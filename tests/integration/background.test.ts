@@ -89,7 +89,16 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
     }
     assert.equal(appended.length, 1);
     assert.equal(faux.state.callCount, 1);
-    assert.ok(notifications.some((item) => item.type === "info" && item.message.includes("后台预压缩成功")));
+    assert.ok(
+      notifications.some(
+        (item) =>
+          item.type === "info" &&
+          item.message.includes("预压缩成功") &&
+          item.message.includes("耗时") &&
+          item.message.includes("预计压缩后约") &&
+          item.message.includes("tokens"),
+      ),
+    );
 
     const preparation = prepareCompactionFromBranch(
       manager.getBranch(),

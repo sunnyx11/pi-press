@@ -60,7 +60,9 @@ type BackgroundTask = {
   thinkingLevel: ThinkingLevel;
   config: PiPressConfig;
   controller: AbortController;
+  startedAt: number;
   firstKeptEntryId?: string;
+  estimatedTokensAfterAtSnapshot?: number;
   promise?: Promise<void>;
   discarded: boolean;
 };
@@ -167,8 +169,8 @@ export class ExtensionRuntime {
     if (this.currentConfig.precomputeMode !== "off") {
       this.notifyUser(
         checkpointId
-          ? "Pi-press：压缩成功，已复用预压缩结果。"
-          : "Pi-press：压缩成功，使用 Pi 原生流程。",
+          ? "pi-press：压缩成功，已复用预压缩结果。"
+          : "pi-press：压缩成功，使用 Pi 原生流程。",
         "info",
       );
     }
@@ -317,7 +319,19 @@ export class ExtensionRuntime {
     const failure = describeError(message);
     this.diagnostics.count("task_failed");
     this.diagnostics.record("task", failure);
-    this.notifyUser(`Pi-press：后台预压缩失败：${failure}`, "error");
+    this.notifyUser(`pi-press：后台预压缩失败：${failure}`, "error");
+  }
+
+  private notifyCheckpointReady(task: BackgroundTask): void {
+    const elapsedSeconds = ((Date.now() - task.startedAt) / 1000).toFixed(1);
+    const estimatedTokens = task.estimatedTokensAfterAtSnapshot;
+    const tokenText = estimatedTokens === undefined
+      ? "未知"
+      : Math.round(estimatedTokens).toLocaleString("en-US");
+    this.notifyUser(
+      `pi-press：预压缩成功，耗时 ${elapsedSeconds} 秒，预计压缩后约 ${tokenText} tokens。`,
+      "info",
+    );
   }
 
   private loadCurrentConfig(ctx: ExtensionContext, cancelWhenOff: boolean): PiPressConfig {
@@ -358,12 +372,15 @@ export class ExtensionRuntime {
     );
   }
 
-  private startBackgroundTask(input: Omit<BackgroundTask, "id" | "runEpoch" | "controller" | "discarded">): void {
+  private startBackgroundTask(
+    input: Omit<BackgroundTask, "id" | "runEpoch" | "controller" | "startedAt" | "discarded">
+  ): void {
     const task: BackgroundTask = {
       ...input,
       id: randomUUID(),
       runEpoch: this.runEpoch,
       controller: new AbortController(),
+      startedAt: Date.now(),
       discarded: false,
     };
     this.inFlightTask = task;
@@ -451,7 +468,7 @@ export class ExtensionRuntime {
         return;
       }
       this.diagnostics.count("checkpoint_ready");
-      this.notifyUser("Pi-press：后台预压缩成功，正式压缩将复用该结果。", "info");
+      this.notifyCheckpointReady(task);
     } catch (error: unknown) {
       if (task.discarded || task.controller.signal.aborted || isAbortLike(error)) {
         this.diagnostics.count("task_cancelled");
@@ -583,6 +600,7 @@ export class ExtensionRuntime {
       return "skipped";
     }
     candidateData.estimatedTokensAfterAtSnapshot = capacity.estimatedTokensAfter;
+    task.estimatedTokensAfterAtSnapshot = capacity.estimatedTokensAfter;
 
     try {
       this.pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, candidateData);

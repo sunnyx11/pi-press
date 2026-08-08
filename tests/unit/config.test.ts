@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   DEFAULT_CONFIG,
   configFingerprint,
   createSnapshotKey,
+  loadConfig,
   normalizeConfig,
 } from "../../src/config.js";
 
@@ -26,6 +30,52 @@ test("normalizeConfig falls back per invalid field", () => {
   assert.equal(result.config.maxRetries, 2);
   assert.equal(result.config.precomputeMode, "threshold-and-manual");
   assert.equal(result.diagnostics.length, 2);
+});
+
+test("loadConfig merges global config before project overrides", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-press-config-"));
+  const globalDir = join(root, "global", "agent");
+  const projectDir = join(root, "project");
+  mkdirSync(globalDir, { recursive: true });
+  mkdirSync(join(projectDir, ".pi"), { recursive: true });
+
+  try {
+    writeFileSync(
+      join(globalDir, "pi-press.json"),
+      JSON.stringify({ softThresholdPercent: 70, maxRetries: 3 }),
+    );
+    writeFileSync(
+      join(projectDir, ".pi", "pi-press.json"),
+      JSON.stringify({ softThresholdPercent: 90 }),
+    );
+
+    const result = loadConfig(projectDir, globalDir);
+
+    assert.equal(result.config.softThresholdPercent, 90);
+    assert.equal(result.config.maxRetries, 3);
+    assert.equal(result.config.hookWaitTimeoutMs, DEFAULT_CONFIG.hookWaitTimeoutMs);
+    assert.deepEqual(result.diagnostics, []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig deduplicates a shared global and project file", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-press-config-"));
+  const projectDir = join(root, "project");
+  const configDir = join(projectDir, ".pi");
+  mkdirSync(configDir, { recursive: true });
+  const configPath = join(configDir, "pi-press.json");
+
+  try {
+    writeFileSync(configPath, "invalid json");
+    const result = loadConfig(projectDir, configDir);
+
+    assert.equal(result.diagnostics.length, 1);
+    assert.match(result.diagnostics[0] ?? "", /pi-press\.json/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("config fingerprint and snapshot key are deterministic", () => {

@@ -448,7 +448,7 @@ acceptLimit = min(hardLimit, targetLimit)
 
 ### 配置
 
-配置读取与业务逻辑分离。配置字段必须经过类型、有限数值、百分比和时间范围校验；无效配置使用默认值并产生诊断。默认配置以 `DESIGN.md` 为准：
+配置读取与业务逻辑分离。配置按 `getAgentDir()/pi-press.json`、`cwd/CONFIG_DIR_NAME/pi-press.json` 的顺序合并，项目字段覆盖全局字段，同一文件只读取一次；字段必须经过类型、有限数值、百分比和时间范围校验；无效配置使用默认值并产生诊断。默认配置以 `DESIGN.md` 为准：
 
 - `precomputeMode: "threshold"`；
 - `softThresholdPercent: 80`；

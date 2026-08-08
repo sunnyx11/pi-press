@@ -126,7 +126,7 @@ checkpoint 是扩展 custom entry，只用于持久化状态，不进入 LLM 上
 
 ## 配置契约
 
-Pi-press 配置独立于 Pi 的运行时 settings。`"threshold"` 模式按 Pi-press 自身策略生成 checkpoint；如果 Pi auto-compaction 已关闭，该 checkpoint 可能不会被消费。当前公开接口无法可靠识别这一状态，使用方应显式选择 `"off"` 或允许手动消费的 `"threshold-and-manual"`，实现不得读取 settings 文件推断。首个版本使用以下字段：
+Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项目的顺序合并：全局文件为 `getAgentDir()/pi-press.json`，项目文件为 `cwd/CONFIG_DIR_NAME/pi-press.json`；项目中存在的字段覆盖同名全局字段，缺失字段继承全局值，最后使用默认值补全。两个配置位置解析为同一文件时只读取一次。`"threshold"` 模式按 Pi-press 自身策略生成 checkpoint；如果 Pi auto-compaction 已关闭，该 checkpoint 可能不会被消费。当前公开接口无法可靠识别这一状态，使用方应显式选择 `"off"` 或允许手动消费的 `"threshold-and-manual"`，实现不得读取 settings 文件推断。首个版本使用以下字段：
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
