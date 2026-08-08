@@ -12,14 +12,14 @@
 
 规范中的“必须”表示禁止偏离；“应”表示默认要求，偏离时需要在代码或设计文档中说明；“可”表示按实现需要选择。
 
-当前项目以 `@earendil-works/pi-coding-agent@0.84.1` 为运行时基线，Node.js 版本以该发行包要求为准。设计文档是 `pi-press` 的行为契约，本文件负责把该契约转换为代码组织和实现规则。
+当前项目依赖 `@earendil-works/pi-coding-agent >=0.84.1`，Node.js 版本以实际安装的发行包要求为准。设计文档是 `pi-press` 的行为契约，本文件负责把该契约转换为代码组织和实现规则。
 
 ## 核心原则
 
 1. **扩展契约优先**：通过 Pi 官方扩展 API 接入运行时，只依赖包根入口导出的公开类型、函数和事件。
 2. **原生语义优先**：摘要编排、正式 compaction entry、session tree、上下文恢复和 TUI 行为由 Pi 负责；`pi-press` 只实现预压缩调度、版本适配和 checkpoint 管理。
 3. **追加式状态**：扩展状态通过 `pi.appendEntry()` 追加 custom entry，原始 session entry 不被覆盖、删除或重写。
-4. **失效即回退**：版本、schema、分支、容量、认证或并发条件无法满足时返回空结果，由 Pi 使用原生实现。
+4. **失效即回退**：schema、分支、容量、认证、并发或公开 API 条件无法满足时返回空结果，由 Pi 使用原生实现；运行时错误和正式 compaction 状态通过 CLI 通知报告。
 5. **边界可验证**：所有跨 API、session、provider、异步任务和持久化数据边界都必须有明确类型、校验和测试。
 6. **副作用集中管理**：纯计算放在无副作用模块中；文件、provider、session 和 UI 操作只出现在相应的适配层或生命周期处理器中。
 
@@ -77,7 +77,7 @@ src/
 │   ├── store.ts                     # custom entry 读取、追加和恢复
 │   └── selection.ts                 # 祖先、epoch、消费状态和容量筛选
 ├── compaction/
-│   ├── preparation.ts               # 0.84.1 preparation 版本适配
+│   ├── preparation.ts               # 当前 Pi preparation 版本适配
 │   ├── compact.ts                   # 公开 compact() 调用和 provider 适配
 │   └── reuse.ts                     # session_before_compact 复用逻辑
 └── provider/
@@ -127,7 +127,7 @@ tests/
 
 ### 纯模块
 
-配置规范化、snapshot key、schema 校验、祖先判断、容量计算、状态转换和版本判断应使用纯函数。纯函数的输入和输出必须显式，禁止通过模块级可变变量传递 session 状态。
+配置规范化、snapshot key、schema 校验、祖先判断、容量计算、状态转换和 checkpoint 版本兼容性判断应使用纯函数。纯函数的输入和输出必须显式，禁止通过模块级可变变量传递 session 状态。
 
 ### 适配模块
 
@@ -138,7 +138,7 @@ tests/
 - `provider/request.ts` 只负责活动模型、认证结果、endpoint、headers、env 和 provider stream 的适配；
 - `checkpoint/store.ts` 只负责通过 `SessionManager` 读取和通过 `pi.appendEntry()` 追加扩展 entry。
 
-版本适配不能散落在业务逻辑中。Pi 版本升级时只允许在版本检查和适配模块中处理差异，并补充对应差异测试。
+版本适配不能散落在业务逻辑中。Pi 版本升级时只允许在适配模块和 checkpoint 兼容性校验中处理差异，并补充对应差异测试。
 
 ## 导入与公开 API
 
@@ -194,7 +194,7 @@ import {
 }
 ```
 
-目标版本必须和实际安装的 Pi 包版本一致。`any` 不得出现在 session entry、provider 响应、配置、checkpoint 或事件返回值边界；外部未知数据先使用 `unknown`，经过 schema 校验后再缩小类型。
+实现仓库应启用严格类型检查，并使用 ESM。类型依赖应与实际安装的 Pi 包版本兼容，当前最低版本为 `0.84.1`。
 
 ### 命名
 
@@ -356,7 +356,7 @@ custom entry 不进入 LLM 上下文，可以作为 session tree 的 metadata。
 `compaction/preparation.ts` 是唯一的 Pi 版本适配边界。其职责是：
 
 1. 从公开 `SessionManager` 分支确定最近正式 compaction 和摘要边界；
-2. 使用目标版本公开函数选择 cut point；
+2. 当前 Pi 公开函数选择 cut point；
 3. 使用公开转换函数构造 `messagesToSummarize` 和 `turnPrefixMessages`；
 4. 保留 Pi 对 context-visible message、split turn、相邻 metadata 和 tool result 的边界规则；
 5. 累计前次兼容 details 中的 `readFiles` 和 `modifiedFiles`；
@@ -388,7 +388,7 @@ provider 请求适配必须：
 
 checkpoint 使用独立协议版本。首个实现只接受 `version: 3`，并同时校验：
 
-- `piVersion === "0.84.1"`；
+- `piVersion` 为生成 checkpoint 的 Pi 版本，消费时必须与当前运行时 `VERSION` 相同；
 - `algorithmVersion` 和 `summaryFormatVersion` 为受支持版本；
 - 字符串非空；
 - 数字有限、非负且符合字段范围；
@@ -426,7 +426,7 @@ preparation 配置 fingerprint
 当前分支包含 firstKeptEntryId
 firstKeptEntryId 位于 snapshotLeafId 之前或与其相同
 当前最新正式 compaction ID == checkpoint.epochCompactionId
-当前 Pi、算法和摘要版本仍受支持
+当前 checkpoint 的 Pi 版本、算法和摘要版本仍与运行时兼容
 ```
 
 ### 容量校验
@@ -451,7 +451,7 @@ acceptLimit = min(hardLimit, targetLimit)
 配置读取与业务逻辑分离。配置字段必须经过类型、有限数值、百分比和时间范围校验；无效配置使用默认值并产生诊断。默认配置以 `DESIGN.md` 为准：
 
 - `precomputeMode: "threshold"`；
-- `softThresholdPercent: 60`；
+- `softThresholdPercent: 80`；
 - `checkpointKeepRecentTokens: 20000`；
 - `summaryReserveTokens: 16384`；
 - `taskTimeoutMs: 120000`；
@@ -466,7 +466,9 @@ acceptLimit = min(hardLimit, targetLimit)
 
 | 情况 | 处理方式 |
 | --- | --- |
-| 版本不匹配、schema 未知或 entry 引用损坏 | 记录诊断，忽略 checkpoint，返回 `undefined`。 |
+| checkpoint Pi 版本不匹配、schema 未知或 entry 引用损坏 | 记录诊断，忽略 checkpoint，返回 `undefined`；正式 compaction 继续使用 Pi 原生实现。 |
+| 生成阶段容量预测超过目标比例 | 记录容量诊断，丢弃本次摘要 usage，不追加 checkpoint，不显示 error 通知；正式 compaction 继续使用 Pi 原生实现。 |
+| provider、公开 API、超时、结果或 checkpoint 追加失败 | 记录失败原因，通过 CLI error 通知显示，清除任务状态并回退 Pi 原生 compaction。 |
 | `ctx.getContextUsage()` 无可用值 | 跳过本次调度，不自行估算 system prompt 或 tool 定义占用。 |
 | provider 认证失败、模型不可用或 context window 缺失 | 结束后台任务，记录失败原因，回退原生 compaction。 |
 | 超时、事件 signal 取消、session shutdown 或分支切换 | 视为正常取消，释放任务状态，不产生未处理异常。 |
@@ -514,7 +516,7 @@ acceptLimit = min(hardLimit, targetLimit)
 
 ### 测试边界
 
-测试必须使用实际安装的 `@earendil-works/pi-coding-agent@0.84.1` 发布包和包根公开接口。测试禁止导入 `dist/core/...`、内部 `prepareCompaction()` 或手工 session JSONL 解析器。
+测试必须使用实际安装的 `@earendil-works/pi-coding-agent` 发布包和包根公开接口，最低依赖版本为 `0.84.1`。测试禁止导入 `dist/core/...`、内部 `prepareCompaction()` 或手工 session JSONL 解析器。
 
 ### 单元测试
 
@@ -531,7 +533,7 @@ acceptLimit = min(hardLimit, targetLimit)
 
 使用公开 SDK、模拟 provider 和固定 session fixture 覆盖：
 
-- `VERSION === "0.84.1"` 启用，其他版本停用预压缩且 Pi 原生 compaction 仍可用；
+- 当前安装的 Pi 版本尝试启用预压缩；公开 API 不兼容时通过 CLI error 通知显示失败，并由 Pi 原生 compaction 继续处理；
 - preparation 与 Pi 公开事件产生的 preparation 在 `firstKeptEntryId`、消息集合、split turn、`previousSummary`、file operations、settings 和 `tokensBefore` 上一致；
 - user、assistant、bash execution、custom message、branch summary、Pi-press custom entry 和 context-invisible metadata 的边界；
 - tool result 不作为错误切分点；
@@ -560,7 +562,7 @@ npm test
 - [ ] 所有 Pi 运行时导入来自包根入口，未使用深层模块或测试接口。
 - [ ] 工厂未启动 session 级后台资源；资源在 `session_start` 或实际使用时创建并在 `session_shutdown` 清理。
 - [ ] `turn_end` 未等待摘要 Promise；detached Promise 具有统一错误处理。
-- [ ] 每个 await 后和 `pi.appendEntry()` 前均检查任务身份、`runEpoch`、session、祖先、epoch 和版本。
+- 每个 await 后和 `pi.appendEntry()` 前均检查任务身份、`runEpoch`、session、祖先、epoch、当前 Pi 版本和算法版本；
 - [ ] checkpoint 通过 schema 校验和 `pi.appendEntry()` 追加，未手工读写 JSONL 或正式 compaction entry。
 - [ ] `session_before_compact` 仅在容量和契约全部满足时返回结果，其他情况返回 `undefined` 走原生实现。
 - [ ] provider signal、headers、baseUrl、env 和认证失败处理经过测试，日志没有敏感信息。
@@ -573,9 +575,9 @@ npm test
 
 1. 阅读新版本的扩展和 compaction 文档；
 2. 对照包根导出表和类型定义检查公开 API；
-3. 更新版本检查和依赖锁定；
+3. 更新 `>=0.84.1` 依赖范围和 lockfile 中的根依赖声明；
 4. 比较 Pi preparation、session entry、provider auth 和事件返回值的变化；
-5. 更新版本适配模块和差异测试；
-6. 在兼容性测试通过前保持旧版本启用条件。
+5. 更新版本适配模块、checkpoint 兼容性校验和差异测试；
+6. 在兼容性测试通过前保留 CLI 失败通知和 Pi 原生回退。
 
 不能因为新版本存在同名内部函数或深层文件而把它加入生产依赖。若公开 API 不足以维持契约，应优先回退 Pi 原生实现，并在设计文档中记录需要的公开接口。

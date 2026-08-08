@@ -1,0 +1,4 @@
+node_modules/
+
+# Local Pi project configuration
+.pi/

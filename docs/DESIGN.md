@@ -6,7 +6,7 @@
 
 核心目标：
 
-- 上下文使用量达到约 60% 时，在后台提前生成一份预压缩结果。
+- 上下文使用量达到约 80% 时，在后台提前生成一份预压缩结果。
 - 后台任务执行期间，当前 agent 继续运行，不中止当前操作。
 - 预压缩结果持久化到当前 session 的 JSONL 文件。
 - Pi 真正触发 compaction 时，扩展返回已经生成的 `CompactionResult`，由 Pi 写入正式 `compaction` entry。
@@ -16,12 +16,12 @@ Pi-press 自行实现并维护以下内容：
 
 - checkpoint 的调度、持久化、校验、去重、消费和失效；
 - 后台任务的超时、取消与并发控制；
-- 目标 Pi 版本缺少公开 preparation 接口时所需的窄版本适配模块。
+- 当前 Pi 公开 preparation 接口缺少的窄版本适配模块。
 
 实现按接口稳定性分为三层：
 
 1. 首选 Pi 扩展契约：`turn_end`、`session_before_compact`、`session_compact`、`session_shutdown`、`session_before_tree`、`session_tree`、`pi.appendEntry()`、`ctx.getContextUsage()`、`ctx.sessionManager` 和 `ctx.modelRegistry`。
-2. 版本锁定的包根入口：`VERSION`、`compact`、`findCutPoint`、`estimateTokens`、`calculateContextTokens`、`getLastAssistantUsage`、`buildSessionContext`、`sessionEntryToContextMessages` 和相关公开类型。
+2. 公开包根入口：`VERSION`、`compact`、`findCutPoint`、`estimateTokens`、`calculateContextTokens`、`getLastAssistantUsage`、`buildSessionContext`、`sessionEntryToContextMessages` 和相关公开类型。
 3. Pi-press 版本适配模块：构造 `Parameters<typeof compact>[0]` 所表示的 preparation，补足 `prepareCompaction()` 未从包根入口导出的能力。
 
 版本适配模块只负责：识别前次正式 compaction 边界、选择切分点、构造 `messagesToSummarize`/`turnPrefixMessages`、累计文件操作并填充 preparation。摘要提示词、split turn 双摘要、`previousSummary` 更新、usage 合并以及 `<read-files>`/`<modified-files>` 附加均由 Pi 公开的 `compact()` 完成。
@@ -33,7 +33,7 @@ Pi-press 自行实现并维护以下内容：
 - 手工读取、解析或修改当前 session JSONL；
 - 手工写入正式 `type: "compaction"` entry。
 
-自定义摘要提示词属于后续扩展，首个版本只使用目标 Pi 版本的 `compact()`。
+自定义摘要提示词属于后续扩展，首个版本只使用当前 Pi 公开的 `compact()`。
 
 ## 非目标
 
@@ -45,13 +45,14 @@ Pi-press 自行实现并维护以下内容：
 
 ## 兼容范围
 
-- 当前实现基线为 `@earendil-works/pi-coding-agent 0.84.1`，依赖和 peer dependency 锁定该精确版本。
-- 启动时检查包根入口导出的 `VERSION`；版本不是 `0.84.1` 时停用后台预压缩和 checkpoint 复用，所有 compaction 交给 Pi 原生实现。
+- 依赖和 peer dependency 使用 `>=0.84.1`，不通过固定版本停用扩展行为；运行时尝试使用当前 Pi 的公开契约。
+- 当前包根 `VERSION` 写入 checkpoint provenance，并用于拒绝复用其他 Pi 版本生成的 checkpoint。版本升级后会生成新的 checkpoint。
+- 公开 API、provider、超时、结果校验或 checkpoint 追加失败时，通过 CLI 通知显示错误，当前 compaction 返回空结果并由 Pi 原生流程继续处理；生成阶段容量预测不满足目标时只记录诊断并跳过 checkpoint。
 - 所有运行时导入必须来自包根入口，禁止通过 `dist/core/...` 引用深层模块。
 - 目标契约包括 coding-agent 的扩展事件、`CompactionResult`、公开 SessionManager 读取接口、custom entry 和上下文重建规则。
 - `@earendil-works/pi-agent-core` harness 使用不同的 compaction 契约，不属于本设计的目标实现。
 - checkpoint 使用独立的协议版本。未知版本、损坏数据和无效 entry 引用必须被忽略，并回退到 Pi 原生 compaction。
-- 升级 Pi 基线前必须重新执行版本适配模块的差异测试和扩展集成测试。
+- Pi 版本升级后必须重新执行版本适配模块的差异测试和扩展集成测试。
 
 ## 核心模型
 
@@ -101,14 +102,14 @@ checkpoint 是扩展 custom entry，只用于持久化状态，不进入 LLM 上
 - 监听 `turn_end`，只同步读取使用量、创建快照和调度任务。处理器不得等待摘要 Promise，必须立即返回。
 - detached task 必须由调度器保存 Promise，并设置统一错误处理，禁止产生未处理的 Promise rejection。
 - 只使用 `ctx.getContextUsage()` 判断阈值。返回 `undefined`、`tokens: null` 或 `percent: null` 时跳过本次检查，不自行估算系统提示词和工具定义占用。
-- 默认软阈值为活动模型上下文窗口的 60%。该值是最早启动点，不是复用 checkpoint 的充分条件。
+- 默认软阈值为活动模型上下文窗口的 80%。该值是最早启动点，不是复用 checkpoint 的充分条件。
 - Pi-press 通过 `precomputeMode: "off" | "threshold" | "threshold-and-manual"` 明确控制是否生成和消费检查点，默认值为 `"threshold"`。当前公开扩展接口无法查询 Pi 的 auto-compaction 设置，因此不得读取 settings 文件推断运行时状态。
 - 同一 session、同一正式 compaction epoch 和同一 snapshot key 同时只运行一个后台任务。
 - snapshot key 由 session ID、正式 compaction epoch、`snapshotSourceLeafId`、Pi 版本、preparation 算法版本、摘要格式版本和 preparation 配置 fingerprint 组成，只用于后台去重。生成模型和 thinking level 只写入 provenance，不参与该键。
 - 后台任务不会调用 `ctx.compact()`，避免中止当前 agent 操作。
 - 任务使用独立的 `AbortController`，不复用当前 agent 的请求信号。
 - 同一时间最多执行一个后台摘要请求。前台与后台共用 provider 时记录前台耗时、429/限流错误和后台耗时，用于评估并发影响。
-- 可配置一次接近原生阈值的 checkpoint 刷新；只有预计压缩后 token 超过目标比例时才允许刷新，避免固定 60% 快照保留过多后续消息。
+- 可配置一次接近原生阈值的 checkpoint 刷新；只有预计压缩后 token 超过目标比例时才允许刷新，避免固定 80% 快照保留过多后续消息。
 
 ### 正式 compaction
 
@@ -130,9 +131,9 @@ Pi-press 配置独立于 Pi 的运行时 settings。`"threshold"` 模式按 Pi-p
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `precomputeMode` | `"threshold"` | `"off"` 停用；`"threshold"` 只服务自动 threshold compaction；`"threshold-and-manual"` 也服务无自定义指令的手动 compaction |
-| `softThresholdPercent` | `60` | 最早启动后台任务的上下文百分比 |
-| `checkpointKeepRecentTokens` | `20000` | 构造候选 preparation 时保留的近期 token，默认取目标 Pi 版本的 `DEFAULT_COMPACTION_SETTINGS` |
-| `summaryReserveTokens` | `16384` | 传给候选 preparation 的摘要输出预算，默认取目标 Pi 版本的 `DEFAULT_COMPACTION_SETTINGS` |
+| `softThresholdPercent` | `80` | 最早启动后台任务的上下文百分比 |
+| `checkpointKeepRecentTokens` | `20000` | 构造候选 preparation 时保留的近期 token，默认取当前 Pi 的 `DEFAULT_COMPACTION_SETTINGS` |
+| `summaryReserveTokens` | `16384` | 传给候选 preparation 的摘要输出预算，默认取当前 Pi 的 `DEFAULT_COMPACTION_SETTINGS` |
 | `taskTimeoutMs` | `120000` | 单次后台任务总超时 |
 | `hookWaitTimeoutMs` | `1000` | 正式 compaction 等待兼容 in-flight 任务的最长时间 |
 | `targetPostCompactionPercent` | `50` | 消费 checkpoint 后允许的最大上下文比例 |
@@ -153,7 +154,7 @@ Pi-press 配置独立于 Pi 的运行时 settings。`"threshold"` 模式按 Pi-p
   "customType": "pi-press.precompaction",
   "data": {
     "version": 3,
-    "piVersion": "0.84.1",
+    "piVersion": "current-pi-version",
     "algorithmVersion": 1,
     "summaryFormatVersion": 1,
     "checkpointId": "checkpoint-1",
@@ -161,7 +162,7 @@ Pi-press 配置独立于 Pi 的运行时 settings。`"threshold"` 模式按 Pi-p
     "snapshotLeafId": "entry-42",
     "snapshotSourceLeafId": "entry-41",
     "epochCompactionId": null,
-    "snapshotKey": "session-1:null:entry-41:0.84.1:1:1:config",
+    "snapshotKey": "session-1:null:entry-41:current-pi-version:1:1:config",,
     "compaction": {
       "summary": "...",
       "firstKeptEntryId": "entry-18",
@@ -215,7 +216,7 @@ checkpoint 不复制原始消息，不可原地更新。原始消息继续由 Pi
 
 ## 后台摘要生成
 
-后台任务由 Pi-press 调度，输出必须来自目标 Pi 版本公开的 `compact()`：
+后台任务由 Pi-press 调度，输出必须来自当前 Pi 公开的 `compact()`：
 
 1. 通过 `ctx.sessionManager.getSessionId()`、`getLeafId()` 和 `getBranch()` 读取 `sessionId`、`snapshotLeafId` 与当前分支；不读取 session 文件。
 2. 从当前分支找到最近的正式 compaction entry，其 ID 作为 `epochCompactionId`；没有时为 `null`。
@@ -236,20 +237,20 @@ checkpoint 不复制原始消息，不可原地更新。原始消息继续由 Pi
    - 通过 `ctx.modelRegistry.getProvider(model.provider)` 取得有效 provider，并把其 `streamSimple` 适配为 `StreamFn`。
 7. 调用包根入口公开的 `compact(preparation, requestModel, apiKey, headers, undefined, signal, thinkingLevel, streamFn, env, retry, callbacks)`。Pi-press 只维护 retry、callbacks、超时和独立 `AbortSignal` 的配置。
 8. `compact()` 返回完整的 `summary`、`firstKeptEntryId`、`tokensBefore`、`usage` 和原生 `details`。Pi-press 不再单独调用 `serializeConversation()` 或 `generateSummaryWithUsage()`。
-9. 追加前重新读取当前 session 状态，确认当前分支继承 `snapshotLeafId`、最新正式 compaction ID 仍为 `epochCompactionId`，且 Pi 版本和算法版本未变化。
+9. 追加前重新读取当前 session 状态，确认当前分支继承 `snapshotLeafId`、最新正式 compaction ID 仍为 `epochCompactionId`，且 preparation 算法和摘要格式版本未变化。
 10. 校验通过后调用 `pi.appendEntry("pi-press.precompaction", data)` 追加 checkpoint。
 
 模型、thinking level 或 endpoint 在摘要完成后发生变化，不会单独使已生成摘要失效；这些字段只作为生成来源记录。消费时按当前模型上下文窗口重新计算压缩后 token。Pi 版本、preparation 算法版本或摘要格式版本变化时，结果必须作废。
 
 追加前检查与 `pi.appendEntry()` 之间不保证原子性。正式 compaction 可能在该窗口内插入，产生一条过期 custom checkpoint；该 entry 会被 `epochCompactionId` 校验拒绝，不进入 LLM 上下文，可以保留。
 
-后台任务使用独立的 `AbortController`。`session_shutdown`、分支切换、正式 compaction epoch 变化、Pi 版本或 preparation 算法版本变化时中止任务。后台失败、超时或取消后清除 in-flight 状态，并按配置决定同一 snapshot 是否允许重试。
+后台任务使用独立的 `AbortController`。`session_shutdown`、分支切换、正式 compaction epoch 变化或 preparation 算法版本变化时中止任务。后台失败、超时或取消后清除 in-flight 状态，并按配置决定同一 snapshot 是否允许重试。
 
 ## 正式 compaction 的复用规则
 
 `session_before_compact` 收到 Pi 当前的 `preparation`、`reason`、`willRetry`、`customInstructions` 和事件 `signal` 后，按以下顺序处理：
 
-1. 检查运行时 Pi 版本和 `precomputeMode`。版本不匹配或模式为 `"off"` 时返回空结果。
+1. 检查 `precomputeMode`。模式为 `"off"` 时返回空结果。
 2. 只处理受支持的事件：`reason: "threshold"`，或模式为 `"threshold-and-manual"` 时无 `customInstructions` 的 `reason: "manual"`。`reason: "overflow"`、`willRetry: true` 或存在 `customInstructions` 时返回空结果。
 3. 通过 `ctx.sessionManager.getBranch()` 获取最新分支，并计算当前 `sessionId` 与 `epochCompactionId`。
 4. 从当前分支由新到旧扫描 `pi-press.precompaction` entry，依次执行 schema、版本、session 和 epoch 校验。
@@ -320,7 +321,7 @@ Pi 随后追加正式 `compaction` entry。恢复后的上下文为：
 
 以下情况使 checkpoint 不可消费：
 
-- Pi 版本、checkpoint schema、preparation 算法版本或摘要格式版本不受支持；
+- 当前 checkpoint 的 Pi 版本、checkpoint schema、preparation 算法版本或摘要格式版本与运行时不匹配；
 - 当前 `precomputeMode` 不允许对应 compaction 类型；
 - `reason` 为 `overflow`、`willRetry` 为真或存在 `customInstructions`；
 - 当前 session 与 checkpoint session 不同；
@@ -366,7 +367,7 @@ checkpoint 不可消费时，扩展返回空结果，由 Pi 原生 compaction �
 当前分支包含 firstKeptEntryId
 firstKeptEntryId 位于 snapshotLeafId 之前或与其相同
 当前最新正式 compaction ID == snapshot epochCompactionId
-当前 Pi 和算法版本仍受支持
+当前 checkpoint 的 Pi 版本、算法版本和摘要格式版本仍满足消费校验
 ```
 
 当前分支仅在快照后追加新 entry 时，checkpoint 仍然有效，新消息作为未压缩尾部保留。切换到其他分支时中止当前后台任务并清除分支内存状态；旧分支已持久化的 checkpoint 保留。再次导航回旧分支时，只要祖先、epoch 和容量校验通过，该 checkpoint 可以恢复使用。
@@ -442,10 +443,10 @@ Promise
 
 ### 发布包接口与版本适配
 
-所有测试以实际安装的 `@earendil-works/pi-coding-agent@0.84.1` 发布包为对象：
+测试以当前安装的 `@earendil-works/pi-coding-agent` 发布包为对象，最低依赖版本为 `0.84.1`：
 
 - 生产代码只从包根入口导入，构建测试阻止 `dist/core/...` 深层导入；
-- `VERSION === "0.84.1"` 时启用，其他版本停用预压缩并验证原生 compaction 仍可使用；
+- 不通过 `VERSION` 做全局启用门控；当前版本会写入 checkpoint，版本不兼容产生的运行时错误通过 CLI 通知显示，并回退 Pi 原生 compaction；
 - 使用公开 SDK、`SessionManager`、模拟 provider 和测试扩展创建固定 session fixture；
 - 通过公开 `session_before_compact` 捕获 Pi 生成的 `preparation`，与版本适配模块对同一分支生成的结果比较；测试不得导入内部 `prepareCompaction()`；
 - 比较 `firstKeptEntryId`、`messagesToSummarize`、`turnPrefixMessages`、`isSplitTurn`、`previousSummary`、file operations、settings 和 `tokensBefore`；
@@ -494,11 +495,11 @@ Promise
 
 ## 验收标准
 
-1. 运行时 Pi 版本为 `0.84.1` 时启用预压缩；其他版本自动停用扩展行为，Pi 原生 compaction 正常工作。
-2. 上下文使用量跨越默认 60% 软阈值后调度 detached task，`turn_end` 不等待摘要请求，当前 agent 不被中止。
+1. 当前安装的 Pi 版本尝试执行预压缩；公开 API 不兼容、provider、超时或结果校验失败时通过 CLI 显示错误，并由 Pi 原生 compaction 继续处理。
+2. 上下文使用量跨越默认 80% 软阈值后调度 detached task，`turn_end` 不等待摘要请求，当前 agent 不被中止。
 3. `ctx.getContextUsage()` 返回不可用值时不启动任务，也不读取 session 文件自行估算。
 4. 生产代码只使用 Pi 扩展契约和包根入口；唯一自有协议适配集中在 preparation 版本适配模块。
-5. 版本适配模块与公开事件提供的 Pi preparation 在目标 fixture 上一致，包括 split turn、metadata 边界、前次摘要和文件操作。
+5. 版本适配模块与当前 Pi 公开事件提供的 preparation 在目标 fixture 上一致，包括 split turn、metadata 边界、前次摘要和文件操作。
 6. 后台摘要调用公开 `compact()`，保留原生提示词、`previousSummary`、split turn、usage 和文件上下文语义。
 7. 模型请求使用有效 provider，并保留解析后的 `baseUrl`、`apiKey`、headers 和 `env`；认证失败时安全回退。
 8. checkpoint 以 `pi-press.precompaction` v3 custom entry 持久化，不进入 LLM 上下文，也不复制原始消息。
@@ -514,4 +515,5 @@ Promise
 18. 模型、thinking level 或 endpoint 变化不自动废弃摘要；当前 context window 无法容纳候选结果时仍会拒绝消费。
 19. 同一 snapshot 不并发生成重复摘要，每个 epoch 的刷新次数受限，session-bound 对象失效后不会被后台闭包访问。
 20. Pi-press 能区分 consumed usage 与 discarded usage；正式 compaction usage 不重复计费，未消费费用在诊断中明确记录。
-21. `npm run typecheck` 和 `npm test` 通过，并包含上述版本适配、provider、checkpoint、并发、生命周期和原生回退测试。
+21. Pi-press 能区分 consumed usage 与 discarded usage；正式 compaction usage 不重复计费，未消费费用在诊断中明确记录；后台预压缩和正式 compaction 的成功/失败状态通过 CLI 通知显示。
+22. `npm run typecheck` 和 `npm test` 通过，并包含上述版本适配、provider、checkpoint、并发、生命周期和原生回退测试。
