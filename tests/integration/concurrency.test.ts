@@ -1,116 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync } from "node:fs";
 import test from "node:test";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fauxAssistantMessage, fauxProvider, type Api, type Model } from "@earendil-works/pi-ai";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-  SessionBeforeCompactEvent,
-  SessionCompactEvent,
-} from "@earendil-works/pi-coding-agent";
-import { ExtensionRuntime } from "../../src/extension-runtime.js";
-import { createPreparationSettings, prepareCompactionFromBranch } from "../../src/compaction/preparation.js";
-import { DEFAULT_CONFIG } from "../../src/config.js";
-import type { PiPressConfig } from "../../src/types.js";
-import { makeModel, makeUserMessage } from "../unit/fixtures.js";
-
-type Notification = { message: string; type: "info" | "warning" | "error" | undefined };
-type ResponseFactory = () => Promise<ReturnType<typeof fauxAssistantMessage>>;
-
-type Scenario = {
-  cwd: string;
-  manager: SessionManager;
-  model: Model<Api>;
-  faux: ReturnType<typeof fauxProvider>;
-  config: PiPressConfig;
-  runtime: ExtensionRuntime;
-  ctx: ExtensionContext;
-  firstKeptId: string;
-  appended: unknown[];
-  notifications: Notification[];
-};
-
-function createScenario(overrides: Partial<PiPressConfig>, responseFactory: ResponseFactory): Scenario {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-press-concurrency-"));
-  mkdirSync(join(cwd, ".pi"));
-  const config: PiPressConfig = {
-    ...DEFAULT_CONFIG,
-    softThresholdPercent: 80,
-    summaryReserveTokens: 1,
-    taskTimeoutMs: 2_000,
-    hookWaitTimeoutMs: 500,
-    ...overrides,
-  };
-  writeFileSync(join(cwd, ".pi", "pi-press.json"), JSON.stringify(config));
-
-  const manager = SessionManager.inMemory(cwd);
-  const firstKeptId = manager.appendMessage(makeUserMessage("old history ".repeat(2_000)));
-  manager.appendMessage(makeUserMessage("recent context ".repeat(2_000)));
-  const faux = fauxProvider({
-    api: "openai-responses",
-    provider: "test",
-    models: [{ id: "model-id", contextWindow: 100_000, maxTokens: 4_096 }],
-  });
-  faux.setResponses([responseFactory]);
-  const model = makeModel();
-  const appended: unknown[] = [];
-  const notifications: Notification[] = [];
-  const pi = {
-    appendEntry: (customType: string, data: unknown) => {
-      appended.push(data);
-      manager.appendCustomEntry(customType, data);
-    },
-  } as Pick<ExtensionAPI, "appendEntry">;
-  const ctx = {
-    cwd,
-    sessionManager: manager,
-    model,
-    modelRegistry: {
-      getApiKeyAndHeaders: async () => ({ ok: true as const }),
-      getProvider: () => faux.provider,
-    },
-    thinkingLevel: "medium",
-    ui: {
-      notify: (message: string, type?: "info" | "warning" | "error") => {
-        notifications.push({ message, type });
-      },
-    },
-    getContextUsage: () => ({ tokens: 90_000, contextWindow: model.contextWindow, percent: 90 }),
-  } as unknown as ExtensionContext;
-  const runtime = new ExtensionRuntime(pi);
-  runtime.onSessionStart(ctx);
-  return { cwd, manager, model, faux, config, runtime, ctx, firstKeptId, appended, notifications };
-}
-
-function makeCompactEvent(scenario: Scenario, signal: AbortSignal): SessionBeforeCompactEvent {
-  const preparation = prepareCompactionFromBranch(
-    scenario.manager.getBranch(),
-    createPreparationSettings(scenario.config),
-  );
-  assert.ok(preparation);
-  return {
-    type: "session_before_compact",
-    preparation,
-    branchEntries: scenario.manager.getBranch(),
-    reason: "threshold",
-    willRetry: false,
-    signal,
-  } satisfies SessionBeforeCompactEvent;
-}
-
-async function waitFor(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (condition()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  assert.fail("condition was not met before timeout");
-}
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import type { SessionCompactEvent } from "@earendil-works/pi-coding-agent";
+import {
+  createScenario,
+  makeCompactEvent,
+  waitFor,
+  type ResponseFactory,
+} from "../runtime-fixture.js";
 
 function delayedResponse(
   delayMs: number,
@@ -342,7 +240,7 @@ test("formal compaction invalidates an in-flight task before it can append", asy
     scenario.runtime.onTurnEnd(scenario.ctx);
     await started;
 
-    scenario.manager.appendCompaction("native summary", scenario.firstKeptId, 90_000);
+    scenario.manager.appendCompaction("native summary", scenario.firstEntryId, 90_000);
     const compactionEntry = scenario.manager.getLeafEntry();
     assert.ok(compactionEntry?.type === "compaction");
     scenario.runtime.onSessionCompact({

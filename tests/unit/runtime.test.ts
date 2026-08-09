@@ -11,6 +11,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { ExtensionRuntime } from "../../src/extension-runtime.js";
 import { makeCheckpointData, makeModel, makePreparation, makeUserMessage } from "./fixtures.js";
+import { waitFor, type Notification } from "../runtime-fixture.js";
 
 test("ready checkpoint claim is exclusive until the compaction signal aborts", async () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime");
@@ -85,10 +86,7 @@ test("capacity-rejected ready checkpoint shows a fallback warning", async () => 
       makeCheckpointData(manager.getSessionId(), snapshotId, firstId),
     );
     const model = makeModel();
-    const notifications: Array<{
-      message: string;
-      type: "info" | "warning" | "error" | undefined;
-    }> = [];
+    const notifications: Notification[] = [];
     const ctx = {
       cwd,
       sessionManager: manager,
@@ -171,7 +169,7 @@ test("task timeout covers authentication resolution and releases the task", asyn
     manager.appendMessage(makeUserMessage("history ".repeat(12_000)));
     manager.appendMessage(makeUserMessage("recent ".repeat(12_000)));
     const model = makeModel();
-    const notifications: Array<{ message: string; type: "info" | "warning" | "error" | undefined }> = [];
+    const notifications: Notification[] = [];
     let authLookups = 0;
     const ctx = {
       cwd,
@@ -196,12 +194,7 @@ test("task timeout covers authentication resolution and releases the task", asyn
     runtime.onSessionStart(ctx);
     runtime.onTurnEnd(ctx);
 
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (runtime.getDiagnostics().counters.task_failed) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
+    await waitFor(() => Boolean(runtime.getDiagnostics().counters.task_failed));
 
     assert.equal(runtime.getDiagnostics().counters.task_failed, 1);
     assert.equal(notifications.length, 1);
@@ -274,7 +267,7 @@ test("single oversized turn silently skips unavailable preparation", async () =>
   manager.appendMessage(makeUserMessage("x".repeat(100_000)));
   const model = makeModel();
   let authLookups = 0;
-  const notifications: Array<{ message: string; type: "info" | "warning" | "error" | undefined }> = [];
+  const notifications: Notification[] = [];
   const ctx = {
     cwd: "/tmp/pi-press-runtime-no-preparation",
     sessionManager: manager,
@@ -298,12 +291,9 @@ test("single oversized turn silently skips unavailable preparation", async () =>
   runtime.onSessionStart(ctx);
   runtime.onTurnEnd(ctx);
 
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (runtime.getDiagnostics().counters.task_skipped_no_preparation) {
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  await waitFor(
+    () => Boolean(runtime.getDiagnostics().counters.task_skipped_no_preparation),
+  );
 
   const diagnostics = runtime.getDiagnostics();
   assert.equal(diagnostics.counters.task_skipped_no_preparation, 1);
@@ -317,7 +307,7 @@ test("authentication failure is shown as a CLI error notification", async () => 
   manager.appendMessage(makeUserMessage("history ".repeat(12_000)));
   manager.appendMessage(makeUserMessage("recent ".repeat(12_000)));
   const model = makeModel();
-  const notifications: Array<{ message: string; type: "info" | "warning" | "error" | undefined }> = [];
+  const notifications: Notification[] = [];
   const ctx = {
     cwd: `/tmp/pi-press-runtime-failure-${process.pid}`,
     sessionManager: manager,
@@ -341,9 +331,7 @@ test("authentication failure is shown as a CLI error notification", async () => 
   runtime.onSessionStart(ctx);
   runtime.onTurnEnd(ctx);
 
-  for (let attempt = 0; attempt < 100 && notifications.length === 0; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  await waitFor(() => notifications.length > 0);
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0]?.type, "error");
   assert.match(notifications[0]?.message ?? "", /后台预压缩失败/);
