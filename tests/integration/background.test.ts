@@ -55,8 +55,10 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
     };
     const appended: unknown[] = [];
     const notifications: Array<{ message: string; type: "info" | "warning" | "error" | undefined }> = [];
+    let notificationCountAtAppend = -1;
     const pi = {
       appendEntry: (customType: string, data: unknown) => {
+        notificationCountAtAppend = notifications.length;
         appended.push(data);
         manager.appendCustomEntry(customType, data);
       },
@@ -86,6 +88,7 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(appended.length, 1);
+    assert.equal(notificationCountAtAppend, 0);
     assert.equal(faux.state.callCount, 1);
     assert.ok(
       notifications.some(
@@ -142,7 +145,90 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
   }
 });
 
-test("capacity-rejected checkpoint is skipped without persistence or error notification", async () => {
+test("checkpoint append failure reports an error without a success notification", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-press-append-failure-"));
+  mkdirSync(join(cwd, ".pi"));
+  writeFileSync(
+    join(cwd, ".pi", "pi-press.json"),
+    JSON.stringify({ summaryReserveTokens: 1, taskTimeoutMs: 2_000 }),
+  );
+
+  try {
+    const manager = SessionManager.inMemory(cwd);
+    manager.appendMessage({
+      role: "user",
+      content: "old history ".repeat(2_000),
+      timestamp: Date.now(),
+    });
+    manager.appendMessage({
+      role: "user",
+      content: "recent context ".repeat(2_000),
+      timestamp: Date.now(),
+    });
+    const faux = fauxProvider({
+      api: "openai-responses",
+      provider: "test",
+      models: [{ id: "model-id", contextWindow: 100_000, maxTokens: 4_096 }],
+    });
+    faux.setResponses([fauxAssistantMessage("checkpoint summary")]);
+    const model = faux.getModel();
+    const notifications: Array<{
+      message: string;
+      type: "info" | "warning" | "error" | undefined;
+    }> = [];
+    const runtime = new ExtensionRuntime({
+      appendEntry: () => {
+        throw new Error("simulated persistence failure");
+      },
+    });
+    const ctx = {
+      cwd,
+      sessionManager: manager,
+      model,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true as const }),
+        getProvider: () => faux.provider,
+      },
+      thinkingLevel: "medium",
+      ui: {
+        notify: (message: string, type?: "info" | "warning" | "error") => {
+          notifications.push({ message, type });
+        },
+      },
+      getContextUsage: () => ({ tokens: 70_000, contextWindow: model.contextWindow, percent: 90 }),
+    } as unknown as ExtensionContext;
+    runtime.onSessionStart(ctx);
+    runtime.onTurnEnd(ctx);
+
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (runtime.getDiagnostics().counters.checkpoint_append_failure) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const diagnostics = runtime.getDiagnostics();
+    assert.equal(diagnostics.counters.checkpoint_append_failure, 1);
+    assert.equal(diagnostics.counters.task_failed, 1);
+    assert.ok(
+      notifications.some(
+        (notification) =>
+          notification.type === "error" && notification.message.includes("追加失败"),
+      ),
+    );
+    assert.equal(
+      notifications.some(
+        (notification) =>
+          notification.type === "info" && notification.message.includes("预压缩成功"),
+      ),
+      false,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("capacity-rejected checkpoint shows a warning without persistence", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-press-capacity-skip-"));
   mkdirSync(join(cwd, ".pi"));
   writeFileSync(
@@ -216,7 +302,9 @@ test("capacity-rejected checkpoint is skipped without persistence or error notif
     assert.equal(diagnostics.counters.checkpoint_skipped_capacity, 1);
     assert.equal(diagnostics.counters.checkpoint_ready ?? 0, 0);
     assert.equal(diagnostics.counters.task_failed ?? 0, 0);
-    assert.equal(notifications.length, 0);
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0]?.type, "warning");
+    assert.match(notifications[0]?.message ?? "", /容量不足/);
     assert.ok(diagnostics.records.some((record) => record.kind === "capacity"));
   } finally {
     rmSync(cwd, { recursive: true, force: true });

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
   ExtensionAPI,
@@ -9,7 +12,7 @@ import type {
 import { ExtensionRuntime } from "../../src/extension-runtime.js";
 import { makeCheckpointData, makeModel, makePreparation, makeUserMessage } from "./fixtures.js";
 
-test("ready checkpoint is reused without a second provider request", async () => {
+test("ready checkpoint claim is exclusive until the compaction signal aborts", async () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime");
   const firstId = manager.appendMessage(makeUserMessage("old history"));
   const snapshotId = manager.appendMessage(makeUserMessage("recent work"));
@@ -34,13 +37,14 @@ test("ready checkpoint is reused without a second provider request", async () =>
   const runtime = new ExtensionRuntime(pi);
   runtime.onSessionStart(ctx);
 
+  const controller = new AbortController();
   const event = {
     type: "session_before_compact",
     preparation: makePreparation(firstId, 100),
     branchEntries: manager.getBranch(),
     reason: "threshold",
     willRetry: false,
-    signal: new AbortController().signal,
+    signal: controller.signal,
   } satisfies SessionBeforeCompactEvent;
   const result = await runtime.beforeCompact(event, ctx);
 
@@ -53,6 +57,75 @@ test("ready checkpoint is reused without a second provider request", async () =>
     ((result.compaction.details as Record<string, unknown>).piPress as Record<string, unknown>).checkpointId,
     "checkpoint-runtime",
   );
+  assert.equal(await runtime.beforeCompact(event, ctx), undefined);
+
+  controller.abort();
+  const highUsageCtx = {
+    ...ctx,
+    getContextUsage: () => ({ tokens: 90_000, contextWindow: model.contextWindow, percent: 90 }),
+  } as ExtensionContext;
+  runtime.onTurnEnd(highUsageCtx);
+  assert.equal(runtime.getDiagnostics().counters.task_started ?? 0, 0);
+});
+
+test("capacity-rejected ready checkpoint shows a fallback warning", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-press-runtime-reuse-capacity-"));
+  mkdirSync(join(cwd, ".pi"));
+  writeFileSync(
+    join(cwd, ".pi", "pi-press.json"),
+    JSON.stringify({ targetPostCompactionPercent: 0 }),
+  );
+
+  try {
+    const manager = SessionManager.inMemory(cwd);
+    const firstId = manager.appendMessage(makeUserMessage("old history"));
+    const snapshotId = manager.appendMessage(makeUserMessage("recent work"));
+    manager.appendCustomEntry(
+      "pi-press.precompaction",
+      makeCheckpointData(manager.getSessionId(), snapshotId, firstId),
+    );
+    const model = makeModel();
+    const notifications: Array<{
+      message: string;
+      type: "info" | "warning" | "error" | undefined;
+    }> = [];
+    const ctx = {
+      cwd,
+      sessionManager: manager,
+      model,
+      modelRegistry: {},
+      thinkingLevel: "medium",
+      ui: {
+        notify: (message: string, type?: "info" | "warning" | "error") => {
+          notifications.push({ message, type });
+        },
+      },
+    } as unknown as ExtensionContext;
+    const runtime = new ExtensionRuntime({ appendEntry: () => undefined });
+    runtime.onSessionStart(ctx);
+
+    const result = await runtime.beforeCompact({
+      type: "session_before_compact",
+      preparation: makePreparation(firstId, 100),
+      branchEntries: manager.getBranch(),
+      reason: "threshold",
+      willRetry: false,
+      signal: new AbortController().signal,
+    }, ctx);
+
+    assert.equal(result, undefined);
+    assert.equal(runtime.getDiagnostics().counters.checkpoint_rejected_capacity, 1);
+    assert.ok(
+      notifications.some(
+        (notification) =>
+          notification.type === "warning" &&
+          notification.message.includes("容量不足") &&
+          notification.message.includes("Pi 原生压缩"),
+      ),
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("unsupported compaction reasons fall back to Pi", async () => {
@@ -85,6 +158,99 @@ test("unsupported compaction reasons fall back to Pi", async () => {
   );
 });
 
+test("task timeout covers authentication resolution and releases the task", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-press-runtime-auth-timeout-"));
+  mkdirSync(join(cwd, ".pi"));
+  writeFileSync(
+    join(cwd, ".pi", "pi-press.json"),
+    JSON.stringify({ taskTimeoutMs: 20, summaryReserveTokens: 1 }),
+  );
+
+  try {
+    const manager = SessionManager.inMemory(cwd);
+    manager.appendMessage(makeUserMessage("history ".repeat(12_000)));
+    manager.appendMessage(makeUserMessage("recent ".repeat(12_000)));
+    const model = makeModel();
+    const notifications: Array<{ message: string; type: "info" | "warning" | "error" | undefined }> = [];
+    let authLookups = 0;
+    const ctx = {
+      cwd,
+      sessionManager: manager,
+      model,
+      modelRegistry: {
+        getApiKeyAndHeaders: () => {
+          authLookups += 1;
+          return new Promise(() => undefined);
+        },
+        getProvider: () => undefined,
+      },
+      thinkingLevel: "medium",
+      ui: {
+        notify: (message: string, type?: "info" | "warning" | "error") => {
+          notifications.push({ message, type });
+        },
+      },
+      getContextUsage: () => ({ tokens: 90_000, contextWindow: model.contextWindow, percent: 90 }),
+    } as unknown as ExtensionContext;
+    const runtime = new ExtensionRuntime({ appendEntry: () => undefined });
+    runtime.onSessionStart(ctx);
+    runtime.onTurnEnd(ctx);
+
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (runtime.getDiagnostics().counters.task_failed) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.equal(runtime.getDiagnostics().counters.task_failed, 1);
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0]?.message ?? "", /超时/);
+
+    runtime.onTurnEnd(ctx);
+    assert.equal(runtime.getDiagnostics().counters.task_started, 2);
+    assert.equal(authLookups, 1);
+    runtime.onSessionShutdown();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("persisted refresh checkpoint prevents another refresh after restore", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-runtime-refresh");
+  const firstId = manager.appendMessage(makeUserMessage("old history"));
+  const firstSnapshotId = manager.appendMessage(makeUserMessage("first snapshot"));
+  manager.appendCustomEntry(
+    "pi-press.precompaction",
+    makeCheckpointData(manager.getSessionId(), firstSnapshotId, firstId, {
+      checkpointId: "checkpoint-initial",
+    }),
+  );
+  const refreshSnapshotId = manager.appendMessage(makeUserMessage("refresh snapshot"));
+  manager.appendCustomEntry(
+    "pi-press.precompaction",
+    makeCheckpointData(manager.getSessionId(), refreshSnapshotId, firstId, {
+      checkpointId: "checkpoint-refresh",
+    }),
+  );
+  manager.appendMessage(makeUserMessage("trailing context ".repeat(15_000)));
+
+  const model = makeModel();
+  const ctx = {
+    cwd: "/tmp/pi-press-runtime-refresh",
+    sessionManager: manager,
+    model,
+    modelRegistry: {},
+    thinkingLevel: "medium",
+    getContextUsage: () => ({ tokens: 90_000, contextWindow: model.contextWindow, percent: 90 }),
+  } as unknown as ExtensionContext;
+  const runtime = new ExtensionRuntime({ appendEntry: () => undefined });
+  runtime.onSessionStart(ctx);
+  runtime.onTurnEnd(ctx);
+
+  assert.equal(runtime.getDiagnostics().counters.task_started ?? 0, 0);
+});
+
 test("unknown context usage does not schedule a task", () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime");
   manager.appendMessage(makeUserMessage("history"));
@@ -103,7 +269,7 @@ test("unknown context usage does not schedule a task", () => {
   assert.equal(runtime.getDiagnostics().counters.threshold_skipped_unknown_usage, 1);
 });
 
-test("single oversized turn skips without provider lookup or error notification", async () => {
+test("single oversized turn silently skips unavailable preparation", async () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime-no-preparation");
   manager.appendMessage(makeUserMessage("x".repeat(100_000)));
   const model = makeModel();
@@ -143,10 +309,10 @@ test("single oversized turn skips without provider lookup or error notification"
   assert.equal(diagnostics.counters.task_skipped_no_preparation, 1);
   assert.equal(diagnostics.counters.task_failed ?? 0, 0);
   assert.equal(authLookups, 0);
-  assert.equal(notifications.length, 0);
+  assert.deepEqual(notifications, []);
 });
 
-test("background failure is shown as a CLI error notification", async () => {
+test("authentication failure is shown as a CLI error notification", async () => {
   const manager = SessionManager.inMemory(`/tmp/pi-press-runtime-failure-${process.pid}`);
   manager.appendMessage(makeUserMessage("history ".repeat(12_000)));
   manager.appendMessage(makeUserMessage("recent ".repeat(12_000)));
@@ -157,7 +323,10 @@ test("background failure is shown as a CLI error notification", async () => {
     sessionManager: manager,
     model,
     modelRegistry: {
-      getApiKeyAndHeaders: async () => ({ ok: false as const, error: "provider test 不可用" }),
+      getApiKeyAndHeaders: async () => ({
+        ok: false as const,
+        error: "provider test 不可用，密钥 sk-review-secret",
+      }),
       getProvider: () => undefined,
     },
     thinkingLevel: "medium",
@@ -178,5 +347,9 @@ test("background failure is shown as a CLI error notification", async () => {
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0]?.type, "error");
   assert.match(notifications[0]?.message ?? "", /后台预压缩失败/);
+  assert.doesNotMatch(
+    JSON.stringify({ notifications, records: runtime.getDiagnostics().records }),
+    /sk-review-secret/,
+  );
   assert.equal(runtime.getDiagnostics().counters.task_failed, 1);
 });

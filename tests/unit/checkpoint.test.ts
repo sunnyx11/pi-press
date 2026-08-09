@@ -35,6 +35,27 @@ test("checkpoint schema accepts v3 and rejects unsupported or malformed data", (
   assert.ok(branch.length > 0);
 });
 
+test("checkpoint schema rejects excessive nesting without throwing", () => {
+  const { data } = makeBranch();
+  let nested: Record<string, unknown> = {};
+  for (let depth = 0; depth < 20_000; depth += 1) {
+    nested = { nested };
+  }
+  const value = {
+    ...data,
+    compaction: {
+      ...data.compaction,
+      details: { nested },
+    },
+  };
+
+  let parsed: ReturnType<typeof parseCheckpointData>;
+  assert.doesNotThrow(() => {
+    parsed = parseCheckpointData(value);
+  });
+  assert.equal(parsed, undefined);
+});
+
 test("selection requires current session, epoch and branch ancestry", () => {
   const { branch, data } = makeBranch();
   const candidates = findReadyCheckpointCandidates(branch, "session", null, undefined);

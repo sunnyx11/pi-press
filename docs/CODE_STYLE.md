@@ -297,12 +297,12 @@ function startTask(input: TaskInput): void {
 }
 ```
 
-`completeTask` 和 `failTask` 必须再次确认当前任务身份；不能仅依赖 Promise 是否完成。任务超时、取消或主动废弃时，先清除 `inFlightTask` 身份，再调用 `controller.abort()`。这样即使 provider 忽略取消，旧 Promise 也不能通过追加前检查。
+`completeTask` 和 `failTask` 必须再次确认当前任务身份；不能仅依赖 Promise 是否完成。任务超时、取消或主动废弃时，先清除 `inFlightTask` 身份，再调用 `controller.abort()`。这样即使 provider 忽略取消，旧 Promise 也不能通过追加前检查。provider 摘要 Promise 必须单独记录活动状态；取消后该 Promise 尚未完成时，不得启动新的后台摘要请求。
 
 ### 并发限制
 
 - 同一 session、正式 compaction epoch 和 snapshot key 同时最多一个后台摘要任务；
-- 同一时间最多一个后台摘要请求；
+- 同一时间最多一个后台摘要请求；取消后尚未完成的 provider Promise 仍计入该限制；
 - 同一时间最多一个 compaction hook 领取 checkpoint；
 - checkpoint 被领取后，取消同 epoch 中不再需要的后台任务；
 - `claimedCheckpointId` 在 hook 成功返回前保持领取状态，失败或取消时释放；
@@ -398,7 +398,7 @@ checkpoint 使用独立协议版本。首个实现只接受 `version: 3`，并�
 - summary 非空；
 - `readFiles` 和 `modifiedFiles` 保持数组类型。
 
-外部数据先按 `unknown` 处理，再通过运行时 schema 校验。未知 schema 版本、损坏 entry、非法引用和不完整数据必须忽略，并回退 Pi 原生 compaction。未知附加字段可原样保留，但不得改变已定义字段语义。
+外部数据先按 `unknown` 处理，再通过运行时 schema 校验。JSON 值校验最多访问 100000 个值，嵌套深度最多为 100，超过限制的数据视为无效。未知 schema 版本、损坏 entry、非法引用和不完整数据必须忽略，并回退 Pi 原生 compaction。未知附加字段可原样保留，但不得改变已定义字段语义。
 
 schema 版本、preparation 算法版本和摘要格式版本发生不兼容变化时，必须递增对应版本并使旧 checkpoint 不可消费。不能通过宽松解析掩盖协议变化。
 
@@ -448,12 +448,12 @@ acceptLimit = min(hardLimit, targetLimit)
 
 ### 配置
 
-配置读取与业务逻辑分离。配置按 `getAgentDir()/pi-press.json`、`cwd/CONFIG_DIR_NAME/pi-press.json` 的顺序合并，项目字段覆盖全局字段，同一文件只读取一次；字段必须经过类型、有限数值、百分比和时间范围校验；无效配置使用默认值并产生诊断。默认配置以 `DESIGN.md` 为准：
+配置读取与业务逻辑分离。配置按 `getAgentDir()/pi-press.json`、`cwd/CONFIG_DIR_NAME/pi-press.json` 的顺序合并，项目字段覆盖全局字段，同一文件只读取一次；无法读取、无法解析或根值不是对象的配置层只产生诊断，不覆盖已读取配置；字段必须经过类型、有限数值、百分比和时间范围校验，其中 `taskTimeoutMs` 与 `hookWaitTimeoutMs` 必须是 `1..2147483647` 范围内的整数；无效字段使用默认值并产生诊断。默认配置以 `DESIGN.md` 为准：
 
 - `precomputeMode: "threshold"`；
 - `softThresholdPercent: 80`；
 - `summaryReserveTokens: 16384`；
-- `taskTimeoutMs: 120000`；
+- `taskTimeoutMs: 300000`；
 - `hookWaitTimeoutMs: 1000`；
 - `targetPostCompactionPercent: 50`。
 
@@ -466,13 +466,17 @@ acceptLimit = min(hardLimit, targetLimit)
 | 情况 | 处理方式 |
 | --- | --- |
 | checkpoint Pi 版本不匹配、schema 未知或 entry 引用损坏 | 记录诊断，忽略 checkpoint，返回 `undefined`；正式 compaction 继续使用 Pi 原生实现。 |
-| 生成阶段容量预测超过目标比例 | 记录容量诊断，丢弃本次摘要 usage，不追加 checkpoint，不显示 error 通知；正式 compaction 继续使用 Pi 原生实现。 |
-| provider、公开 API、超时、结果或 checkpoint 追加失败 | 记录失败原因，通过 CLI error 通知显示，清除任务状态并回退 Pi 原生 compaction。 |
+| 达到阈值但 preparation 不可用 | 记录诊断并静默跳过；后续 `turn_end` 可以再次尝试。 |
+| 生成阶段容量预测超过目标比例或无法计算 | 记录容量诊断，通过 CLI warning 显示容量数值或不可用状态，丢弃本次摘要 usage，不追加 checkpoint；正式 compaction 继续使用 Pi 原生实现。 |
+| 消费阶段容量预测超过目标比例或无法计算 | 记录容量诊断，通过 CLI warning 显示 checkpoint ID、容量数值和 Pi 原生回退状态。 |
+| provider、公开 API、结果或 checkpoint 追加失败 | 记录不含认证信息和完整响应的失败原因，通过 CLI error 通知显示，清除任务状态并回退 Pi 原生 compaction。 |
+| 后台任务总超时 | 清除任务身份，发送 abort，记录超时并通过 CLI error 通知显示；正式 compaction 回退 Pi 原生实现。 |
+| hook 等待后台任务超时 | 中止对应任务，记录等待超时并通过 CLI warning 显示 Pi 原生回退状态。 |
 | `ctx.getContextUsage()` 无可用值 | 跳过本次调度，不自行估算 system prompt 或 tool 定义占用。 |
-| provider 认证失败、模型不可用或 context window 缺失 | 结束后台任务，记录失败原因，回退原生 compaction。 |
-| 超时、事件 signal 取消、session shutdown 或分支切换 | 视为正常取消，释放任务状态，不产生未处理异常。 |
+| provider 认证失败、模型不可用或 context window 缺失 | 结束后台任务，记录失败原因，通过 CLI error 通知显示，回退原生 compaction。 |
+| 事件 signal 取消、session shutdown 或分支切换 | 视为正常取消，释放任务状态，不产生未处理异常。 |
 | provider 瞬时错误 | 固定允许一次重试；每次重试仍需传递 signal。 |
-| `pi.appendEntry()` 失败 | 保留错误原因并清除任务身份，不宣称 checkpoint 已 ready。 |
+| `pi.appendEntry()` 失败 | 保留错误原因并清除任务身份，通过 CLI error 显示失败；只有 `pi.appendEntry()` 成功返回后才能显示 checkpoint ready。 |
 | 内部不变量破坏 | 在测试中让错误暴露；事件边界捕获后回退，并保留带 `cause` 的诊断。 |
 
 预期的 checkpoint 无效、provider 失败和取消不得用异常打断 Pi 的原生 compaction。需要抛出错误时使用标准 `Error`，保留 `cause`，并清除密钥、完整 provider 响应和敏感 session 内容。

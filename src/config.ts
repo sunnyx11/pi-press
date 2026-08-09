@@ -8,12 +8,13 @@ export const DEFAULT_CONFIG: PiPressConfig = {
   precomputeMode: "threshold",
   softThresholdPercent: 80,
   summaryReserveTokens: 16_384,
-  taskTimeoutMs: 120_000,
+  taskTimeoutMs: 300_000,
   hookWaitTimeoutMs: 1_000,
   targetPostCompactionPercent: 50,
 };
 
 const CONFIG_FILE_NAME = "pi-press.json";
+const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
 
 type ConfigKey = keyof PiPressConfig;
 
@@ -43,6 +44,10 @@ function isIntegerAtLeast(value: unknown, minimum: number): value is number {
   return isFiniteNumber(value) && Number.isInteger(value) && value >= minimum;
 }
 
+function isTimerDuration(value: unknown): value is number {
+  return isIntegerAtLeast(value, 1) && value <= MAX_TIMER_TIMEOUT_MS;
+}
+
 function isPercent(value: unknown): value is number {
   return isFiniteNumber(value) && value >= 0 && value <= 100;
 }
@@ -62,7 +67,7 @@ function isValidValue(key: ConfigKey, value: unknown): boolean {
       return isIntegerAtLeast(value, 0);
     case "taskTimeoutMs":
     case "hookWaitTimeoutMs":
-      return isIntegerAtLeast(value, 1);
+      return isTimerDuration(value);
   }
 }
 
@@ -74,7 +79,7 @@ interface ConfigLayerResult {
 function normalizeConfigLayer(raw: unknown): ConfigLayerResult {
   if (!isRecord(raw)) {
     return {
-      config: { ...DEFAULT_CONFIG },
+      config: {},
       diagnostics: ["配置必须是 JSON 对象"],
     };
   }
@@ -113,10 +118,9 @@ function readConfigLayer(configPath: string): ConfigLayerResult {
     if (isNodeError(error) && error.code === "ENOENT") {
       return { config: {}, diagnostics: [] };
     }
-    const reason = error instanceof Error ? error.message : String(error);
     return {
-      config: { ...DEFAULT_CONFIG },
-      diagnostics: [`无法读取配置文件：${reason}`],
+      config: {},
+      diagnostics: ["无法读取或解析配置文件"],
     };
   }
   return normalizeConfigLayer(raw);

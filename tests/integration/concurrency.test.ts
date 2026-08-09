@@ -134,6 +134,49 @@ function delayedResponse(
   };
 }
 
+test("background task timeout reports an error notification", async () => {
+  const scenario = createScenario(
+    { taskTimeoutMs: 20 },
+    delayedResponse(120),
+  );
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const diagnostics = scenario.runtime.getDiagnostics();
+    assert.equal(diagnostics.counters.task_failed, 1);
+    assert.equal(diagnostics.counters.task_cancelled ?? 0, 0);
+    assert.ok(
+      scenario.notifications.some(
+        (notification) => notification.type === "error" && notification.message.includes("超时"),
+      ),
+    );
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("timed out provider request prevents a second background request until it settles", async () => {
+  const activity = { active: 0, max: 0 };
+  const response = delayedResponse(120, undefined, activity);
+  const scenario = createScenario({ taskTimeoutMs: 20 }, response);
+  scenario.faux.setResponses([response, response]);
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(scenario.faux.state.callCount, 1);
+    assert.equal(activity.max, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
 test("hook waits for an in-flight checkpoint and reuses it", async () => {
   let resolveStarted!: () => void;
   const started = new Promise<void>((resolve) => {
@@ -186,6 +229,14 @@ test("hook timeout aborts the task before it can append a checkpoint", async () 
     assert.equal(diagnostics.counters.checkpoint_ready ?? 0, 0);
     assert.equal(diagnostics.counters.task_discarded, 1);
     assert.ok(diagnostics.records.some((record) => record.message === "hook_timeout"));
+    assert.ok(
+      scenario.notifications.some(
+        (notification) =>
+          notification.type === "warning" &&
+          notification.message.includes("等待预压缩结果超时") &&
+          notification.message.includes("Pi 原生压缩"),
+      ),
+    );
   } finally {
     rmSync(scenario.cwd, { recursive: true, force: true });
   }

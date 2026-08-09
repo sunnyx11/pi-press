@@ -15,7 +15,6 @@ import {
 import { estimateCheckpointCapacity } from "./checkpoint/capacity.js";
 import {
   findReadyCheckpointCandidates,
-  getConsumedCheckpointIds,
   getEpochCompactionId,
   getEntryIndex,
   getSnapshotSourceLeafId,
@@ -82,6 +81,10 @@ function isAbortLike(error: unknown): boolean {
     (error.name === "AbortError" || error.message === "The operation was aborted");
 }
 
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && error.name === "TimeoutError";
+}
+
 function getCheckpointIdFromDetails(details: unknown): string | undefined {
   if (!isJsonObject(details) || !isJsonObject(details.piPress)) {
     return undefined;
@@ -124,7 +127,10 @@ export class ExtensionRuntime {
   private currentConfig: PiPressConfig = { ...DEFAULT_CONFIG };
   private runEpoch = 0;
   private inFlightTask: BackgroundTask | undefined;
+  private activeProviderRequest: Promise<CompactionResult> | undefined;
   private claimedCheckpointId: string | undefined;
+  private claimSignal: AbortSignal | undefined;
+  private claimAbortHandler: (() => void) | undefined;
   private hookInFlight = false;
   private readonly attemptsBySnapshotKey = new Map<string, number>();
   private readonly refreshesByEpoch = new Map<string, number>();
@@ -162,7 +168,7 @@ export class ExtensionRuntime {
       this.diagnostics.count("checkpoint_consumed");
       this.diagnostics.recordUsage("consumed", event.compactionEntry.usage);
       if (this.claimedCheckpointId === checkpointId) {
-        this.claimedCheckpointId = undefined;
+        this.releaseCheckpointClaim(checkpointId);
       }
     }
     this.invalidate("session_compact", false);
@@ -218,7 +224,7 @@ export class ExtensionRuntime {
       snapshotSourceLeafId,
       config,
     );
-    if (this.inFlightTask) {
+    if (this.inFlightTask || this.activeProviderRequest) {
       return;
     }
 
@@ -231,7 +237,11 @@ export class ExtensionRuntime {
     const existingCandidate = candidates[0];
     const epochKey = `${sessionId}:${epochCompactionId ?? "null"}`;
     if (existingCandidate) {
-      const refreshCount = this.refreshesByEpoch.get(epochKey) ?? 0;
+      const persistedRefreshCount = candidates.length - 1;
+      const refreshCount = Math.max(
+        this.refreshesByEpoch.get(epochKey) ?? 0,
+        persistedRefreshCount,
+      );
       if (
         refreshCount >= MAX_REFRESHES_PER_EPOCH ||
         !this.shouldRefresh(existingCandidate, branchEntries, model, config)
@@ -284,6 +294,10 @@ export class ExtensionRuntime {
       }
       const waitOutcome = await this.waitForTask(task, config.hookWaitTimeoutMs, event.signal);
       if (waitOutcome !== "finished") {
+        if (waitOutcome === "timeout") {
+          this.diagnostics.count("hook_wait_timed_out");
+          this.notifyWarning("正式压缩等待预压缩结果超时，已取消后台任务并回退 Pi 原生压缩。");
+        }
         this.discardTask(task, waitOutcome === "timeout" ? "hook_timeout" : "hook_aborted");
         return undefined;
       }
@@ -316,6 +330,10 @@ export class ExtensionRuntime {
     }
   }
 
+  private notifyWarning(message: string): void {
+    this.notifyUser(`pi-press：${message}`, "warning");
+  }
+
   private reportTaskFailure(message: string): void {
     const failure = describeError(message);
     this.diagnostics.count("task_failed");
@@ -343,12 +361,33 @@ export class ExtensionRuntime {
     return result.config;
   }
 
+  private claimCheckpoint(checkpointId: string, signal: AbortSignal): void {
+    this.releaseCheckpointClaim();
+    this.claimedCheckpointId = checkpointId;
+    this.claimSignal = signal;
+    const onAbort = (): void => this.releaseCheckpointClaim(checkpointId);
+    this.claimAbortHandler = onAbort;
+    signal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  private releaseCheckpointClaim(checkpointId?: string): void {
+    if (checkpointId !== undefined && this.claimedCheckpointId !== checkpointId) {
+      return;
+    }
+    if (this.claimSignal && this.claimAbortHandler) {
+      this.claimSignal.removeEventListener("abort", this.claimAbortHandler);
+    }
+    this.claimedCheckpointId = undefined;
+    this.claimSignal = undefined;
+    this.claimAbortHandler = undefined;
+  }
+
   private invalidate(reason: string, clearContext: boolean): void {
     this.runEpoch += 1;
     if (this.inFlightTask) {
       this.discardTask(this.inFlightTask, reason);
     }
-    this.claimedCheckpointId = undefined;
+    this.releaseCheckpointClaim();
     this.attemptsBySnapshotKey.clear();
     this.refreshesByEpoch.clear();
     if (clearContext) {
@@ -363,6 +402,7 @@ export class ExtensionRuntime {
     return (
       this.inFlightTask === task &&
       !task.discarded &&
+      !task.controller.signal.aborted &&
       task.runEpoch === this.runEpoch &&
       this.currentSessionId === task.sessionId &&
       this.currentConfig.precomputeMode !== "off"
@@ -397,82 +437,104 @@ export class ExtensionRuntime {
 
   private async runBackgroundTask(task: BackgroundTask): Promise<void> {
     try {
-      if (!this.isCurrentTask(task)) {
-        return;
-      }
-      const preparation = prepareCompactionFromBranch(
-        task.branchEntries,
-        createPreparationSettings(task.config),
-      );
-      if (!preparation) {
-        this.diagnostics.count("task_skipped_no_preparation");
-        return;
-      }
-      task.firstKeptEntryId = preparation.firstKeptEntryId;
-      if (!this.isCurrentTask(task)) {
-        return;
-      }
-
-      const registry = this.currentModelRegistry;
-      if (!registry) {
-        this.diagnostics.count("task_skipped_missing_registry");
-        this.reportTaskFailure("缺少当前模型的 provider 注册表");
-        return;
-      }
-      const providerResult = await resolveProviderRequest(registry, task.model);
-      if (!this.isCurrentTask(task)) {
-        return;
-      }
-      if (!providerResult.ok) {
-        this.diagnostics.count(`provider_${providerResult.failure.kind}_failure`);
-        const failure = providerResult.failure.message || `provider ${providerResult.failure.kind} 不可用`;
-        this.diagnostics.record("provider", failure);
-        this.reportTaskFailure(failure);
-        return;
-      }
-
-      const retry = {
-        enabled: MAX_BACKGROUND_RETRIES > 0,
-        maxRetries: MAX_BACKGROUND_RETRIES,
-        baseDelayMs: RETRY_BASE_DELAY_MS,
-      };
-      const result = await this.runWithTimeout(
-        () => compact(
-          preparation,
-          providerResult.request.model,
-          providerResult.request.apiKey,
-          providerResult.request.headers,
-          undefined,
-          task.controller.signal,
-          task.thinkingLevel,
-          providerResult.request.streamFn,
-          providerResult.request.env,
-          retry,
-        ),
-        task.controller,
-        task.config.taskTimeoutMs,
-      );
-      if (!this.isCurrentTask(task)) {
-        this.diagnostics.recordUsage("discarded", result.usage);
-        return;
-      }
-      const appendOutcome = this.appendCheckpoint(task, preparation, result);
-      if (appendOutcome !== "appended") {
-        this.diagnostics.recordUsage("discarded", result.usage);
-        if (appendOutcome === "failed" && this.isCurrentTask(task)) {
-          this.reportTaskFailure("压缩结果未通过 checkpoint 校验或追加失败");
-        }
-        return;
-      }
-      this.diagnostics.count("checkpoint_ready");
-      this.notifyCheckpointReady(task);
+      await this.runWithTimeout(() => this.generateCheckpoint(task), task);
     } catch (error: unknown) {
+      if (isTimeoutError(error)) {
+        this.diagnostics.count("task_timed_out");
+        this.reportTaskFailure("后台预压缩超时");
+        return;
+      }
       if (task.discarded || task.controller.signal.aborted || isAbortLike(error)) {
         this.diagnostics.count("task_cancelled");
         return;
       }
-      this.reportTaskFailure(describeError(error));
+      this.reportTaskFailure("后台预压缩执行失败");
     }
+  }
+
+  private async generateCheckpoint(task: BackgroundTask): Promise<void> {
+    if (!this.isCurrentTask(task)) {
+      return;
+    }
+    const preparation = prepareCompactionFromBranch(
+      task.branchEntries,
+      createPreparationSettings(task.config),
+    );
+    if (!preparation) {
+      const message = "当前分支无法构造可用 preparation";
+      this.diagnostics.count("task_skipped_no_preparation");
+      this.diagnostics.record("task", message);
+      return;
+    }
+    task.firstKeptEntryId = preparation.firstKeptEntryId;
+    if (!this.isCurrentTask(task)) {
+      return;
+    }
+
+    const registry = this.currentModelRegistry;
+    if (!registry) {
+      this.diagnostics.count("task_skipped_missing_registry");
+      this.reportTaskFailure("缺少当前模型的 provider 注册表");
+      return;
+    }
+    const providerResult = await resolveProviderRequest(
+      registry,
+      task.model,
+      task.controller.signal,
+    );
+    if (!this.isCurrentTask(task)) {
+      return;
+    }
+    if (!providerResult.ok) {
+      this.diagnostics.count(`provider_${providerResult.failure.kind}_failure`);
+      const failure = providerResult.failure.kind === "auth"
+        ? "活动模型认证不可用"
+        : "活动模型 provider 不可用";
+      this.diagnostics.record("provider", failure);
+      this.reportTaskFailure(failure);
+      return;
+    }
+
+    const retry = {
+      enabled: MAX_BACKGROUND_RETRIES > 0,
+      maxRetries: MAX_BACKGROUND_RETRIES,
+      baseDelayMs: RETRY_BASE_DELAY_MS,
+    };
+    const request = Promise.resolve().then(() => compact(
+      preparation,
+      providerResult.request.model,
+      providerResult.request.apiKey,
+      providerResult.request.headers,
+      undefined,
+      task.controller.signal,
+      task.thinkingLevel,
+      providerResult.request.streamFn,
+      providerResult.request.env,
+      retry,
+    ));
+    this.activeProviderRequest = request;
+    const releaseRequest = (): void => {
+      if (this.activeProviderRequest === request) {
+        this.activeProviderRequest = undefined;
+      }
+    };
+    void request.then(releaseRequest, releaseRequest);
+
+    const result = await request;
+    if (!this.isCurrentTask(task)) {
+      this.diagnostics.recordUsage("discarded", result.usage);
+      return;
+    }
+    const appendOutcome = this.appendCheckpoint(task, preparation, result);
+    if (appendOutcome !== "appended") {
+      this.diagnostics.recordUsage("discarded", result.usage);
+      if (appendOutcome === "failed" && this.isCurrentTask(task)) {
+        this.reportTaskFailure("压缩结果未通过 checkpoint 校验或追加失败");
+      }
+      return;
+    }
+    this.diagnostics.count("checkpoint_ready");
+    this.notifyCheckpointReady(task);
   }
 
   private finishTask(task: BackgroundTask): void {
@@ -495,17 +557,19 @@ export class ExtensionRuntime {
 
   private async runWithTimeout<T>(
     operation: () => Promise<T>,
-    controller: AbortController,
-    timeoutMs: number,
+    task: BackgroundTask,
   ): Promise<T> {
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
-        controller.abort();
+        if (this.inFlightTask === task) {
+          this.inFlightTask = undefined;
+        }
+        task.controller.abort();
         const error = new Error("Pi-press background task timed out");
         error.name = "TimeoutError";
         reject(error);
-      }, timeoutMs);
+      }, task.config.taskTimeoutMs);
     });
     try {
       return await Promise.race([Promise.resolve().then(operation), timeout]);
@@ -589,11 +653,20 @@ export class ExtensionRuntime {
     );
     if (!capacity) {
       this.diagnostics.count("checkpoint_skipped_capacity_unavailable");
+      this.diagnostics.record(
+        "capacity",
+        `checkpoint ${candidateData.checkpointId}：无法计算预计压缩后容量`,
+      );
+      this.notifyWarning(
+        `后台预压缩容量无法计算，未持久化 checkpoint ${candidateData.checkpointId}。`,
+      );
       return "skipped";
     }
     if (!capacity.accepted) {
+      const message = describeCapacityRejection(candidateData.checkpointId, capacity);
       this.diagnostics.count("checkpoint_skipped_capacity");
-      this.diagnostics.record("capacity", describeCapacityRejection(candidateData.checkpointId, capacity));
+      this.diagnostics.record("capacity", message);
+      this.notifyWarning(`后台预压缩容量不足，未持久化结果：${message}。`);
       return "skipped";
     }
     candidateData.estimatedTokensAfterAtSnapshot = capacity.estimatedTokensAfter;
@@ -650,11 +723,6 @@ export class ExtensionRuntime {
     const branch = ctx.sessionManager.getBranch();
     const sessionId = ctx.sessionManager.getSessionId();
     const epochCompactionId = getEpochCompactionId(branch);
-    if (this.claimedCheckpointId) {
-      if (!getConsumedCheckpointIds(branch).has(this.claimedCheckpointId)) {
-        this.claimedCheckpointId = undefined;
-      }
-    }
     const candidates = findReadyCheckpointCandidates(
       branch,
       sessionId,
@@ -676,19 +744,29 @@ export class ExtensionRuntime {
       );
       if (!capacity) {
         this.diagnostics.count("checkpoint_rejected_capacity_unavailable");
+        this.diagnostics.record(
+          "capacity",
+          `checkpoint ${candidate.data.checkpointId}：无法计算预计压缩后容量`,
+        );
+        this.notifyWarning(
+          `checkpoint ${candidate.data.checkpointId} 容量无法计算，已回退 Pi 原生压缩。`,
+        );
         continue;
       }
       if (!capacity.accepted) {
+        const message = describeCapacityRejection(candidate.data.checkpointId, capacity);
         this.diagnostics.count("checkpoint_rejected_capacity");
-        this.diagnostics.record("capacity", describeCapacityRejection(candidate.data.checkpointId, capacity));
+        this.diagnostics.record("capacity", message);
+        this.notifyWarning(`checkpoint 容量不足，已回退 Pi 原生压缩：${message}。`);
         continue;
       }
-      this.claimedCheckpointId = candidate.data.checkpointId;
+      const result = buildCheckpointCompactionResult(candidate, event.preparation);
+      this.claimCheckpoint(candidate.data.checkpointId, event.signal);
       if (this.inFlightTask && this.inFlightTask.epochCompactionId === epochCompactionId) {
         this.discardTask(this.inFlightTask, "checkpoint_reused");
       }
       this.diagnostics.count("checkpoint_reused");
-      return buildCheckpointCompactionResult(candidate, event.preparation);
+      return result;
     }
     return undefined;
   }

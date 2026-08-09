@@ -9,6 +9,7 @@ Pi-press 保留 Pi 原生的 session、分支和正式 compaction 机制，只�
 - 当前 agent 继续执行，不等待后台摘要请求。
 - 预压缩结果通过 Pi 的扩展 API 保存。
 - 检查点失效、容量不足或 provider 请求失败时，回退到 Pi 原生压缩。
+- checkpoint 持久化完成后才显示成功；认证失败和后台摘要执行失败显示 error，preparation 不可用只记录诊断，容量不足和正式压缩等待超时显示 warning。
 
 ## 与原生压缩比较
 
@@ -59,6 +60,7 @@ pi -e ./src/index.ts
 {
   "precomputeMode": "threshold",
   "softThresholdPercent": 80,
+  "taskTimeoutMs": 300000,
   "targetPostCompactionPercent": 50
 }
 ```
@@ -71,7 +73,7 @@ pi -e ./src/index.ts
 | `"threshold"` | 处理阈值触发的自动压缩。 |
 | `"threshold-and-manual"` | 在阈值压缩之外，复用没有自定义指令的手动压缩检查点。 |
 
-其他可配置字段包括摘要预留 token、后台任务超时、压缩前等待时间和压缩后目标比例。后台摘要请求固定允许一次瞬时错误重试；预压缩固定保留 `2000` 个近期 token；同一正式 compaction epoch 最多刷新一次 checkpoint，这些值都不作为配置项。完整字段、默认值、校验规则和容量计算见 [docs/DESIGN.md](docs/DESIGN.md)。
+其他可配置字段包括摘要预留 token、后台任务超时、压缩前等待时间和压缩后目标比例，后台任务总超时默认为 `300000` 毫秒。后台摘要请求固定允许一次瞬时错误重试；预压缩固定保留 `2000` 个近期 token；同一正式 compaction epoch 最多刷新一次 checkpoint，这些值都不作为配置项。完整字段、默认值、校验规则和容量计算见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 二次开发
 

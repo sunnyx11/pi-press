@@ -14,26 +14,71 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function isJsonValue(value: unknown, seen = new WeakSet<object>()): value is JsonValue {
-  if (value === null || typeof value === "string" || typeof value === "boolean") {
-    return true;
+const MAX_JSON_DEPTH = 100;
+const MAX_JSON_VALUES = 100_000;
+
+type PendingJsonValue = {
+  value: unknown;
+  depth: number;
+};
+
+export function isJsonValue(value: unknown): value is JsonValue {
+  const pending: PendingJsonValue[] = [{ value, depth: 0 }];
+  const seen = new WeakSet<object>();
+  let visited = 0;
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) {
+      continue;
+    }
+    visited += 1;
+    if (visited > MAX_JSON_VALUES || current.depth > MAX_JSON_DEPTH) {
+      return false;
+    }
+
+    const currentValue = current.value;
+    if (
+      currentValue === null ||
+      typeof currentValue === "string" ||
+      typeof currentValue === "boolean"
+    ) {
+      continue;
+    }
+    if (typeof currentValue === "number") {
+      if (!Number.isFinite(currentValue)) {
+        return false;
+      }
+      continue;
+    }
+    if (typeof currentValue !== "object" || seen.has(currentValue)) {
+      return false;
+    }
+    seen.add(currentValue);
+
+    let children: unknown[];
+    try {
+      if (Array.isArray(currentValue)) {
+        children = currentValue;
+      } else {
+        const prototype = Object.getPrototypeOf(currentValue);
+        if (prototype !== Object.prototype && prototype !== null) {
+          return false;
+        }
+        children = Object.values(currentValue);
+      }
+    } catch {
+      return false;
+    }
+    if (visited + pending.length + children.length > MAX_JSON_VALUES) {
+      return false;
+    }
+    for (const child of children) {
+      pending.push({ value: child, depth: current.depth + 1 });
+    }
   }
-  if (typeof value === "number") {
-    return Number.isFinite(value);
-  }
-  if (typeof value !== "object") {
-    return false;
-  }
-  if (seen.has(value)) {
-    return false;
-  }
-  seen.add(value);
-  if (Array.isArray(value)) {
-    return value.every((item) => isJsonValue(item, seen));
-  }
-  return Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null
-    ? Object.entries(value).every(([key, item]) => typeof key === "string" && isJsonValue(item, seen))
-    : false;
+
+  return true;
 }
 
 export function isJsonObject(value: unknown): value is JsonObject {

@@ -19,6 +19,7 @@ test("normalizeConfig returns design defaults and ignores removed fields", () =>
   });
   assert.deepEqual(result.config, DEFAULT_CONFIG);
   assert.equal(DEFAULT_CONFIG.softThresholdPercent, 80);
+  assert.equal(DEFAULT_CONFIG.taskTimeoutMs, 300_000);
   assert.deepEqual(result.diagnostics, []);
 });
 
@@ -61,6 +62,30 @@ test("loadConfig merges global config before project overrides", () => {
   }
 });
 
+test("loadConfig keeps global values when project JSON is malformed", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-press-config-"));
+  const globalDir = join(root, "global", "agent");
+  const projectDir = join(root, "project");
+  mkdirSync(globalDir, { recursive: true });
+  mkdirSync(join(projectDir, ".pi"), { recursive: true });
+
+  try {
+    writeFileSync(
+      join(globalDir, "pi-press.json"),
+      JSON.stringify({ softThresholdPercent: 70, hookWaitTimeoutMs: 777 }),
+    );
+    writeFileSync(join(projectDir, ".pi", "pi-press.json"), "invalid json");
+
+    const result = loadConfig(projectDir, globalDir);
+
+    assert.equal(result.config.softThresholdPercent, 70);
+    assert.equal(result.config.hookWaitTimeoutMs, 777);
+    assert.equal(result.diagnostics.length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig deduplicates a shared global and project file", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-press-config-"));
   const projectDir = join(root, "project");
@@ -84,6 +109,21 @@ test("config fingerprint and snapshot key are deterministic", () => {
   const second = configFingerprint({ ...DEFAULT_CONFIG });
   assert.equal(first, second);
   assert.match(createSnapshotKey("session", null, "leaf", DEFAULT_CONFIG), /session:null:leaf:0\.84\.1:1:1:/);
+});
+
+test("normalizeConfig rejects timeout values above the Node timer limit", () => {
+  const result = normalizeConfig({
+    taskTimeoutMs: 2_147_483_648,
+    hookWaitTimeoutMs: Number.MAX_SAFE_INTEGER,
+  });
+
+  assert.equal(result.config.taskTimeoutMs, DEFAULT_CONFIG.taskTimeoutMs);
+  assert.equal(result.config.hookWaitTimeoutMs, DEFAULT_CONFIG.hookWaitTimeoutMs);
+  assert.equal(result.diagnostics.length, 2);
+
+  const maximum = normalizeConfig({ taskTimeoutMs: 2_147_483_647 });
+  assert.equal(maximum.config.taskTimeoutMs, 2_147_483_647);
+  assert.deepEqual(maximum.diagnostics, []);
 });
 
 test("normalizeConfig rejects a non-object root", () => {
