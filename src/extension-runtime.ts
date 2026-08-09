@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, Model, Usage } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   VERSION,
   compact,
@@ -49,7 +49,6 @@ type SessionManager = ExtensionContext["sessionManager"];
 type ModelRegistry = ExtensionContext["modelRegistry"];
 
 type BackgroundTask = {
-  id: string;
   sessionId: string;
   runEpoch: number;
   snapshotLeafId: string;
@@ -65,6 +64,12 @@ type BackgroundTask = {
   firstKeptEntryId?: string;
   promise?: Promise<void>;
   discarded: boolean;
+};
+
+type CheckpointClaim = {
+  checkpointId: string;
+  signal: AbortSignal;
+  abortHandler: () => void;
 };
 
 type WaitOutcome = "finished" | "timeout" | "aborted";
@@ -103,20 +108,6 @@ function describeCapacityRejection(checkpointId: string, capacity: CompactionCap
   return `checkpoint ${checkpointId}：预计压缩后 ${capacity.estimatedTokensAfter} tokens，接受上限 ${capacity.acceptLimit} tokens`;
 }
 
-function createCheckpointCandidate(data: CheckpointData): CheckpointCandidate {
-  return {
-    entry: {
-      type: "custom",
-      id: `pi-press-pending-${data.checkpointId}`,
-      parentId: null,
-      timestamp: data.createdAt,
-      customType: CHECKPOINT_CUSTOM_TYPE,
-      data,
-    },
-    data,
-  };
-}
-
 /** 管理单个扩展实例的 session 状态、后台摘要任务和 checkpoint 复用。 */
 export class ExtensionRuntime {
   private readonly diagnostics: Diagnostics;
@@ -128,9 +119,7 @@ export class ExtensionRuntime {
   private runEpoch = 0;
   private inFlightTask: BackgroundTask | undefined;
   private activeProviderRequest: Promise<CompactionResult> | undefined;
-  private claimedCheckpointId: string | undefined;
-  private claimSignal: AbortSignal | undefined;
-  private claimAbortHandler: (() => void) | undefined;
+  private checkpointClaim: CheckpointClaim | undefined;
   private hookInFlight = false;
   private readonly attemptsBySnapshotKey = new Map<string, number>();
   private readonly refreshesByEpoch = new Map<string, number>();
@@ -146,7 +135,7 @@ export class ExtensionRuntime {
   onSessionStart(ctx: ExtensionContext): void {
     this.invalidate("session_start", true);
     this.bindContext(ctx);
-    this.loadCurrentConfig(ctx, true);
+    this.loadCurrentConfig(ctx);
   }
 
   onSessionBeforeTree(): void {
@@ -155,7 +144,7 @@ export class ExtensionRuntime {
 
   onSessionTree(ctx: ExtensionContext): void {
     this.bindContext(ctx);
-    this.loadCurrentConfig(ctx, true);
+    this.loadCurrentConfig(ctx);
   }
 
   onSessionShutdown(): void {
@@ -167,7 +156,7 @@ export class ExtensionRuntime {
     if (checkpointId) {
       this.diagnostics.count("checkpoint_consumed");
       this.diagnostics.recordUsage("consumed", event.compactionEntry.usage);
-      if (this.claimedCheckpointId === checkpointId) {
+      if (this.checkpointClaim?.checkpointId === checkpointId) {
         this.releaseCheckpointClaim(checkpointId);
       }
     }
@@ -185,7 +174,7 @@ export class ExtensionRuntime {
 
   onTurnEnd(ctx: ExtensionContext): void {
     this.bindContext(ctx);
-    const config = this.loadCurrentConfig(ctx, true);
+    const config = this.loadCurrentConfig(ctx);
     if (config.precomputeMode === "off") {
       return;
     }
@@ -232,7 +221,7 @@ export class ExtensionRuntime {
       branchEntries,
       sessionId,
       epochCompactionId,
-      this.claimedCheckpointId,
+      this.checkpointClaim?.checkpointId,
     );
     const existingCandidate = candidates[0];
     const epochKey = `${sessionId}:${epochCompactionId ?? "null"}`;
@@ -274,7 +263,7 @@ export class ExtensionRuntime {
     ctx: ExtensionContext,
   ): Promise<{ compaction: CompactionResult } | undefined> {
     this.bindContext(ctx);
-    const config = this.loadCurrentConfig(ctx, true);
+    const config = this.loadCurrentConfig(ctx);
     if (config.precomputeMode === "off" || !this.isSupportedCompaction(event, config)) {
       return undefined;
     }
@@ -349,13 +338,13 @@ export class ExtensionRuntime {
     );
   }
 
-  private loadCurrentConfig(ctx: ExtensionContext, cancelWhenOff: boolean): PiPressConfig {
+  private loadCurrentConfig(ctx: ExtensionContext): PiPressConfig {
     const result = loadConfig(ctx.cwd);
     this.currentConfig = result.config;
     for (const message of result.diagnostics) {
       this.diagnostics.record("config", message);
     }
-    if (cancelWhenOff && result.config.precomputeMode === "off" && this.inFlightTask) {
+    if (result.config.precomputeMode === "off" && this.inFlightTask) {
       this.discardTask(this.inFlightTask, "config_off");
     }
     return result.config;
@@ -363,23 +352,18 @@ export class ExtensionRuntime {
 
   private claimCheckpoint(checkpointId: string, signal: AbortSignal): void {
     this.releaseCheckpointClaim();
-    this.claimedCheckpointId = checkpointId;
-    this.claimSignal = signal;
-    const onAbort = (): void => this.releaseCheckpointClaim(checkpointId);
-    this.claimAbortHandler = onAbort;
-    signal.addEventListener("abort", onAbort, { once: true });
+    const abortHandler = (): void => this.releaseCheckpointClaim(checkpointId);
+    this.checkpointClaim = { checkpointId, signal, abortHandler };
+    signal.addEventListener("abort", abortHandler, { once: true });
   }
 
   private releaseCheckpointClaim(checkpointId?: string): void {
-    if (checkpointId !== undefined && this.claimedCheckpointId !== checkpointId) {
+    const claim = this.checkpointClaim;
+    if (!claim || (checkpointId !== undefined && claim.checkpointId !== checkpointId)) {
       return;
     }
-    if (this.claimSignal && this.claimAbortHandler) {
-      this.claimSignal.removeEventListener("abort", this.claimAbortHandler);
-    }
-    this.claimedCheckpointId = undefined;
-    this.claimSignal = undefined;
-    this.claimAbortHandler = undefined;
+    claim.signal.removeEventListener("abort", claim.abortHandler);
+    this.checkpointClaim = undefined;
   }
 
   private invalidate(reason: string, clearContext: boolean): void {
@@ -410,11 +394,10 @@ export class ExtensionRuntime {
   }
 
   private startBackgroundTask(
-    input: Omit<BackgroundTask, "id" | "runEpoch" | "controller" | "startedAt" | "discarded">
+    input: Omit<BackgroundTask, "runEpoch" | "controller" | "startedAt" | "discarded">
   ): void {
     const task: BackgroundTask = {
       ...input,
-      id: randomUUID(),
       runEpoch: this.runEpoch,
       controller: new AbortController(),
       startedAt: Date.now(),
@@ -643,10 +626,9 @@ export class ExtensionRuntime {
       },
       createdAt: new Date().toISOString(),
     };
-    const candidate = createCheckpointCandidate(candidateData);
     const capacity = estimateCheckpointCapacity(
       task.branchEntries,
-      candidate,
+      candidateData,
       preparation,
       contextWindow,
       task.config.targetPostCompactionPercent,
@@ -727,7 +709,7 @@ export class ExtensionRuntime {
       branch,
       sessionId,
       epochCompactionId,
-      this.claimedCheckpointId,
+      this.checkpointClaim?.checkpointId,
     );
     const model = asModel(ctx.model);
     if (!model) {
@@ -737,7 +719,7 @@ export class ExtensionRuntime {
     for (const candidate of candidates) {
       const capacity = estimateCheckpointCapacity(
         branch,
-        candidate,
+        candidate.data,
         event.preparation,
         model.contextWindow,
         config.targetPostCompactionPercent,

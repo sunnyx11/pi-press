@@ -227,8 +227,8 @@ import {
 | `session_before_tree` | 递增运行 epoch，取消当前任务，释放当前分支绑定状态；不读取将要失效的旧 session 对象。 |
 | `session_tree` | 读取新分支并恢复内存状态；不重复执行已经由 `session_before_tree` 完成的 epoch 递增。 |
 | `session_shutdown` | 递增运行 epoch，先清除任务身份再发送 abort，清理 session 资源；不等待后台 provider Promise。 |
-| `model_select` | 只更新后续任务的 provenance；不得使已有 ready checkpoint 自动失效，也不得改变 snapshot key。 |
-| `thinking_level_select` | 只更新后续任务的 provenance；处理器不承担 checkpoint 失效和消费判断。 |
+| `model_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取模型 provenance，不废弃已有 ready checkpoint，也不改变 snapshot key。 |
+| `thinking_level_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取 thinking level，不承担 checkpoint 失效和消费判断。 |
 
 首个版本不在 `agent_end` 或 `agent_settled` 中调用 `ctx.compact()`。`session_before_compact` 不支持的 `overflow`、`willRetry: true`、带 `customInstructions` 的请求必须回退 Pi 原生 compaction。
 

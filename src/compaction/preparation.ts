@@ -72,7 +72,7 @@ function isUsableUsage(value: unknown): value is Usage {
 }
 
 function getMessageUsage(message: AgentMessage): Usage | undefined {
-  if (message.role !== "assistant" || !isRecord(message)) {
+  if (message.role !== "assistant") {
     return undefined;
   }
   if (message.stopReason === "aborted" || message.stopReason === "error") {
@@ -94,12 +94,12 @@ export function estimateContextTokensFromEntries(entries: readonly SessionEntry[
   }
 
   if (lastUsageIndex < 0) {
-    return messages.reduce((total, message) => total + estimateTokens(message), 0);
+    return estimateMessagesTokens(messages);
   }
 
   const usage = getLastAssistantUsage(activeEntries);
   if (!usage) {
-    return messages.reduce((total, message) => total + estimateTokens(message), 0);
+    return estimateMessagesTokens(messages);
   }
   let trailingTokens = 0;
   for (let index = lastUsageIndex + 1; index < messages.length; index += 1) {

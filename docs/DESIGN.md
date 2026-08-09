@@ -382,7 +382,7 @@ custom checkpoint 和 metrics entry 会成为 session tree 中的新 leaf，但�
 - `session_tree`：按新分支恢复状态；不重复递增已经由 `session_before_tree` 更新的 `runEpoch`。
 - `session_shutdown`：递增 `runEpoch`，中止任务并清除 session-bound 引用；处理器不等待后台 provider Promise，后台闭包不得再访问失效的 `pi` 或 `ctx`。
 - `session_compact`：记录消费，递增 `runEpoch`，中止旧 epoch 任务并以新正式 compaction ID 开始下一轮。
-- `model_select` 和 `thinking_level_select`：只更新后续任务的生成来源，不改变内容 snapshot key，也不废弃已持久化 ready checkpoint。
+- `model_select` 和 `thinking_level_select`：不注册专用处理器；后续任务从新的事件上下文读取生成来源，不改变内容 snapshot key，也不废弃已持久化 ready checkpoint。
 
 ## 运行时状态与并发
 
@@ -489,7 +489,7 @@ Promise
 - 正式 compaction 先发生，旧 epoch 任务随后完成但不能追加 checkpoint；
 - `session_before_tree` 中止任务，`session_tree` 恢复新分支，返回旧分支后恢复持久化 checkpoint；
 - `session_shutdown` 和 reload 后旧后台闭包不访问失效的 `pi`/`ctx`，shutdown handler 不等待延迟 provider Promise；
-- `model_select` 和 `thinking_level_select` 更新后续任务 provenance，但不改变内容 snapshot key，也不废弃 ready checkpoint；
+- 模型或 thinking level 变化后的后续任务使用新的 provenance，但不改变内容 snapshot key，也不废弃 ready checkpoint；
 - 同一 snapshot key 去重、明确失败后的受控重试和每 epoch 最多一次刷新；
 - `precomputeMode` 三种取值及运行中切换到 `"off"`；
 - manual `/compact`、`customInstructions`、所有 overflow compaction 和 `willRetry` 均按支持范围复用或回退；

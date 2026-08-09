@@ -12,6 +12,4 @@ export default function registerPiPress(pi: ExtensionAPI): void {
   pi.on("session_before_tree", () => runtime.onSessionBeforeTree());
   pi.on("session_tree", (_event, ctx) => runtime.onSessionTree(ctx));
   pi.on("session_shutdown", () => runtime.onSessionShutdown());
-  pi.on("model_select", () => undefined);
-  pi.on("thinking_level_select", () => undefined);
 }

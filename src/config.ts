@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir, VERSION } from "@earendil-works/pi-coding-agent";
-import type { PiPressConfig, PrecomputeMode } from "./types.js";
+import {
+  PREPARATION_ALGORITHM_VERSION,
+  SUMMARY_FORMAT_VERSION,
+  type PiPressConfig,
+  type PrecomputeMode,
+} from "./types.js";
 
 export const DEFAULT_CONFIG: PiPressConfig = {
   precomputeMode: "threshold",
@@ -176,8 +181,8 @@ export function createSnapshotKey(
     epochCompactionId ?? "null",
     snapshotSourceLeafId,
     VERSION,
-    "1",
-    "1",
+    PREPARATION_ALGORITHM_VERSION,
+    SUMMARY_FORMAT_VERSION,
     configFingerprint(config),
   ].join(":");
 }

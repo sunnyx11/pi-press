@@ -2,7 +2,6 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import type {
   compact,
-  CompactionResult,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
@@ -95,29 +94,3 @@ export interface ProviderRequest {
   env?: Record<string, string>;
   streamFn: StreamFn;
 }
-
-export interface PreparationSnapshot {
-  sessionId: string;
-  snapshotLeafId: string;
-  snapshotSourceLeafId: string;
-  epochCompactionId: string | null;
-  snapshotKey: string;
-  preparation: CompactionPreparation;
-  model: Model<Api>;
-  thinkingLevel: string;
-  providerRequest: ProviderRequest;
-  branchEntries: SessionEntry[];
-}
-
-export interface StoredCompactionResult extends Omit<CompactionResult, "usage" | "details"> {
-  usage?: Usage;
-  details?: JsonObject;
-}
-
-export interface PiPressCompactionDetails extends JsonObject {
-  readFiles: JsonValue;
-  modifiedFiles: JsonValue;
-  piPress: JsonValue;
-}
-
-export type PiCompactionSettings = CompactionSettings;

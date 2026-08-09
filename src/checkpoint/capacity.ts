@@ -6,7 +6,7 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import type {
-  CheckpointCandidate,
+  CheckpointData,
   CompactionCapacityEstimate,
   CompactionPreparation,
 } from "../types.js";
@@ -15,19 +15,19 @@ function sumMessageTokens(messages: ReturnType<typeof buildSessionContext>["mess
   return messages.reduce((total, message) => total + estimateTokens(message), 0);
 }
 
-function makeSummaryEntry(candidate: CheckpointCandidate): CompactionEntry {
-  const details = candidate.data.compaction.details;
+function makeSummaryEntry(data: CheckpointData): CompactionEntry {
+  const details = data.compaction.details;
   return {
     type: "compaction",
-    id: `pi-press-capacity-${candidate.data.checkpointId}`,
+    id: `pi-press-capacity-${data.checkpointId}`,
     parentId: null,
     timestamp: "1970-01-01T00:00:00.000Z",
-    summary: candidate.data.compaction.summary,
-    firstKeptEntryId: candidate.data.compaction.firstKeptEntryId,
-    tokensBefore: candidate.data.compaction.tokensBefore,
-    ...(candidate.data.compaction.usage === undefined
+    summary: data.compaction.summary,
+    firstKeptEntryId: data.compaction.firstKeptEntryId,
+    tokensBefore: data.compaction.tokensBefore,
+    ...(data.compaction.usage === undefined
       ? {}
-      : { usage: candidate.data.compaction.usage }),
+      : { usage: data.compaction.usage }),
     ...(details === undefined ? {} : { details }),
   };
 }
@@ -35,7 +35,7 @@ function makeSummaryEntry(candidate: CheckpointCandidate): CompactionEntry {
 /** 根据当前 preparation 模拟复用 checkpoint 后的上下文容量。 */
 export function estimateCheckpointCapacity(
   branch: readonly SessionEntry[],
-  candidate: CheckpointCandidate,
+  data: CheckpointData,
   preparation: CompactionPreparation,
   contextWindow: number,
   targetPostCompactionPercent: number,
@@ -46,13 +46,13 @@ export function estimateCheckpointCapacity(
   const currentMessages = buildSessionContext([...branch]).messages;
   const currentMessagesEstimatedTokens = sumMessageTokens(currentMessages);
   const fixedOverhead = Math.max(0, preparation.tokensBefore - currentMessagesEstimatedTokens);
-  const summaryMessage = sessionEntryToContextMessages(makeSummaryEntry(candidate))[0];
+  const summaryMessage = sessionEntryToContextMessages(makeSummaryEntry(data))[0];
   if (!summaryMessage) {
     return undefined;
   }
 
   const firstKeptIndex = branch.findIndex(
-    (entry) => entry.id === candidate.data.compaction.firstKeptEntryId,
+    (entry) => entry.id === data.compaction.firstKeptEntryId,
   );
   if (firstKeptIndex < 0) {
     return undefined;

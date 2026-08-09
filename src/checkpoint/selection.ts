@@ -1,8 +1,5 @@
 import { VERSION } from "@earendil-works/pi-coding-agent";
-import type {
-  CompactionEntry,
-  SessionEntry,
-} from "@earendil-works/pi-coding-agent";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   CHECKPOINT_CUSTOM_TYPE,
   PREPARATION_ALGORITHM_VERSION,
@@ -121,12 +118,4 @@ export function findReadyCheckpointCandidates(
     }
   }
   return candidates;
-}
-
-export function getCompactionEntryById(
-  branch: readonly SessionEntry[],
-  entryId: string,
-): CompactionEntry | undefined {
-  const entry = branch.find((item) => item.id === entryId);
-  return entry?.type === "compaction" ? entry : undefined;
 }
