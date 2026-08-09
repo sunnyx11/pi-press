@@ -44,6 +44,7 @@ import {
 
 const RETRY_BASE_DELAY_MS = 250;
 const MAX_REFRESHES_PER_EPOCH = 1;
+const MAX_BACKGROUND_RETRIES = 1;
 
 type SessionManager = ExtensionContext["sessionManager"];
 type ModelRegistry = ExtensionContext["modelRegistry"];
@@ -242,7 +243,7 @@ export class ExtensionRuntime {
     }
 
     const attempts = this.attemptsBySnapshotKey.get(snapshotKey) ?? 0;
-    if (attempts > config.maxRetries) {
+    if (attempts > MAX_BACKGROUND_RETRIES) {
       return;
     }
     this.attemptsBySnapshotKey.set(snapshotKey, attempts + 1);
@@ -436,8 +437,8 @@ export class ExtensionRuntime {
       }
 
       const retry = {
-        enabled: task.config.maxRetries > 0,
-        maxRetries: task.config.maxRetries,
+        enabled: MAX_BACKGROUND_RETRIES > 0,
+        maxRetries: MAX_BACKGROUND_RETRIES,
         baseDelayMs: RETRY_BASE_DELAY_MS,
       };
       const result = await this.runWithTimeout(

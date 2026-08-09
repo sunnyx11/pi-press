@@ -136,9 +136,8 @@ Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项�
 | `taskTimeoutMs` | `120000` | 单次后台任务总超时 |
 | `hookWaitTimeoutMs` | `1000` | 正式 compaction 等待兼容 in-flight 任务的最长时间 |
 | `targetPostCompactionPercent` | `50` | 消费 checkpoint 后允许的最大上下文比例 |
-| `maxRetries` | `1` | 后台摘要的瞬时错误重试次数 |
 
-候选 preparation 固定使用 `keepRecentTokens: 2000`，用于在预压缩 checkpoint 中保留少量近期内容，同时覆盖 snapshot 前尽可能多的完整消息；同一正式 compaction epoch 最多刷新一次 checkpoint。这两个值都不是配置项。
+候选 preparation 固定使用 `keepRecentTokens: 2000`，用于在预压缩 checkpoint 中保留少量近期内容，同时覆盖 snapshot 前尽可能多的完整消息；后台摘要请求固定允许一次瞬时错误重试；同一正式 compaction epoch 最多刷新一次 checkpoint。这些值都不是配置项。
 
 压缩后 token 校验额外预留 `max(4096, ceil(contextWindow * 0.02))` 的安全余量。实现必须校验百分比、token 和超时字段的范围；无效配置使用默认值并记录诊断。
 

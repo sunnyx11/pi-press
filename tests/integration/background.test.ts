@@ -27,7 +27,6 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
       summaryReserveTokens: 1,
       taskTimeoutMs: 2_000,
       hookWaitTimeoutMs: 500,
-      maxRetries: 0,
     }),
   );
 
@@ -108,7 +107,6 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
         taskTimeoutMs: 2_000,
         hookWaitTimeoutMs: 500,
         targetPostCompactionPercent: 50,
-        maxRetries: 0,
       }),
     );
     assert.ok(preparation);
@@ -157,7 +155,6 @@ test("capacity-rejected checkpoint is skipped without persistence or error notif
       summaryReserveTokens: 1,
       targetPostCompactionPercent: 0,
       taskTimeoutMs: 2_000,
-      maxRetries: 0,
     }),
   );
 

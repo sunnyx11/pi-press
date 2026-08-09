@@ -42,7 +42,6 @@ function createScenario(overrides: Partial<PiPressConfig>, responseFactory: Resp
     summaryReserveTokens: 1,
     taskTimeoutMs: 2_000,
     hookWaitTimeoutMs: 500,
-    maxRetries: 0,
     ...overrides,
   };
   writeFileSync(join(cwd, ".pi", "pi-press.json"), JSON.stringify(config));

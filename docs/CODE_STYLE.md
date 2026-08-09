@@ -455,10 +455,9 @@ acceptLimit = min(hardLimit, targetLimit)
 - `summaryReserveTokens: 16384`；
 - `taskTimeoutMs: 120000`；
 - `hookWaitTimeoutMs: 1000`；
-- `targetPostCompactionPercent: 50`；
-- `maxRetries: 1`。
+- `targetPostCompactionPercent: 50`。
 
-候选 preparation 固定使用 `keepRecentTokens: 2000`，该值不属于 Pi-press 配置字段；同一正式 compaction epoch 最多刷新一次 checkpoint，该限制也固定实现。
+候选 preparation 固定使用 `keepRecentTokens: 2000`，该值不属于 Pi-press 配置字段；后台摘要请求固定允许一次瞬时错误重试；同一正式 compaction epoch 最多刷新一次 checkpoint，这些限制均固定实现。
 
 配置 fingerprint 必须参与 snapshot key。`precomputeMode` 切换为 `"off"` 时中止 in-flight 任务并停止消费 ready checkpoint。
 
@@ -472,7 +471,7 @@ acceptLimit = min(hardLimit, targetLimit)
 | `ctx.getContextUsage()` 无可用值 | 跳过本次调度，不自行估算 system prompt 或 tool 定义占用。 |
 | provider 认证失败、模型不可用或 context window 缺失 | 结束后台任务，记录失败原因，回退原生 compaction。 |
 | 超时、事件 signal 取消、session shutdown 或分支切换 | 视为正常取消，释放任务状态，不产生未处理异常。 |
-| provider 瞬时错误 | 仅按 `maxRetries` 和明确的重试策略处理；每次重试仍需传递 signal。 |
+| provider 瞬时错误 | 固定允许一次重试；每次重试仍需传递 signal。 |
 | `pi.appendEntry()` 失败 | 保留错误原因并清除任务身份，不宣称 checkpoint 已 ready。 |
 | 内部不变量破坏 | 在测试中让错误暴露；事件边界捕获后回退，并保留带 `cause` 的诊断。 |
 

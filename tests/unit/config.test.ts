@@ -15,6 +15,7 @@ test("normalizeConfig returns design defaults and ignores removed fields", () =>
   const result = normalizeConfig({
     checkpointKeepRecentTokens: 1,
     maxRefreshesPerEpoch: 0,
+    maxRetries: 0,
   });
   assert.deepEqual(result.config, DEFAULT_CONFIG);
   assert.equal(DEFAULT_CONFIG.softThresholdPercent, 80);
@@ -25,12 +26,10 @@ test("normalizeConfig falls back per invalid field", () => {
   const result = normalizeConfig({
     softThresholdPercent: 101,
     taskTimeoutMs: 0,
-    maxRetries: 2,
     precomputeMode: "threshold-and-manual",
   });
   assert.equal(result.config.softThresholdPercent, DEFAULT_CONFIG.softThresholdPercent);
   assert.equal(result.config.taskTimeoutMs, DEFAULT_CONFIG.taskTimeoutMs);
-  assert.equal(result.config.maxRetries, 2);
   assert.equal(result.config.precomputeMode, "threshold-and-manual");
   assert.equal(result.diagnostics.length, 2);
 });
@@ -45,7 +44,7 @@ test("loadConfig merges global config before project overrides", () => {
   try {
     writeFileSync(
       join(globalDir, "pi-press.json"),
-      JSON.stringify({ softThresholdPercent: 70, maxRetries: 3 }),
+      JSON.stringify({ softThresholdPercent: 70 }),
     );
     writeFileSync(
       join(projectDir, ".pi", "pi-press.json"),
@@ -55,7 +54,6 @@ test("loadConfig merges global config before project overrides", () => {
     const result = loadConfig(projectDir, globalDir);
 
     assert.equal(result.config.softThresholdPercent, 90);
-    assert.equal(result.config.maxRetries, 3);
     assert.equal(result.config.hookWaitTimeoutMs, DEFAULT_CONFIG.hookWaitTimeoutMs);
     assert.deepEqual(result.diagnostics, []);
   } finally {

@@ -71,7 +71,7 @@ pi -e ./src/index.ts
 | `"threshold"` | 处理阈值触发的自动压缩。 |
 | `"threshold-and-manual"` | 在阈值压缩之外，复用没有自定义指令的手动压缩检查点。 |
 
-其他可配置字段包括摘要预留 token、后台任务超时、压缩前等待时间、压缩后目标比例和重试次数。预压缩固定保留 `2000` 个近期 token；同一正式 compaction epoch 最多刷新一次 checkpoint，这两个值都不作为配置项。完整字段、默认值、校验规则和容量计算见 [docs/DESIGN.md](docs/DESIGN.md)。
+其他可配置字段包括摘要预留 token、后台任务超时、压缩前等待时间和压缩后目标比例。后台摘要请求固定允许一次瞬时错误重试；预压缩固定保留 `2000` 个近期 token；同一正式 compaction epoch 最多刷新一次 checkpoint，这些值都不作为配置项。完整字段、默认值、校验规则和容量计算见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 二次开发
 

@@ -11,7 +11,6 @@ export const DEFAULT_CONFIG: PiPressConfig = {
   taskTimeoutMs: 120_000,
   hookWaitTimeoutMs: 1_000,
   targetPostCompactionPercent: 50,
-  maxRetries: 1,
 };
 
 const CONFIG_FILE_NAME = "pi-press.json";
@@ -25,7 +24,6 @@ const CONFIG_KEYS: readonly ConfigKey[] = [
   "taskTimeoutMs",
   "hookWaitTimeoutMs",
   "targetPostCompactionPercent",
-  "maxRetries",
 ];
 
 export interface ConfigLoadResult {
@@ -65,8 +63,6 @@ function isValidValue(key: ConfigKey, value: unknown): boolean {
     case "taskTimeoutMs":
     case "hookWaitTimeoutMs":
       return isIntegerAtLeast(value, 1);
-    case "maxRetries":
-      return isIntegerAtLeast(value, 0);
   }
 }
 
