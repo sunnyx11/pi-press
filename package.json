@@ -1,8 +1,28 @@
 {
   "name": "pi-press",
   "version": "0.1.0",
-  "private": true,
+  "description": "Precompute Pi compaction summaries in the background and reuse them when compaction starts.",
   "type": "module",
+  "license": "MIT",
+  "author": "sunnyx11",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "context-compaction",
+    "llm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sunnyx11/pi-press.git"
+  },
+  "homepage": "https://github.com/sunnyx11/pi-press#readme",
+  "bugs": {
+    "url": "https://github.com/sunnyx11/pi-press/issues"
+  },
+  "files": [
+    "src",
+    "CHANGELOG.md"
+  ],
   "engines": {
     "node": ">=22.19.0"
   },
@@ -11,17 +31,21 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/unit/*.test.ts tests/integration/*.test.ts"
+    "test": "tsx --test tests/unit/*.test.ts tests/integration/*.test.ts",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
-  "dependencies": {
-    "@earendil-works/pi-agent-core": ">=0.84.1",
-    "@earendil-works/pi-ai": ">=0.84.1",
-    "@earendil-works/pi-coding-agent": ">=0.84.1"
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.84.1"
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-agent-core": ">=0.84.1",
+    "@earendil-works/pi-ai": ">=0.84.1",
+    "@earendil-works/pi-coding-agent": ">=0.84.1",
     "@types/node": "^22.10.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"

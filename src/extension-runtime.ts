@@ -20,7 +20,7 @@ import {
   getSnapshotSourceLeafId,
   isBeforeOrSame,
 } from "./checkpoint/selection.js";
-import { isJsonObject, isUsage } from "./checkpoint/schema.js";
+import { isJsonObject, isUsage, parseCheckpointData } from "./checkpoint/schema.js";
 import { loadConfig, createSnapshotKey, configFingerprint, DEFAULT_CONFIG } from "./config.js";
 import { Diagnostics } from "./diagnostics.js";
 import { buildCheckpointCompactionResult } from "./compaction/reuse.js";
@@ -44,6 +44,18 @@ import {
 const RETRY_BASE_DELAY_MS = 250;
 const MAX_REFRESHES_PER_EPOCH = 1;
 const MAX_BACKGROUND_RETRIES = 1;
+
+// Pi reload 会重新创建模块实例；全局 Symbol 让未结束的请求继续占用后台名额。
+const SHARED_RUNTIME_STATE_KEY = Symbol.for("pi-press.runtime-state.v1");
+
+type SharedRuntimeState = {
+  activeBackgroundOperation?: Promise<void>;
+};
+
+const runtimeStateHost = globalThis as typeof globalThis & {
+  [SHARED_RUNTIME_STATE_KEY]?: SharedRuntimeState;
+};
+const sharedRuntimeState = runtimeStateHost[SHARED_RUNTIME_STATE_KEY] ??= {};
 
 type SessionManager = ExtensionContext["sessionManager"];
 type ModelRegistry = ExtensionContext["modelRegistry"];
@@ -108,6 +120,22 @@ function describeCapacityRejection(checkpointId: string, capacity: CompactionCap
   return `checkpoint ${checkpointId}：预计压缩后 ${capacity.estimatedTokensAfter} tokens，接受上限 ${capacity.acceptLimit} tokens`;
 }
 
+function sanitizeProvenanceBaseUrl(baseUrl: string): string | undefined {
+  try {
+    const url = new URL(baseUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return undefined;
+    }
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
 /** 管理单个扩展实例的 session 状态、后台摘要任务和 checkpoint 复用。 */
 export class ExtensionRuntime {
   private readonly diagnostics: Diagnostics;
@@ -118,7 +146,6 @@ export class ExtensionRuntime {
   private currentConfig: PiPressConfig = { ...DEFAULT_CONFIG };
   private runEpoch = 0;
   private inFlightTask: BackgroundTask | undefined;
-  private activeProviderRequest: Promise<CompactionResult> | undefined;
   private checkpointClaim: CheckpointClaim | undefined;
   private hookInFlight = false;
   private readonly attemptsBySnapshotKey = new Map<string, number>();
@@ -213,7 +240,7 @@ export class ExtensionRuntime {
       snapshotSourceLeafId,
       config,
     );
-    if (this.inFlightTask || this.activeProviderRequest) {
+    if (this.inFlightTask || sharedRuntimeState.activeBackgroundOperation) {
       return;
     }
 
@@ -264,6 +291,9 @@ export class ExtensionRuntime {
   ): Promise<{ compaction: CompactionResult } | undefined> {
     this.bindContext(ctx);
     const config = this.loadCurrentConfig(ctx);
+    if (this.checkpointClaim && this.checkpointClaim.signal !== event.signal) {
+      this.releaseCheckpointClaim();
+    }
     if (config.precomputeMode === "off" || !this.isSupportedCompaction(event, config)) {
       return undefined;
     }
@@ -396,6 +426,9 @@ export class ExtensionRuntime {
   private startBackgroundTask(
     input: Omit<BackgroundTask, "runEpoch" | "controller" | "startedAt" | "discarded">
   ): void {
+    if (sharedRuntimeState.activeBackgroundOperation) {
+      return;
+    }
     const task: BackgroundTask = {
       ...input,
       runEpoch: this.runEpoch,
@@ -405,7 +438,15 @@ export class ExtensionRuntime {
     };
     this.inFlightTask = task;
     this.diagnostics.count("task_started");
-    const promise = Promise.resolve().then(() => this.runBackgroundTask(task));
+    const operation = Promise.resolve().then(() => this.generateCheckpoint(task));
+    sharedRuntimeState.activeBackgroundOperation = operation;
+    const releaseOperation = (): void => {
+      if (sharedRuntimeState.activeBackgroundOperation === operation) {
+        delete sharedRuntimeState.activeBackgroundOperation;
+      }
+    };
+    void operation.then(releaseOperation, releaseOperation);
+    const promise = this.runBackgroundTask(task, operation);
     task.promise = promise;
     void promise.then(
       () => this.finishTask(task),
@@ -418,9 +459,12 @@ export class ExtensionRuntime {
     );
   }
 
-  private async runBackgroundTask(task: BackgroundTask): Promise<void> {
+  private async runBackgroundTask(
+    task: BackgroundTask,
+    operation: Promise<void>,
+  ): Promise<void> {
     try {
-      await this.runWithTimeout(() => this.generateCheckpoint(task), task);
+      await this.runWithTimeout(() => operation, task);
     } catch (error: unknown) {
       if (isTimeoutError(error)) {
         this.diagnostics.count("task_timed_out");
@@ -495,20 +539,17 @@ export class ExtensionRuntime {
       providerResult.request.env,
       retry,
     ));
-    this.activeProviderRequest = request;
-    const releaseRequest = (): void => {
-      if (this.activeProviderRequest === request) {
-        this.activeProviderRequest = undefined;
-      }
-    };
-    void request.then(releaseRequest, releaseRequest);
-
     const result = await request;
     if (!this.isCurrentTask(task)) {
       this.diagnostics.recordUsage("discarded", result.usage);
       return;
     }
-    const appendOutcome = this.appendCheckpoint(task, preparation, result);
+    const appendOutcome = this.appendCheckpoint(
+      task,
+      preparation,
+      result,
+      providerResult.request.model,
+    );
     if (appendOutcome !== "appended") {
       this.diagnostics.recordUsage("discarded", result.usage);
       if (appendOutcome === "failed" && this.isCurrentTask(task)) {
@@ -567,6 +608,7 @@ export class ExtensionRuntime {
     task: BackgroundTask,
     preparation: CompactionPreparation,
     result: CompactionResult,
+    requestModel: Model<Api>,
   ): CheckpointAppendOutcome {
     if (!this.isCurrentTask(task)) {
       return "skipped";
@@ -593,6 +635,7 @@ export class ExtensionRuntime {
       return "failed";
     }
     const contextWindow = task.model.contextWindow;
+    const provenanceBaseUrl = sanitizeProvenanceBaseUrl(requestModel.baseUrl);
     const candidateData: CheckpointData = {
       version: 3,
       piVersion: VERSION,
@@ -614,12 +657,12 @@ export class ExtensionRuntime {
       estimatedTokensAfterAtSnapshot: 0,
       provenance: {
         model: {
-          provider: task.model.provider,
-          id: task.model.id,
-          api: task.model.api,
-          baseUrl: task.model.baseUrl,
-          contextWindow: task.model.contextWindow,
-          maxTokens: task.model.maxTokens,
+          provider: requestModel.provider,
+          id: requestModel.id,
+          api: requestModel.api,
+          baseUrl: provenanceBaseUrl ?? "",
+          contextWindow: requestModel.contextWindow,
+          maxTokens: requestModel.maxTokens,
         },
         thinkingLevel: task.thinkingLevel,
         configFingerprint: configFingerprint(task.config),
@@ -652,9 +695,14 @@ export class ExtensionRuntime {
       return "skipped";
     }
     candidateData.estimatedTokensAfterAtSnapshot = capacity.estimatedTokensAfter;
+    const checkpointData = parseCheckpointData(candidateData, { piVersion: VERSION });
+    if (!checkpointData) {
+      this.diagnostics.count("checkpoint_invalid_result");
+      return "failed";
+    }
 
     try {
-      this.pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, candidateData);
+      this.pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, checkpointData);
       return "appended";
     } catch (error: unknown) {
       this.diagnostics.count("checkpoint_append_failure");

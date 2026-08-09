@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 import test from "node:test";
 import type { SessionCompactEvent } from "@earendil-works/pi-coding-agent";
+import { parseCheckpointData } from "../../src/checkpoint/schema.js";
 import {
   createScenario,
   makeCompactEvent,
@@ -106,6 +107,67 @@ test("checkpoint append failure reports an error without a success notification"
       false,
     );
   } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint provenance records the sanitized resolved endpoint", async () => {
+  const scenario = createScenario();
+  const { appended, ctx, cwd, runtime } = scenario;
+  const registry = ctx.modelRegistry as unknown as {
+    getApiKeyAndHeaders: () => Promise<{
+      ok: true;
+      baseUrl: string;
+    }>;
+  };
+  registry.getApiKeyAndHeaders = async () => ({
+    ok: true,
+    baseUrl: "https://user:password@override.test/v1?apiKey=sk-url-secret#credential",
+  });
+
+  try {
+    runtime.onTurnEnd(ctx);
+    await waitFor(() => appended.length === 1);
+
+    const checkpoint = parseCheckpointData(appended[0]);
+    assert.ok(checkpoint);
+    assert.equal(checkpoint.provenance.model.baseUrl, "https://override.test/v1");
+    assert.doesNotMatch(JSON.stringify(checkpoint.provenance), /user|password|sk-url-secret|credential/);
+  } finally {
+    runtime.onSessionShutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("invalid checkpoint data is rejected by the full schema before persistence", async () => {
+  const scenario = createScenario();
+  const { appended, ctx, cwd, notifications, runtime } = scenario;
+  const model = ctx.model as { baseUrl: string };
+  model.baseUrl = "";
+
+  try {
+    runtime.onTurnEnd(ctx);
+    await waitFor(() => {
+      const counters = runtime.getDiagnostics().counters;
+      return Boolean(
+        counters.checkpoint_invalid_result ||
+        counters.checkpoint_ready ||
+        counters.task_failed
+      );
+    });
+
+    const diagnostics = runtime.getDiagnostics();
+    assert.equal(diagnostics.counters.checkpoint_invalid_result, 1);
+    assert.equal(diagnostics.counters.checkpoint_ready ?? 0, 0);
+    assert.equal(appended.length, 0);
+    assert.ok(
+      notifications.some(
+        (notification) =>
+          notification.type === "error" && notification.message.includes("checkpoint 校验"),
+      ),
+    );
+  } finally {
+    runtime.onSessionShutdown();
     rmSync(cwd, { recursive: true, force: true });
   }
 });

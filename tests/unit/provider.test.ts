@@ -34,18 +34,32 @@ test("provider request keeps endpoint/env and removes null headers", async () =>
   assert.deepEqual(result.request.env, { TEST_REGION: "local" });
 });
 
-test("provider authentication wait stops when the task signal aborts", async () => {
+test("provider authentication cancellation waits for the underlying operation to settle", async () => {
   const controller = new AbortController();
+  let resolveAuth!: () => void;
+  const auth = new Promise<{ ok: true }>((resolve) => {
+    resolveAuth = () => resolve({ ok: true });
+  });
   const registry = {
-    getApiKeyAndHeaders: () => new Promise<{ ok: true }>((resolve) => {
-      setTimeout(() => resolve({ ok: true }), 30);
-    }),
+    getApiKeyAndHeaders: () => auth,
     getProvider: () => undefined,
   };
 
   const result = resolveProviderRequest(registry, makeModel(), controller.signal);
+  let resultSettled = false;
+  void result.then(
+    () => {
+      resultSettled = true;
+    },
+    () => {
+      resultSettled = true;
+    },
+  );
   controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(resultSettled, false);
 
+  resolveAuth();
   await assert.rejects(
     result,
     (error: unknown) => error instanceof Error && error.name === "AbortError",

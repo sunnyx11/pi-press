@@ -3,6 +3,7 @@ import { rmSync } from "node:fs";
 import test from "node:test";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import type { SessionCompactEvent } from "@earendil-works/pi-coding-agent";
+import { ExtensionRuntime } from "../../src/extension-runtime.js";
 import {
   createScenario,
   makeCompactEvent,
@@ -51,6 +52,7 @@ test("background task timeout reports an error notification", async () => {
     );
   } finally {
     scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 100));
     rmSync(scenario.cwd, { recursive: true, force: true });
   }
 });
@@ -199,6 +201,82 @@ test("concurrent compact hooks allow only one waiter", async () => {
     assert.ok(firstResult?.compaction);
     assert.equal(scenario.faux.state.callCount, 1);
   } finally {
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("reloaded module instances share one active background provider request", async () => {
+  const firstModule = await import(
+    new URL("../../src/extension-runtime.ts?reload=first", import.meta.url).href
+  ) as { ExtensionRuntime: typeof ExtensionRuntime };
+  const secondModule = await import(
+    new URL("../../src/extension-runtime.ts?reload=second", import.meta.url).href
+  ) as { ExtensionRuntime: typeof ExtensionRuntime };
+  const activity = { active: 0, max: 0 };
+  const response = delayedResponse(40, undefined, activity);
+  const scenario = createScenario({}, response);
+  scenario.faux.setResponses([response, response]);
+  const appended: unknown[] = [];
+  const createRuntime = (Runtime: typeof ExtensionRuntime): ExtensionRuntime => new Runtime({
+    appendEntry: (customType, data) => {
+      appended.push(data);
+      scenario.manager.appendCustomEntry(customType, data);
+    },
+  });
+  const firstRuntime = createRuntime(firstModule.ExtensionRuntime);
+  const secondRuntime = createRuntime(secondModule.ExtensionRuntime);
+  firstRuntime.onSessionStart(scenario.ctx);
+  secondRuntime.onSessionStart(scenario.ctx);
+
+  try {
+    firstRuntime.onTurnEnd(scenario.ctx);
+    secondRuntime.onTurnEnd(scenario.ctx);
+    await waitFor(() => appended.length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    assert.equal(scenario.faux.state.callCount, 1);
+    assert.equal(activity.max, 1);
+    assert.equal(firstRuntime.getDiagnostics().counters.task_started, 1);
+    assert.equal(secondRuntime.getDiagnostics().counters.task_started ?? 0, 0);
+    assert.equal(appended.length, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    firstRuntime.onSessionShutdown();
+    secondRuntime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("runtime instances share one active background provider request", async () => {
+  const activity = { active: 0, max: 0 };
+  const response = delayedResponse(40, undefined, activity);
+  const scenario = createScenario({}, response);
+  scenario.faux.setResponses([response, response]);
+  const secondAppended: unknown[] = [];
+  const secondRuntime = new ExtensionRuntime({
+    appendEntry: (customType, data) => {
+      secondAppended.push(data);
+      scenario.manager.appendCustomEntry(customType, data);
+    },
+  });
+  secondRuntime.onSessionStart(scenario.ctx);
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    secondRuntime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length + secondAppended.length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    assert.equal(scenario.faux.state.callCount, 1);
+    assert.equal(activity.max, 1);
+    assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 1);
+    assert.equal(secondRuntime.getDiagnostics().counters.task_started ?? 0, 0);
+    assert.equal(scenario.appended.length + secondAppended.length, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    secondRuntime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 50));
     rmSync(scenario.cwd, { recursive: true, force: true });
   }
 });

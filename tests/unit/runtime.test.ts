@@ -13,7 +13,7 @@ import { ExtensionRuntime } from "../../src/extension-runtime.js";
 import { makeCheckpointData, makeModel, makePreparation, makeUserMessage } from "./fixtures.js";
 import { waitFor, type Notification } from "../runtime-fixture.js";
 
-test("ready checkpoint claim is exclusive until the compaction signal aborts", async () => {
+test("checkpoint claim stays exclusive within one attempt and recovers for a newer attempt", async () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime");
   const firstId = manager.appendMessage(makeUserMessage("old history"));
   const snapshotId = manager.appendMessage(makeUserMessage("recent work"));
@@ -60,7 +60,18 @@ test("ready checkpoint claim is exclusive until the compaction signal aborts", a
   );
   assert.equal(await runtime.beforeCompact(event, ctx), undefined);
 
+  const nextController = new AbortController();
+  const nextEvent = {
+    ...event,
+    signal: nextController.signal,
+  } satisfies SessionBeforeCompactEvent;
+  const nextResult = await runtime.beforeCompact(nextEvent, ctx);
+  assert.ok(nextResult?.compaction);
+  assert.equal(await runtime.beforeCompact(nextEvent, ctx), undefined);
+
   controller.abort();
+  assert.equal(await runtime.beforeCompact(nextEvent, ctx), undefined);
+  nextController.abort();
   const highUsageCtx = {
     ...ctx,
     getContextUsage: () => ({ tokens: 90_000, contextWindow: model.contextWindow, percent: 90 }),
@@ -156,7 +167,7 @@ test("unsupported compaction reasons fall back to Pi", async () => {
   );
 });
 
-test("task timeout covers authentication resolution and releases the task", async () => {
+test("timed out authentication remains occupied across runtime instances until it settles", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-press-runtime-auth-timeout-"));
   mkdirSync(join(cwd, ".pi"));
   writeFileSync(
@@ -171,6 +182,10 @@ test("task timeout covers authentication resolution and releases the task", asyn
     const model = makeModel();
     const notifications: Notification[] = [];
     let authLookups = 0;
+    let resolveAuth!: () => void;
+    const auth = new Promise<{ ok: false; error: string }>((resolve) => {
+      resolveAuth = () => resolve({ ok: false, error: "authentication unavailable" });
+    });
     const ctx = {
       cwd,
       sessionManager: manager,
@@ -178,7 +193,7 @@ test("task timeout covers authentication resolution and releases the task", asyn
       modelRegistry: {
         getApiKeyAndHeaders: () => {
           authLookups += 1;
-          return new Promise(() => undefined);
+          return auth;
         },
         getProvider: () => undefined,
       },
@@ -191,19 +206,34 @@ test("task timeout covers authentication resolution and releases the task", asyn
       getContextUsage: () => ({ tokens: 90_000, contextWindow: model.contextWindow, percent: 90 }),
     } as unknown as ExtensionContext;
     const runtime = new ExtensionRuntime({ appendEntry: () => undefined });
+    const nextRuntime = new ExtensionRuntime({ appendEntry: () => undefined });
     runtime.onSessionStart(ctx);
-    runtime.onTurnEnd(ctx);
+    nextRuntime.onSessionStart(ctx);
+    try {
+      runtime.onTurnEnd(ctx);
 
-    await waitFor(() => Boolean(runtime.getDiagnostics().counters.task_failed));
+      await waitFor(() => Boolean(runtime.getDiagnostics().counters.task_failed));
 
-    assert.equal(runtime.getDiagnostics().counters.task_failed, 1);
-    assert.equal(notifications.length, 1);
-    assert.match(notifications[0]?.message ?? "", /超时/);
+      assert.equal(runtime.getDiagnostics().counters.task_failed, 1);
+      assert.equal(notifications.length, 1);
+      assert.match(notifications[0]?.message ?? "", /超时/);
 
-    runtime.onTurnEnd(ctx);
-    assert.equal(runtime.getDiagnostics().counters.task_started, 2);
-    assert.equal(authLookups, 1);
-    runtime.onSessionShutdown();
+      nextRuntime.onTurnEnd(ctx);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(nextRuntime.getDiagnostics().counters.task_started ?? 0, 0);
+      assert.equal(authLookups, 1);
+
+      resolveAuth();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      nextRuntime.onTurnEnd(ctx);
+      await waitFor(() => authLookups === 2);
+      assert.equal(nextRuntime.getDiagnostics().counters.task_started, 1);
+    } finally {
+      resolveAuth();
+      runtime.onSessionShutdown();
+      nextRuntime.onSessionShutdown();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

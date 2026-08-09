@@ -1,0 +1,27 @@
+# Changelog
+
+本文件记录项目中所有值得注意的变更。
+
+格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
+版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/spec/v2.0.0.html)。
+
+## [Unreleased]
+
+## [0.1.0] - 2026-08-09
+
+### Added
+
+- 上下文使用量达到可配置阈值后，在后台生成 Pi compaction 摘要。
+- 通过 Pi 扩展 API 持久化带版本的预压缩 checkpoint，并在正式 compaction 时复用兼容结果。
+- 复用前校验 checkpoint schema、session、正式 compaction epoch、分支祖先和预计压缩后容量。
+- 支持全局和项目配置，控制调度阈值、任务超时、正式压缩等待时间和容量目标。
+- preparation、provider、checkpoint、容量或生命周期条件不满足时回退 Pi 原生 compaction。
+- 通过 Pi 通知显示持久化成功、执行失败、容量拒绝和正式 compaction 结果。
+
+### Security
+
+- 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
+- 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
+
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/sunnyx11/pi-press/releases/tag/v0.1.0

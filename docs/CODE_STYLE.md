@@ -14,6 +14,8 @@
 
 当前项目依赖 `@earendil-works/pi-coding-agent >=0.84.1`，Node.js 版本以实际安装的发行包要求为准。设计文档是 `pi-press` 的行为契约，本文件负责把该契约转换为代码组织和实现规则。
 
+npm 发布包中的 Pi 核心包必须声明为 `peerDependencies: "*"`，由 Pi 宿主提供；本地类型检查和测试使用 `devDependencies` 中的最低兼容版本，禁止把 Pi 核心包作为普通运行时依赖随扩展重复安装。
+
 ## 核心原则
 
 1. **扩展契约优先**：通过 Pi 官方扩展 API 接入运行时，只依赖包根入口导出的公开类型、函数和事件。
@@ -127,7 +129,7 @@ tests/
 
 ### 纯模块
 
-配置规范化、snapshot key、schema 校验、祖先判断、容量计算、状态转换和 checkpoint 版本兼容性判断应使用纯函数。纯函数的输入和输出必须显式，禁止通过模块级可变变量传递 session 状态。
+配置规范化、snapshot key、schema 校验、祖先判断、容量计算、状态转换和 checkpoint 版本兼容性判断应使用纯函数。纯函数的输入和输出必须显式，禁止通过模块级可变变量传递 session 数据。宿主进程级活动操作通过版本化 `Symbol` 保存，只作为重新导入的 Runtime 实例间的并发信号量，不得提供 session 内容访问接口。
 
 ### 适配模块
 
@@ -226,7 +228,7 @@ import {
 | `session_compact` | 记录正式 entry 对 checkpoint 的消费，递增运行 epoch，取消旧 epoch 任务。 |
 | `session_before_tree` | 递增运行 epoch，取消当前任务，释放当前分支绑定状态；不读取将要失效的旧 session 对象。 |
 | `session_tree` | 读取新分支并恢复内存状态；不重复执行已经由 `session_before_tree` 完成的 epoch 递增。 |
-| `session_shutdown` | 递增运行 epoch，先清除任务身份再发送 abort，清理 session 资源；不等待后台 provider Promise。 |
+| `session_shutdown` | 递增运行 epoch，先清除任务身份再发送 abort，清理 session 资源；不等待后台认证或 provider Promise，进程级占用由底层 Promise 结束时释放。 |
 | `model_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取模型 provenance，不废弃已有 ready checkpoint，也不改变 snapshot key。 |
 | `thinking_level_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取 thinking level，不承担 checkpoint 失效和消费判断。 |
 
@@ -297,15 +299,15 @@ function startTask(input: TaskInput): void {
 }
 ```
 
-`completeTask` 和 `failTask` 必须再次确认当前任务身份；不能仅依赖 Promise 是否完成。任务超时、取消或主动废弃时，先清除 `inFlightTask` 身份，再调用 `controller.abort()`。这样即使 provider 忽略取消，旧 Promise 也不能通过追加前检查。provider 摘要 Promise 必须单独记录活动状态；取消后该 Promise 尚未完成时，不得启动新的后台摘要请求。
+`completeTask` 和 `failTask` 必须再次确认当前任务身份；不能仅依赖 Promise 是否完成。任务超时、取消或主动废弃时，先清除 `inFlightTask` 身份，再调用 `controller.abort()`。这样即使 provider 忽略取消，旧 Promise 也不能通过追加前检查。进程级活动操作必须覆盖 preparation、认证和 provider 请求，并且只在底层 Promise 实际结束后释放；reload 后重新导入的 Runtime 实例不得绕过该占用状态。
 
 ### 并发限制
 
 - 同一 session、正式 compaction epoch 和 snapshot key 同时最多一个后台摘要任务；
-- 同一时间最多一个后台摘要请求；取消后尚未完成的 provider Promise 仍计入该限制；
-- 同一时间最多一个 compaction hook 领取 checkpoint；
+- 宿主进程内所有 Runtime 实例同一时间最多一个后台操作；取消后尚未完成的认证或 provider Promise 仍计入该限制；
+- 同一 Runtime 实例同一时间最多一个 compaction hook 领取 checkpoint；
 - checkpoint 被领取后，取消同 epoch 中不再需要的后台任务；
-- `claimedCheckpointId` 在 hook 成功返回前保持领取状态，失败或取消时释放；
+- checkpoint claim 必须绑定事件 signal；signal 取消、正式消费或新 attempt 使用不同 signal 时释放；
 - ready checkpoint 生成成功后，同一 snapshot key 不得重复请求；
 - 刷新任务必须使用新的 `snapshotSourceLeafId`，且同一 epoch 最多刷新一次；
 - 不以 Promise 的完成顺序代替 epoch、祖先和身份校验。
@@ -336,7 +338,7 @@ pi.appendEntry("pi-press.precompaction", checkpointData);
 pi.appendEntry("pi-press.metrics", metricsData);
 ```
 
-custom entry 不进入 LLM 上下文，可以作为 session tree 的 metadata。entry 必须是可序列化数据，追加后不得原地更新。扩展不得手工追加正式 `type: "compaction"` entry；正式 entry 由 Pi 根据 `session_before_compact` 的返回值写入。
+custom entry 不进入 LLM 上下文，可以作为 session tree 的 metadata。entry 必须是可序列化数据，追加后不得原地更新。checkpoint 在 `pi.appendEntry()` 前必须通过统一的完整 v3 parser，禁止只校验本次 provider 返回的局部字段。扩展不得手工追加正式 `type: "compaction"` entry；正式 entry 由 Pi 根据 `session_before_compact` 的返回值写入。
 
 消费状态从正式 compaction entry 的 `details.piPress.checkpointId` 推导，不新增 consumed entry。metrics entry 只用于扩展诊断，不能改变 checkpoint 的有效性和 session 上下文。
 
@@ -375,9 +377,10 @@ provider 请求适配必须：
 - 检查 `getApiKeyAndHeaders()` 的 `ok` 结果；认证失败时返回可诊断的原生回退；
 - 保留解析得到的 `baseUrl`、`apiKey`、headers 和 `env`；
 - 将值为 `null` 的 header 解释为删除，传给 `compact()` 前移除；
-- 当解析结果提供 `baseUrl` 时构造带该地址的 request model；
+- 当解析结果提供 `baseUrl` 时构造带该地址的 request model；checkpoint provenance 使用实际 request endpoint 的脱敏副本，并移除 URL username、password、query 和 fragment；
 - 通过 `ctx.modelRegistry.getProvider(model.provider)` 获取有效 provider，并将其 `streamSimple` 适配为 `StreamFn`；
 - 传入独立任务 signal、retry 配置、超时和 callbacks；
+- 认证等待收到 abort 后必须消费底层认证 Promise，并在该 Promise 结束前保留进程级活动占用；
 - 不在日志、错误消息、metrics 或 checkpoint provenance 中写入 API key。
 
 模型、thinking level、endpoint 和预算属于生成 provenance；它们不单独使已有 ready checkpoint 失效。消费时必须按当前 preparation、当前模型 context window 和当前限制重新计算容量。
@@ -565,11 +568,11 @@ npm test
 - [ ] 所有 Pi 运行时导入来自包根入口，未使用深层模块或测试接口。
 - [ ] 工厂未启动 session 级后台资源；资源在 `session_start` 或实际使用时创建并在 `session_shutdown` 清理。
 - [ ] `turn_end` 未等待摘要 Promise；detached Promise 具有统一错误处理。
-- 每个 await 后和 `pi.appendEntry()` 前均检查任务身份、`runEpoch`、session、祖先、epoch、当前 Pi 版本和算法版本；
-- [ ] checkpoint 通过 schema 校验和 `pi.appendEntry()` 追加，未手工读写 JSONL 或正式 compaction entry。
-- [ ] `session_before_compact` 仅在容量和契约全部满足时返回结果，其他情况返回 `undefined` 走原生实现。
-- [ ] provider signal、headers、baseUrl、env 和认证失败处理经过测试，日志没有敏感信息。
-- [ ] 已覆盖 split turn、metadata 边界、分支、重启、取消、超时、重复任务和旧 epoch。
+- [ ] 每个 await 后和 `pi.appendEntry()` 前均检查任务身份、`runEpoch`、session、祖先、epoch、当前 Pi 版本和算法版本。
+- [ ] checkpoint 在追加前和恢复时均通过完整 schema 校验，未手工读写 JSONL 或正式 compaction entry。
+- [ ] `session_before_compact` 仅在容量和契约全部满足时返回结果，其他情况返回 `undefined` 走原生实现；新 signal 可以释放旧 attempt 的 claim。
+- [ ] provider signal、headers、baseUrl、env 和认证失败处理经过测试；provenance 保存实际 endpoint 的脱敏副本，日志没有敏感信息。
+- [ ] 已覆盖 split turn、metadata 边界、分支、重启、取消、超时、跨 Runtime 重复任务和旧 epoch。
 - [ ] `npm run typecheck` 与 `npm test` 通过，未验证项已记录。
 
 ## 版本升级规则

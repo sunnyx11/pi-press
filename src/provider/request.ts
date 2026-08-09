@@ -35,24 +35,22 @@ function createAbortError(): Error {
 }
 
 function waitForAuth<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) {
-    return Promise.reject(createAbortError());
-  }
   return new Promise<T>((resolve, reject) => {
-    let settled = false;
+    let aborted = signal.aborted;
+    const onAbort = (): void => {
+      aborted = true;
+      signal.removeEventListener("abort", onAbort);
+    };
+    if (!aborted) {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
     const finish = (callback: () => void): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
       signal.removeEventListener("abort", onAbort);
       callback();
     };
-    const onAbort = (): void => finish(() => reject(createAbortError()));
-    signal.addEventListener("abort", onAbort, { once: true });
     void operation.then(
-      (value) => finish(() => resolve(value)),
-      (error: unknown) => finish(() => reject(error)),
+      (value) => finish(() => aborted ? reject(createAbortError()) : resolve(value)),
+      (error: unknown) => finish(() => aborted ? reject(createAbortError()) : reject(error)),
     );
   });
 }
