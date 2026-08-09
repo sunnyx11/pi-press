@@ -97,7 +97,7 @@ tests/
 
 ```json
 {
-  "name": "pi-press",
+  "name": "@sunnyx11/pi-press",
   "type": "module",
   "pi": {
     "extensions": ["./src/index.ts"]

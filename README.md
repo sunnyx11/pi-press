@@ -31,26 +31,26 @@ Pi-press 不改变原始 session entry，也不手工写入正式 `compaction` e
 安装最新版本：
 
 ```bash
-pi install npm:pi-press
+pi install npm:@sunnyx11/pi-press
 ```
 
 固定安装首个版本：
 
 ```bash
-pi install npm:pi-press@0.1.0
+pi install npm:@sunnyx11/pi-press@0.1.0
 ```
 
 只在当前进程中临时加载：
 
 ```bash
-pi -e npm:pi-press@0.1.0
+pi -e npm:@sunnyx11/pi-press@0.1.0
 ```
 
 更新未固定版本或卸载：
 
 ```bash
-pi update npm:pi-press
-pi remove npm:pi-press
+pi update npm:@sunnyx11/pi-press
+pi remove npm:@sunnyx11/pi-press
 ```
 
 `pi-press` 是 Pi 扩展包，不提供独立 CLI。Pi 扩展与宿主进程具有相同的系统权限，安装前应检查包来源和源码。
