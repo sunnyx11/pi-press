@@ -43,6 +43,7 @@ import {
 } from "./types.js";
 
 const RETRY_BASE_DELAY_MS = 250;
+const MAX_REFRESHES_PER_EPOCH = 1;
 
 type SessionManager = ExtensionContext["sessionManager"];
 type ModelRegistry = ExtensionContext["modelRegistry"];
@@ -232,7 +233,7 @@ export class ExtensionRuntime {
     if (existingCandidate) {
       const refreshCount = this.refreshesByEpoch.get(epochKey) ?? 0;
       if (
-        refreshCount >= config.maxRefreshesPerEpoch ||
+        refreshCount >= MAX_REFRESHES_PER_EPOCH ||
         !this.shouldRefresh(existingCandidate, branchEntries, model, config)
       ) {
         return;

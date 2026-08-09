@@ -108,7 +108,6 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
         taskTimeoutMs: 2_000,
         hookWaitTimeoutMs: 500,
         targetPostCompactionPercent: 50,
-        maxRefreshesPerEpoch: 1,
         maxRetries: 0,
       }),
     );

@@ -307,7 +307,7 @@ function startTask(input: TaskInput): void {
 - checkpoint 被领取后，取消同 epoch 中不再需要的后台任务；
 - `claimedCheckpointId` 在 hook 成功返回前保持领取状态，失败或取消时释放；
 - ready checkpoint 生成成功后，同一 snapshot key 不得重复请求；
-- 刷新任务必须使用新的 `snapshotSourceLeafId`，且受 `maxRefreshesPerEpoch` 限制；
+- 刷新任务必须使用新的 `snapshotSourceLeafId`，且同一 epoch 最多刷新一次；
 - 不以 Promise 的完成顺序代替 epoch、祖先和身份校验。
 
 后台摘要与正式 compaction 之间存在竞争时，正式 compaction 优先。等待 in-flight 任务必须同时受 `hookWaitTimeoutMs` 和事件 `signal` 限制；等待失败后清除任务身份、发送 abort 并返回 `undefined`。
@@ -456,10 +456,9 @@ acceptLimit = min(hardLimit, targetLimit)
 - `taskTimeoutMs: 120000`；
 - `hookWaitTimeoutMs: 1000`；
 - `targetPostCompactionPercent: 50`；
-- `maxRefreshesPerEpoch: 1`；
 - `maxRetries: 1`。
 
-候选 preparation 固定使用 `keepRecentTokens: 2000`，该值不属于 Pi-press 配置字段。
+候选 preparation 固定使用 `keepRecentTokens: 2000`，该值不属于 Pi-press 配置字段；同一正式 compaction epoch 最多刷新一次 checkpoint，该限制也固定实现。
 
 配置 fingerprint 必须参与 snapshot key。`precomputeMode` 切换为 `"off"` 时中止 in-flight 任务并停止消费 ready checkpoint。
 

@@ -24,7 +24,6 @@ export interface PiPressConfig {
   taskTimeoutMs: number;
   hookWaitTimeoutMs: number;
   targetPostCompactionPercent: number;
-  maxRefreshesPerEpoch: number;
   maxRetries: number;
 }
 

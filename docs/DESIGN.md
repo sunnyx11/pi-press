@@ -136,10 +136,9 @@ Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项�
 | `taskTimeoutMs` | `120000` | 单次后台任务总超时 |
 | `hookWaitTimeoutMs` | `1000` | 正式 compaction 等待兼容 in-flight 任务的最长时间 |
 | `targetPostCompactionPercent` | `50` | 消费 checkpoint 后允许的最大上下文比例 |
-| `maxRefreshesPerEpoch` | `1` | 同一正式 compaction epoch 内允许的 checkpoint 刷新次数 |
 | `maxRetries` | `1` | 后台摘要的瞬时错误重试次数 |
 
-候选 preparation 固定使用 `keepRecentTokens: 2000`，用于在预压缩 checkpoint 中保留少量近期内容，同时覆盖 snapshot 前尽可能多的完整消息；该值不是配置项。
+候选 preparation 固定使用 `keepRecentTokens: 2000`，用于在预压缩 checkpoint 中保留少量近期内容，同时覆盖 snapshot 前尽可能多的完整消息；同一正式 compaction epoch 最多刷新一次 checkpoint。这两个值都不是配置项。
 
 压缩后 token 校验额外预留 `max(4096, ceil(contextWindow * 0.02))` 的安全余量。实现必须校验百分比、token 和超时字段的范围；无效配置使用默认值并记录诊断。
 
@@ -421,7 +420,7 @@ Promise
 - 任何超时、取消或主动废弃操作都必须先清除任务身份，再发送 abort。即使 provider 忽略取消，旧 Promise 也不能通过追加前检查。
 - `session_before_compact` 领取 checkpoint 后设置 `claimedCheckpointId`；失败或事件取消时释放，成功后由 `session_compact` 确认消费。
 - 成功生成 ready checkpoint 后，同一 snapshot key 不再发起请求；明确失败时按 retry/cooldown 配置决定是否重试。
-- 刷新任务受 `maxRefreshesPerEpoch` 限制，并且必须使用新的 `snapshotSourceLeafId`。
+- 刷新任务受固定的同 epoch 一次刷新限制，并且必须使用新的 `snapshotSourceLeafId`。
 - 所有状态检查发生在 `pi.appendEntry()` 前；检查通过后立即同步追加 custom entry。
 - 正式 compaction epoch 只由当前分支最新正式 compaction entry ID 表示，不维护额外整数 generation。
 
