@@ -39,7 +39,6 @@ function createScenario(overrides: Partial<PiPressConfig>, responseFactory: Resp
   const config: PiPressConfig = {
     ...DEFAULT_CONFIG,
     softThresholdPercent: 80,
-    checkpointKeepRecentTokens: 1,
     summaryReserveTokens: 1,
     taskTimeoutMs: 2_000,
     hookWaitTimeoutMs: 500,
@@ -49,8 +48,8 @@ function createScenario(overrides: Partial<PiPressConfig>, responseFactory: Resp
   writeFileSync(join(cwd, ".pi", "pi-press.json"), JSON.stringify(config));
 
   const manager = SessionManager.inMemory(cwd);
-  const firstKeptId = manager.appendMessage(makeUserMessage("old history ".repeat(80)));
-  manager.appendMessage(makeUserMessage("recent context ".repeat(80)));
+  const firstKeptId = manager.appendMessage(makeUserMessage("old history ".repeat(2_000)));
+  manager.appendMessage(makeUserMessage("recent context ".repeat(2_000)));
   const faux = fauxProvider({
     api: "openai-responses",
     provider: "test",

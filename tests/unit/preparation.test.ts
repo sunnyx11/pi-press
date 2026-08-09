@@ -9,15 +9,20 @@ import { makeCheckpointData, makePreparation, makeUserMessage } from "./fixtures
 
 test("preparation preserves Pi metadata boundary and message selection", () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-test");
-  const firstId = manager.appendMessage(makeUserMessage("old history that must be summarized"));
+  const firstId = manager.appendMessage(
+    makeUserMessage("old history that must be summarized ".repeat(2_000)),
+  );
   manager.appendCustomEntry("pi-press.fixture", { state: true });
-  const recentId = manager.appendMessage(makeUserMessage("recent work that stays"));
+  const recentId = manager.appendMessage(
+    makeUserMessage("recent work that stays ".repeat(2_000)),
+  );
   const preparation = prepareCompactionFromBranch(
     manager.getBranch(),
-    createPreparationSettings({ ...DEFAULT_CONFIG, checkpointKeepRecentTokens: 1 }),
+    createPreparationSettings(DEFAULT_CONFIG),
   );
 
   assert.ok(preparation);
+  assert.equal(preparation.settings.keepRecentTokens, 2_000);
   assert.equal(preparation.messagesToSummarize.length, 0);
   assert.equal(preparation.turnPrefixMessages.length, 1);
   assert.equal(preparation.turnPrefixMessages[0]?.role, "user");

@@ -11,8 +11,8 @@ import {
   normalizeConfig,
 } from "../../src/config.js";
 
-test("normalizeConfig returns design defaults", () => {
-  const result = normalizeConfig({});
+test("normalizeConfig returns design defaults and ignores removed fields", () => {
+  const result = normalizeConfig({ checkpointKeepRecentTokens: 1 });
   assert.deepEqual(result.config, DEFAULT_CONFIG);
   assert.equal(DEFAULT_CONFIG.softThresholdPercent, 80);
   assert.deepEqual(result.diagnostics, []);

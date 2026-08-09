@@ -24,7 +24,6 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
     join(cwd, ".pi", "pi-press.json"),
     JSON.stringify({
       softThresholdPercent: 80,
-      checkpointKeepRecentTokens: 1,
       summaryReserveTokens: 1,
       taskTimeoutMs: 2_000,
       hookWaitTimeoutMs: 500,
@@ -36,12 +35,12 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
     const manager = SessionManager.inMemory(cwd);
     manager.appendMessage({
       role: "user",
-      content: "old history ".repeat(80),
+      content: "old history ".repeat(2_000),
       timestamp: Date.now(),
     });
     const firstKeptId = manager.appendMessage({
       role: "user",
-      content: "recent context ".repeat(80),
+      content: "recent context ".repeat(2_000),
       timestamp: Date.now(),
     });
     const faux = fauxProvider({
@@ -105,7 +104,6 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
       createPreparationSettings({
         precomputeMode: "threshold",
         softThresholdPercent: 80,
-        checkpointKeepRecentTokens: 1,
         summaryReserveTokens: 1,
         taskTimeoutMs: 2_000,
         hookWaitTimeoutMs: 500,
@@ -157,7 +155,6 @@ test("capacity-rejected checkpoint is skipped without persistence or error notif
     join(cwd, ".pi", "pi-press.json"),
     JSON.stringify({
       softThresholdPercent: 80,
-      checkpointKeepRecentTokens: 1,
       summaryReserveTokens: 1,
       targetPostCompactionPercent: 0,
       taskTimeoutMs: 2_000,
@@ -169,12 +166,12 @@ test("capacity-rejected checkpoint is skipped without persistence or error notif
     const manager = SessionManager.inMemory(cwd);
     manager.appendMessage({
       role: "user",
-      content: "old history ".repeat(80),
+      content: "old history ".repeat(2_000),
       timestamp: Date.now(),
     });
     manager.appendMessage({
       role: "user",
-      content: "recent context ".repeat(80),
+      content: "recent context ".repeat(2_000),
       timestamp: Date.now(),
     });
     const faux = fauxProvider({

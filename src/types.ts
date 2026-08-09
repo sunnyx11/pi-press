@@ -20,7 +20,6 @@ export type PrecomputeMode = "off" | "threshold" | "threshold-and-manual";
 export interface PiPressConfig {
   precomputeMode: PrecomputeMode;
   softThresholdPercent: number;
-  checkpointKeepRecentTokens: number;
   summaryReserveTokens: number;
   taskTimeoutMs: number;
   hookWaitTimeoutMs: number;

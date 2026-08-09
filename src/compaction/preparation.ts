@@ -17,6 +17,9 @@ import type {
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { isRecord } from "../checkpoint/schema.js";
 
+// 预压缩只保留少量近期内容，尽可能覆盖 snapshot 前的完整消息。
+const CHECKPOINT_KEEP_RECENT_TOKENS = 2_000;
+
 function createFileOps(): FileOperations {
   return {
     read: new Set<string>(),
@@ -229,6 +232,6 @@ export function createPreparationSettings(config: PiPressConfig): CompactionSett
   return {
     enabled: true,
     reserveTokens: config.summaryReserveTokens,
-    keepRecentTokens: config.checkpointKeepRecentTokens,
+    keepRecentTokens: CHECKPOINT_KEEP_RECENT_TOKENS,
   };
 }

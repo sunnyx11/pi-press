@@ -452,13 +452,14 @@ acceptLimit = min(hardLimit, targetLimit)
 
 - `precomputeMode: "threshold"`；
 - `softThresholdPercent: 80`；
-- `checkpointKeepRecentTokens: 20000`；
 - `summaryReserveTokens: 16384`；
 - `taskTimeoutMs: 120000`；
 - `hookWaitTimeoutMs: 1000`；
 - `targetPostCompactionPercent: 50`；
 - `maxRefreshesPerEpoch: 1`；
 - `maxRetries: 1`。
+
+候选 preparation 固定使用 `keepRecentTokens: 2000`，该值不属于 Pi-press 配置字段。
 
 配置 fingerprint 必须参与 snapshot key。`precomputeMode` 切换为 `"off"` 时中止 in-flight 任务并停止消费 ready checkpoint。
 

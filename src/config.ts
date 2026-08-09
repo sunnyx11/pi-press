@@ -7,7 +7,6 @@ import type { PiPressConfig, PrecomputeMode } from "./types.js";
 export const DEFAULT_CONFIG: PiPressConfig = {
   precomputeMode: "threshold",
   softThresholdPercent: 80,
-  checkpointKeepRecentTokens: 20_000,
   summaryReserveTokens: 16_384,
   taskTimeoutMs: 120_000,
   hookWaitTimeoutMs: 1_000,
@@ -23,7 +22,6 @@ type ConfigKey = keyof PiPressConfig;
 const CONFIG_KEYS: readonly ConfigKey[] = [
   "precomputeMode",
   "softThresholdPercent",
-  "checkpointKeepRecentTokens",
   "summaryReserveTokens",
   "taskTimeoutMs",
   "hookWaitTimeoutMs",
@@ -64,7 +62,6 @@ function isValidValue(key: ConfigKey, value: unknown): boolean {
     case "softThresholdPercent":
     case "targetPostCompactionPercent":
       return isPercent(value);
-    case "checkpointKeepRecentTokens":
     case "summaryReserveTokens":
       return isIntegerAtLeast(value, 0);
     case "taskTimeoutMs":
