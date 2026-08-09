@@ -64,7 +64,6 @@ type BackgroundTask = {
   controller: AbortController;
   startedAt: number;
   firstKeptEntryId?: string;
-  estimatedTokensAfterAtSnapshot?: number;
   promise?: Promise<void>;
   discarded: boolean;
 };
@@ -326,12 +325,8 @@ export class ExtensionRuntime {
 
   private notifyCheckpointReady(task: BackgroundTask): void {
     const elapsedSeconds = ((Date.now() - task.startedAt) / 1000).toFixed(1);
-    const estimatedTokens = task.estimatedTokensAfterAtSnapshot;
-    const tokenText = estimatedTokens === undefined
-      ? "未知"
-      : Math.round(estimatedTokens).toLocaleString("en-US");
     this.notifyUser(
-      `pi-press：预压缩成功，耗时 ${elapsedSeconds} 秒，预计压缩后约 ${tokenText} tokens。`,
+      `pi-press：预压缩成功，耗时 ${elapsedSeconds} 秒。`,
       "info",
     );
   }
@@ -602,7 +597,6 @@ export class ExtensionRuntime {
       return "skipped";
     }
     candidateData.estimatedTokensAfterAtSnapshot = capacity.estimatedTokensAfter;
-    task.estimatedTokensAfterAtSnapshot = capacity.estimatedTokensAfter;
 
     try {
       this.pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, candidateData);
