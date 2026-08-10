@@ -80,7 +80,7 @@ src/
 │   └── selection.ts                 # 祖先、epoch、消费状态和容量筛选
 ├── compaction/
 │   ├── preparation.ts               # 当前 Pi preparation 版本适配
-│   ├── compact.ts                   # 公开 compact() 调用和 provider 适配
+│   ├── virtual-context.ts           # context 事件的请求级虚拟上下文和容量判断
 │   └── reuse.ts                     # session_before_compact 复用逻辑
 └── provider/
     └── request.ts                   # API key、headers、endpoint 和 env 解析
@@ -136,7 +136,7 @@ tests/
 与 Pi 或 provider 的交互集中在适配模块：
 
 - `compaction/preparation.ts` 只负责从公开 session 数据构造 `Parameters<typeof compact>[0]` 所需 preparation；
-- `compaction/compact.ts` 只负责调用公开 `compact()` 并保留 Pi 的摘要、usage、split turn 和文件操作语义；
+- `compaction/virtual-context.ts` 只负责将 ready checkpoint 投影为请求级虚拟消息并执行 hard limit 判断；
 - `provider/request.ts` 只负责活动模型、认证结果、endpoint、headers、env 和 provider stream 的适配；
 - `checkpoint/store.ts` 只负责通过 `SessionManager` 读取和通过 `pi.appendEntry()` 追加扩展 entry。
 
@@ -223,7 +223,9 @@ import {
 | 事件 | 处理要求 |
 | --- | --- |
 | `session_start` | 通过 `ctx.sessionManager.getEntries()`、`getBranch()` 恢复 checkpoint、正式 compaction epoch、消费状态和当前分支。 |
-| `turn_end` | 读取 `ctx.getContextUsage()`，判断软阈值，获取快照并调度后台任务。处理器必须在后台摘要完成前返回。 |
+| `turn_end` | 读取 `ctx.getContextUsage()`，判断软阈值或已应用虚拟 checkpoint 的尾部容量，获取快照并调度后台任务。处理器必须在后台摘要完成前返回。 |
+| `context` | 每次 provider 请求前重新校验 ready checkpoint，构造虚拟 `compactionSummary` 和当前未压缩尾部；映射不明确时返回原消息。 |
+| `agent_settled` | 在 Pi 完成重试、原生 compaction 和排队续跑后，延迟检查并按需调用 `ctx.compact()`；正式 entry、上下文重建和持久化由 Pi 完成。 |
 | `session_before_compact` | 校验 reason、signal、分支、epoch、checkpoint 和容量；可返回兼容 `CompactionResult`，否则返回 `undefined` 让 Pi 使用原生实现。 |
 | `session_compact` | 记录正式 entry 对 checkpoint 的消费，递增运行 epoch，取消旧 epoch 任务。 |
 | `session_before_tree` | 递增运行 epoch，取消当前任务，释放当前分支绑定状态；不读取将要失效的旧 session 对象。 |
@@ -232,7 +234,7 @@ import {
 | `model_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取模型 provenance，不废弃已有 ready checkpoint，也不改变 snapshot key。 |
 | `thinking_level_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取 thinking level，不承担 checkpoint 失效和消费判断。 |
 
-首个版本不在 `agent_end` 或 `agent_settled` 中调用 `ctx.compact()`。`session_before_compact` 不支持的 `overflow`、`willRetry: true`、带 `customInstructions` 的请求必须回退 Pi 原生 compaction。
+`turn_end` 不调用 `ctx.compact()`，因为当前 agent loop 仍可能继续采样。`agent_end` 之后仍可能发生自动重试、原生压缩或排队消息续跑；只有 `agent_settled` 后，且虚拟 checkpoint 已实际用于请求、上下文仍有效并且 `ctx.isIdle()` 为真时，才允许通过延迟回调调用 `ctx.compact()`。正式 `compaction` entry 由 Pi 写入，失败时保留虚拟 checkpoint 并按限制重试。`session_before_compact` 不支持的 `overflow`、`willRetry: true`、带 `customInstructions` 的请求必须回退 Pi 原生 compaction。
 
 `session_before_compact` 的 handler 只在 checkpoint 完整满足项目设计时返回：
 
@@ -367,7 +369,7 @@ custom entry 不进入 LLM 上下文，可以作为 session tree 的 metadata。
 
 `firstKeptEntryId` 是 Pi preparation 产生的不透明 entry ID。实现不得自行把它限制为 user 或 assistant entry，也不得在 tool result 上自行创建无 Pi 依据的切分规则。
 
-后台摘要必须调用公开 `compact()`，复用 Pi 的摘要提示词、`previousSummary`、split turn 双摘要、usage 合并和文件标签附加。首个版本不实现自定义摘要提示词，也不单独调用内部摘要函数。
+后台摘要任务和 settled 后正式化均通过公开 `compact()` 或 `ctx.compact()` 进入 Pi 的摘要与 session 写入流程，复用 Pi 的摘要提示词、`previousSummary`、split turn 双摘要、usage 合并和文件标签附加。首个版本不实现自定义摘要提示词，也不单独调用内部摘要函数。
 
 ### Provider
 
@@ -539,7 +541,8 @@ acceptLimit = min(hardLimit, targetLimit)
 
 使用公开 SDK、模拟 provider 和固定 session fixture 覆盖：
 
-- 当前安装的 Pi 版本尝试启用预压缩；公开 API 不兼容时通过 CLI error 通知显示失败，并由 Pi 原生 compaction 继续处理；
+- `context` 返回的虚拟摘要和当前尾部只影响当次 provider 请求；
+- `agent_settled` 调度正式化后，Pi 写入的 entry、session 重建和 resume 结果必须通过公开 SDK 集成测试验证；
 - preparation 与 Pi 公开事件产生的 preparation 在 `firstKeptEntryId`、消息集合、split turn、`previousSummary`、file operations、settings 和 `tokensBefore` 上一致；
 - user、assistant、bash execution、custom message、branch summary、Pi-press custom entry 和 context-invisible metadata 的边界；
 - tool result 不作为错误切分点；

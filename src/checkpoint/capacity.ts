@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   buildSessionContext,
   estimateTokens,
@@ -11,17 +12,17 @@ import type {
   CompactionPreparation,
 } from "../types.js";
 
-function sumMessageTokens(messages: ReturnType<typeof buildSessionContext>["messages"]): number {
+function sumMessageTokens(messages: readonly AgentMessage[]): number {
   return messages.reduce((total, message) => total + estimateTokens(message), 0);
 }
 
-function makeSummaryEntry(data: CheckpointData): CompactionEntry {
+function makeSummaryEntry(data: CheckpointData, timestamp: string): CompactionEntry {
   const details = data.compaction.details;
   return {
     type: "compaction",
     id: `pi-press-capacity-${data.checkpointId}`,
     parentId: null,
-    timestamp: "1970-01-01T00:00:00.000Z",
+    timestamp,
     summary: data.compaction.summary,
     firstKeptEntryId: data.compaction.firstKeptEntryId,
     tokensBefore: data.compaction.tokensBefore,
@@ -29,6 +30,52 @@ function makeSummaryEntry(data: CheckpointData): CompactionEntry {
       ? {}
       : { usage: data.compaction.usage }),
     ...(details === undefined ? {} : { details }),
+  };
+}
+
+export function checkpointToCompactionSummaryMessage(data: CheckpointData): AgentMessage | undefined {
+  return sessionEntryToContextMessages(makeSummaryEntry(data, data.createdAt))[0];
+}
+
+export type VirtualCheckpointCapacityEstimate = {
+  estimatedTokens: number;
+  hardLimit: number;
+  targetLimit: number;
+  needsRefresh: boolean;
+};
+
+export function estimateVirtualCheckpointCapacity(
+  data: CheckpointData,
+  trailingMessages: readonly AgentMessage[],
+  contextWindow: number,
+  summaryReserveTokens: number,
+  targetPostCompactionPercent: number,
+): VirtualCheckpointCapacityEstimate | undefined {
+  if (
+    !Number.isFinite(contextWindow) ||
+    contextWindow <= 0 ||
+    !Number.isFinite(summaryReserveTokens) ||
+    summaryReserveTokens < 0 ||
+    !Number.isFinite(targetPostCompactionPercent) ||
+    targetPostCompactionPercent < 0 ||
+    targetPostCompactionPercent > 100
+  ) {
+    return undefined;
+  }
+  const summaryMessage = checkpointToCompactionSummaryMessage(data);
+  if (!summaryMessage) {
+    return undefined;
+  }
+  const estimatedTokens =
+    data.estimatedTokensAfterAtSnapshot + sumMessageTokens(trailingMessages);
+  const safetyMargin = Math.max(4096, Math.ceil(contextWindow * 0.02));
+  const hardLimit = contextWindow - summaryReserveTokens - safetyMargin;
+  const targetLimit = Math.floor((contextWindow * targetPostCompactionPercent) / 100);
+  return {
+    estimatedTokens,
+    hardLimit,
+    targetLimit,
+    needsRefresh: estimatedTokens > targetLimit,
   };
 }
 
@@ -46,7 +93,9 @@ export function estimateCheckpointCapacity(
   const currentMessages = buildSessionContext([...branch]).messages;
   const currentMessagesEstimatedTokens = sumMessageTokens(currentMessages);
   const fixedOverhead = Math.max(0, preparation.tokensBefore - currentMessagesEstimatedTokens);
-  const summaryMessage = sessionEntryToContextMessages(makeSummaryEntry(data))[0];
+  const summaryMessage = sessionEntryToContextMessages(
+    makeSummaryEntry(data, "1970-01-01T00:00:00.000Z"),
+  )[0];
   if (!summaryMessage) {
     return undefined;
   }

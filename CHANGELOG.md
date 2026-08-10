@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- 在公开 `context` 事件中应用 checkpoint 的虚拟 `compactionSummary` 和当前未压缩尾部，并在 hard limit、边界映射不明确或 checkpoint 失效时回退原消息。
+- 在 `agent_settled` 后延迟调用 `ctx.compact()`，由 Pi 写入正式 compaction entry、重建 agent state，并支持 native compaction 优先、失败重试和 session resume。
+- 根据已应用虚拟 checkpoint 的尾部容量刷新后台 checkpoint，避免虚拟 provider usage 低于软阈值时遗漏增长。
+
 ## [0.1.0] - 2026-08-09
 
 ### Added

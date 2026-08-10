@@ -6,6 +6,7 @@ import {
   compact,
   sessionEntryToContextMessages,
   type CompactionResult,
+  type ContextEvent,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
@@ -24,6 +25,7 @@ import { isJsonObject, isUsage, parseCheckpointData } from "./checkpoint/schema.
 import { loadConfig, createSnapshotKey, configFingerprint, DEFAULT_CONFIG } from "./config.js";
 import { Diagnostics } from "./diagnostics.js";
 import { buildCheckpointCompactionResult } from "./compaction/reuse.js";
+import { projectCheckpointToVirtualContext } from "./compaction/virtual-context.js";
 import {
   createPreparationSettings,
   estimateMessagesTokens,
@@ -44,6 +46,7 @@ import {
 const RETRY_BASE_DELAY_MS = 250;
 const MAX_REFRESHES_PER_EPOCH = 1;
 const MAX_BACKGROUND_RETRIES = 1;
+const MAX_FORMALIZATION_ATTEMPTS = 2;
 
 // Pi reload 会重新创建模块实例；全局 Symbol 让未结束的请求继续占用后台名额。
 const SHARED_RUNTIME_STATE_KEY = Symbol.for("pi-press.runtime-state.v1");
@@ -82,6 +85,28 @@ type CheckpointClaim = {
   checkpointId: string;
   signal: AbortSignal;
   abortHandler: () => void;
+};
+
+type VirtualApplication = {
+  checkpointId: string;
+  sessionId: string;
+  epochCompactionId: string | null;
+  lastAppliedLeafId: string;
+};
+
+type FormalizationSchedule = {
+  requestId: string;
+  runEpoch: number;
+  checkpointId: string;
+  sessionId: string;
+  epochCompactionId: string | null;
+  scheduledLeafId: string;
+  ctx: ExtensionContext;
+  timer?: NodeJS.Timeout;
+};
+
+type PendingFormalization = Omit<FormalizationSchedule, "ctx" | "timer"> & {
+  attempt: number;
 };
 
 type WaitOutcome = "finished" | "timeout" | "aborted";
@@ -150,6 +175,10 @@ export class ExtensionRuntime {
   private hookInFlight = false;
   private readonly attemptsBySnapshotKey = new Map<string, number>();
   private readonly refreshesByEpoch = new Map<string, number>();
+  private readonly formalizationAttemptsByEpoch = new Map<string, number>();
+  private virtualApplication: VirtualApplication | undefined;
+  private formalizationSchedule: FormalizationSchedule | undefined;
+  private pendingFormalization: PendingFormalization | undefined;
 
   constructor(private readonly pi: Pick<ExtensionAPI, "appendEntry">, diagnostics = new Diagnostics()) {
     this.diagnostics = diagnostics;
@@ -176,6 +205,129 @@ export class ExtensionRuntime {
 
   onSessionShutdown(): void {
     this.invalidate("session_shutdown", true);
+  }
+
+  onContext(event: ContextEvent, ctx: ExtensionContext): Pick<ContextEvent, "messages"> {
+    this.bindContext(ctx);
+    if (this.currentConfig.precomputeMode === "off") {
+      return { messages: event.messages };
+    }
+    const model = asModel(ctx.model);
+    if (!model) {
+      this.diagnostics.count("virtual_skipped_unknown_model");
+      return { messages: event.messages };
+    }
+
+    const branch = ctx.sessionManager.getBranch();
+    const sessionId = ctx.sessionManager.getSessionId();
+    const epochCompactionId = getEpochCompactionId(branch);
+    const candidates = findReadyCheckpointCandidates(
+      branch,
+      sessionId,
+      epochCompactionId,
+      this.checkpointClaim?.checkpointId,
+    );
+    if (
+      this.virtualApplication &&
+      (this.virtualApplication.sessionId !== sessionId ||
+        this.virtualApplication.epochCompactionId !== epochCompactionId ||
+        getEntryIndex(branch, this.virtualApplication.lastAppliedLeafId) < 0)
+    ) {
+      this.virtualApplication = undefined;
+    }
+
+    for (const candidate of candidates) {
+      const projection = projectCheckpointToVirtualContext({
+        branch,
+        eventMessages: event.messages,
+        checkpoint: candidate.data,
+        contextWindow: model.contextWindow,
+        summaryReserveTokens: this.currentConfig.summaryReserveTokens,
+        targetPostCompactionPercent: this.currentConfig.targetPostCompactionPercent,
+      });
+      if (!projection) {
+        continue;
+      }
+      const leafId = ctx.sessionManager.getLeafId();
+      if (!leafId) {
+        this.diagnostics.count("virtual_skipped_empty_branch");
+        return { messages: event.messages };
+      }
+      this.virtualApplication = {
+        checkpointId: candidate.data.checkpointId,
+        sessionId,
+        epochCompactionId,
+        lastAppliedLeafId: leafId,
+      };
+      this.diagnostics.count("virtual_applied");
+      if (projection.needsRefresh) {
+        this.diagnostics.count("virtual_refresh_needed");
+      }
+      return { messages: projection.messages };
+    }
+
+    this.diagnostics.count("virtual_skipped");
+    return { messages: event.messages };
+  }
+
+  onAgentSettled(ctx: ExtensionContext): void {
+    this.bindContext(ctx);
+    if (
+      this.currentConfig.precomputeMode === "off" ||
+      !this.virtualApplication ||
+      this.pendingFormalization ||
+      this.formalizationSchedule
+    ) {
+      return;
+    }
+    if (!this.isIdle(ctx)) {
+      this.diagnostics.count("formalization_skipped_busy");
+      return;
+    }
+
+    const branch = ctx.sessionManager.getBranch();
+    const sessionId = ctx.sessionManager.getSessionId();
+    const epochCompactionId = getEpochCompactionId(branch);
+    const application = this.virtualApplication;
+    if (
+      application.sessionId !== sessionId ||
+      application.epochCompactionId !== epochCompactionId ||
+      getEntryIndex(branch, application.lastAppliedLeafId) < 0
+    ) {
+      this.virtualApplication = undefined;
+      return;
+    }
+    const candidate = findReadyCheckpointCandidates(
+      branch,
+      sessionId,
+      epochCompactionId,
+      this.checkpointClaim?.checkpointId,
+    ).find((item) => item.data.checkpointId === application.checkpointId);
+    if (!candidate) {
+      this.virtualApplication = undefined;
+      return;
+    }
+
+    const epochKey = this.formalizationEpochKey(sessionId, epochCompactionId);
+    if ((this.formalizationAttemptsByEpoch.get(epochKey) ?? 0) >= MAX_FORMALIZATION_ATTEMPTS) {
+      return;
+    }
+    const scheduledLeafId = ctx.sessionManager.getLeafId();
+    if (!scheduledLeafId) {
+      return;
+    }
+    const schedule: FormalizationSchedule = {
+      requestId: randomUUID(),
+      runEpoch: this.runEpoch,
+      checkpointId: candidate.data.checkpointId,
+      sessionId,
+      epochCompactionId,
+      scheduledLeafId,
+      ctx,
+    };
+    this.formalizationSchedule = schedule;
+    this.diagnostics.count("formalization_scheduled");
+    schedule.timer = setTimeout(() => this.runFormalization(schedule), 0);
   }
 
   onSessionCompact(event: SessionCompactEvent, ctx: ExtensionContext): void {
@@ -206,19 +358,13 @@ export class ExtensionRuntime {
       return;
     }
     const usage = ctx.getContextUsage();
-    if (
-      !usage ||
-      usage.tokens === null ||
-      usage.percent === null ||
-      !Number.isFinite(usage.tokens) ||
-      !Number.isFinite(usage.percent)
-    ) {
-      this.diagnostics.count("threshold_skipped_unknown_usage");
-      return;
-    }
-    if (usage.percent < config.softThresholdPercent) {
-      return;
-    }
+    const usageKnown = Boolean(
+      usage &&
+      usage.tokens !== null &&
+      usage.percent !== null &&
+      Number.isFinite(usage.tokens) &&
+      Number.isFinite(usage.percent),
+    );
     const model = asModel(ctx.model);
     if (!model || !Number.isFinite(model.contextWindow) || model.contextWindow <= 0) {
       this.diagnostics.count("threshold_skipped_unknown_model");
@@ -234,6 +380,28 @@ export class ExtensionRuntime {
       return;
     }
     const epochCompactionId = getEpochCompactionId(branchEntries);
+    const candidates = findReadyCheckpointCandidates(
+      branchEntries,
+      sessionId,
+      epochCompactionId,
+      this.checkpointClaim?.checkpointId,
+    );
+    const virtualCandidate = this.virtualApplication
+      ? candidates.find((candidate) => candidate.data.checkpointId === this.virtualApplication?.checkpointId)
+      : undefined;
+    const virtualRefreshNeeded = Boolean(
+      virtualCandidate && this.shouldRefresh(virtualCandidate, branchEntries, model, config),
+    );
+    if (!virtualRefreshNeeded) {
+      if (!usageKnown) {
+        this.diagnostics.count("threshold_skipped_unknown_usage");
+        return;
+      }
+      if (usage!.percent! < config.softThresholdPercent) {
+        return;
+      }
+    }
+
     const snapshotKey = createSnapshotKey(
       sessionId,
       epochCompactionId,
@@ -244,12 +412,6 @@ export class ExtensionRuntime {
       return;
     }
 
-    const candidates = findReadyCheckpointCandidates(
-      branchEntries,
-      sessionId,
-      epochCompactionId,
-      this.checkpointClaim?.checkpointId,
-    );
     const existingCandidate = candidates[0];
     const epochKey = `${sessionId}:${epochCompactionId ?? "null"}`;
     if (existingCandidate) {
@@ -294,7 +456,11 @@ export class ExtensionRuntime {
     if (this.checkpointClaim && this.checkpointClaim.signal !== event.signal) {
       this.releaseCheckpointClaim();
     }
-    if (config.precomputeMode === "off" || !this.isSupportedCompaction(event, config)) {
+    const internalFormalization = this.isPendingFormalization(event, ctx);
+    const internalCheckpointId = internalFormalization
+      ? this.pendingFormalization?.checkpointId
+      : undefined;
+    if (config.precomputeMode === "off" || !this.isSupportedCompaction(event, config, internalFormalization)) {
       return undefined;
     }
     if (this.hookInFlight) {
@@ -302,7 +468,12 @@ export class ExtensionRuntime {
     }
     this.hookInFlight = true;
     try {
-      let result = this.tryReuseCheckpoint(event, ctx, config);
+      let result = this.tryReuseCheckpoint(
+        event,
+        ctx,
+        config,
+        internalCheckpointId,
+      );
       if (result) {
         return { compaction: result };
       }
@@ -323,11 +494,145 @@ export class ExtensionRuntime {
       if (event.signal.aborted) {
         return undefined;
       }
-      result = this.tryReuseCheckpoint(event, ctx, config);
+      result = this.tryReuseCheckpoint(
+        event,
+        ctx,
+        config,
+        internalCheckpointId,
+      );
       return result ? { compaction: result } : undefined;
     } finally {
       this.hookInFlight = false;
     }
+  }
+
+  private isPendingFormalization(
+    event: SessionBeforeCompactEvent,
+    ctx: ExtensionContext,
+  ): boolean {
+    const pending = this.pendingFormalization;
+    if (
+      !pending ||
+      event.reason !== "manual" ||
+      (event.customInstructions !== undefined && event.customInstructions.trim().length > 0) ||
+      pending.runEpoch !== this.runEpoch ||
+      pending.sessionId !== ctx.sessionManager.getSessionId()
+    ) {
+      return false;
+    }
+    return getEpochCompactionId(ctx.sessionManager.getBranch()) === pending.epochCompactionId;
+  }
+
+  private isIdle(ctx: ExtensionContext): boolean {
+    try {
+      return ctx.isIdle();
+    } catch (error: unknown) {
+      this.diagnostics.record("lifecycle", `无法读取 agent 空闲状态：${describeError(error)}`);
+      return false;
+    }
+  }
+
+  private formalizationEpochKey(sessionId: string, epochCompactionId: string | null): string {
+    return `${sessionId}:${epochCompactionId ?? "null"}`;
+  }
+
+  private runFormalization(schedule: FormalizationSchedule): void {
+    if (this.formalizationSchedule !== schedule) {
+      return;
+    }
+    this.formalizationSchedule = undefined;
+    const ctx = schedule.ctx;
+    if (
+      schedule.runEpoch !== this.runEpoch ||
+      this.currentSessionId !== schedule.sessionId ||
+      this.currentConfig.precomputeMode === "off" ||
+      !this.isIdle(ctx)
+    ) {
+      this.diagnostics.count("formalization_skipped_stale");
+      return;
+    }
+
+    const branch = ctx.sessionManager.getBranch();
+    const currentEpoch = getEpochCompactionId(branch);
+    if (
+      currentEpoch !== schedule.epochCompactionId ||
+      getEntryIndex(branch, schedule.scheduledLeafId) < 0
+    ) {
+      this.diagnostics.count("formalization_skipped_stale");
+      return;
+    }
+    const candidate = findReadyCheckpointCandidates(
+      branch,
+      schedule.sessionId,
+      currentEpoch,
+      this.checkpointClaim?.checkpointId,
+    ).find((item) => item.data.checkpointId === schedule.checkpointId);
+    if (!candidate || !this.virtualApplication || this.virtualApplication.checkpointId !== schedule.checkpointId) {
+      this.diagnostics.count("formalization_skipped_stale");
+      return;
+    }
+
+    const epochKey = this.formalizationEpochKey(schedule.sessionId, schedule.epochCompactionId);
+    const attempt = (this.formalizationAttemptsByEpoch.get(epochKey) ?? 0) + 1;
+    if (attempt > MAX_FORMALIZATION_ATTEMPTS) {
+      return;
+    }
+    this.formalizationAttemptsByEpoch.set(epochKey, attempt);
+    const pending: PendingFormalization = {
+      requestId: schedule.requestId,
+      runEpoch: schedule.runEpoch,
+      checkpointId: schedule.checkpointId,
+      sessionId: schedule.sessionId,
+      epochCompactionId: schedule.epochCompactionId,
+      scheduledLeafId: schedule.scheduledLeafId,
+      attempt,
+    };
+    this.pendingFormalization = pending;
+    this.diagnostics.count("formalization_started");
+
+    try {
+      ctx.compact({
+        onComplete: () => this.onFormalizationComplete(pending),
+        onError: (error: Error) => this.onFormalizationError(pending, error),
+      });
+    } catch (error: unknown) {
+      this.onFormalizationError(pending, error);
+    }
+  }
+
+  private onFormalizationComplete(pending: PendingFormalization): void {
+    if (this.pendingFormalization?.requestId !== pending.requestId) {
+      return;
+    }
+    this.diagnostics.count("formalization_complete_callback");
+  }
+
+  private onFormalizationError(pending: PendingFormalization, error: unknown): void {
+    if (this.pendingFormalization?.requestId !== pending.requestId) {
+      return;
+    }
+    this.pendingFormalization = undefined;
+    this.diagnostics.count("formalization_failed");
+
+    this.diagnostics.record("lifecycle", `正式化失败：${describeError(error)}`);
+    this.notifyWarning("虚拟压缩正式化失败，后续 settled 状态最多再试一次。");
+  }
+
+  private cancelFormalizationSchedule(): void {
+    const schedule = this.formalizationSchedule;
+    if (!schedule) {
+      return;
+    }
+    if (schedule.timer) {
+      clearTimeout(schedule.timer);
+    }
+    this.formalizationSchedule = undefined;
+  }
+
+  private clearVirtualState(): void {
+    this.virtualApplication = undefined;
+    this.cancelFormalizationSchedule();
+    this.pendingFormalization = undefined;
   }
 
   private bindContext(ctx: ExtensionContext): void {
@@ -374,8 +679,12 @@ export class ExtensionRuntime {
     for (const message of result.diagnostics) {
       this.diagnostics.record("config", message);
     }
-    if (result.config.precomputeMode === "off" && this.inFlightTask) {
-      this.discardTask(this.inFlightTask, "config_off");
+    if (result.config.precomputeMode === "off") {
+      if (this.inFlightTask) {
+        this.discardTask(this.inFlightTask, "config_off");
+      }
+      this.clearVirtualState();
+      this.formalizationAttemptsByEpoch.clear();
     }
     return result.config;
   }
@@ -402,8 +711,10 @@ export class ExtensionRuntime {
       this.discardTask(this.inFlightTask, reason);
     }
     this.releaseCheckpointClaim();
+    this.clearVirtualState();
     this.attemptsBySnapshotKey.clear();
     this.refreshesByEpoch.clear();
+    this.formalizationAttemptsByEpoch.clear();
     if (clearContext) {
       this.currentSessionManager = undefined;
       this.currentModelRegistry = undefined;
@@ -729,7 +1040,11 @@ export class ExtensionRuntime {
     return candidate.data.estimatedTokensAfterAtSnapshot + trailingTokens > targetLimit;
   }
 
-  private isSupportedCompaction(event: SessionBeforeCompactEvent, config: PiPressConfig): boolean {
+  private isSupportedCompaction(
+    event: SessionBeforeCompactEvent,
+    config: PiPressConfig,
+    internalFormalization: boolean,
+  ): boolean {
     if (event.willRetry || event.reason === "overflow") {
       return false;
     }
@@ -739,13 +1054,14 @@ export class ExtensionRuntime {
     if (event.reason === "threshold") {
       return config.precomputeMode !== "off";
     }
-    return config.precomputeMode === "threshold-and-manual";
+    return internalFormalization || config.precomputeMode === "threshold-and-manual";
   }
 
   private tryReuseCheckpoint(
     event: SessionBeforeCompactEvent,
     ctx: ExtensionContext,
     config: PiPressConfig,
+    requiredCheckpointId?: string,
   ): CompactionResult | undefined {
     if (event.signal.aborted) {
       return undefined;
@@ -765,6 +1081,9 @@ export class ExtensionRuntime {
       return undefined;
     }
     for (const candidate of candidates) {
+      if (requiredCheckpointId !== undefined && candidate.data.checkpointId !== requiredCheckpointId) {
+        continue;
+      }
       const capacity = estimateCheckpointCapacity(
         branch,
         candidate.data,
