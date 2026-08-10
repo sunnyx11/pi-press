@@ -76,7 +76,7 @@ pi remove npm:@sunnyx11/pi-press
   "precomputeMode": "threshold",
   "softThresholdPercent": 80,
   "taskTimeoutMs": 300000,
-  "targetPostCompactionPercent": 50
+  "targetPostCompactionPercent": 60
 }
 ```
 

@@ -20,6 +20,7 @@ test("normalizeConfig returns design defaults and ignores removed fields", () =>
   assert.deepEqual(result.config, DEFAULT_CONFIG);
   assert.equal(DEFAULT_CONFIG.softThresholdPercent, 80);
   assert.equal(DEFAULT_CONFIG.taskTimeoutMs, 300_000);
+  assert.equal(DEFAULT_CONFIG.targetPostCompactionPercent, 60);
   assert.deepEqual(result.diagnostics, []);
 });
 

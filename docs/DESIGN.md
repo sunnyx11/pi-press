@@ -191,7 +191,7 @@ Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项�
 | `summaryReserveTokens` | `16384` | 传给候选 preparation 的摘要输出预算，默认取当前 Pi 的 `DEFAULT_COMPACTION_SETTINGS` |
 | `taskTimeoutMs` | `300000` | 单次后台任务总超时 |
 | `hookWaitTimeoutMs` | `1000` | 正式 compaction 等待兼容 in-flight 任务的最长时间 |
-| `targetPostCompactionPercent` | `50` | 正式复用 checkpoint 的最大上下文比例，也是虚拟上下文请求刷新 checkpoint 的目标比例 |
+| `targetPostCompactionPercent` | `60` | 正式复用 checkpoint 的最大上下文比例，也是虚拟上下文请求刷新 checkpoint 的目标比例 |
 
 候选 preparation 固定使用 `keepRecentTokens: 2000`，用于在预压缩 checkpoint 中保留少量近期内容，同时覆盖 snapshot 前尽可能多的完整消息；后台摘要请求固定允许一次瞬时错误重试；同一正式 compaction epoch 最多刷新一次 checkpoint。虚拟上下文超过目标比例时仍可在 hard limit 内继续使用，但只允许一次刷新；刷新后仍超过 hard limit 时按保护能力不足处理。这些值都不是配置项。
 

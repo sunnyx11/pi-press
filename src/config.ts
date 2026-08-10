@@ -15,7 +15,7 @@ export const DEFAULT_CONFIG: PiPressConfig = {
   summaryReserveTokens: 16_384,
   taskTimeoutMs: 300_000,
   hookWaitTimeoutMs: 1_000,
-  targetPostCompactionPercent: 50,
+  targetPostCompactionPercent: 60,
 };
 
 const CONFIG_FILE_NAME = "pi-press.json";

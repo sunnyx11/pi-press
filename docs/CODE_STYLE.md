@@ -460,7 +460,7 @@ acceptLimit = min(hardLimit, targetLimit)
 - `summaryReserveTokens: 16384`；
 - `taskTimeoutMs: 300000`；
 - `hookWaitTimeoutMs: 1000`；
-- `targetPostCompactionPercent: 50`。
+- `targetPostCompactionPercent: 60`。
 
 候选 preparation 固定使用 `keepRecentTokens: 2000`，该值不属于 Pi-press 配置字段；后台摘要请求固定允许一次瞬时错误重试；同一正式 compaction epoch 最多刷新一次 checkpoint，这些限制均固定实现。
 
