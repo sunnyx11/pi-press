@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-11
+
+### Fixed
+
+- 修复其他 `context` 扩展转换或注入消息时的虚拟 checkpoint 兼容：保留已转换和注入的消息，将额外 token 纳入容量校验，并在映射不明确或处理异常时返回原上下文。
+
 ## [0.2.0] - 2026-08-10
 
 ### Added
@@ -34,6 +40,7 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/sunnyx11/pi-press/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/sunnyx11/pi-press/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sunnyx11/pi-press/releases/tag/v0.1.0

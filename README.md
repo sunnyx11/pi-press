@@ -36,16 +36,16 @@ Pi-press 不改变原始 session entry，也不手工写入正式 `compaction` e
 pi install npm:@sunnyx11/pi-press
 ```
 
-固定安装首个版本：
+固定安装指定版本：
 
 ```bash
-pi install npm:@sunnyx11/pi-press@0.2.0
+pi install npm:@sunnyx11/pi-press@0.2.1
 ```
 
 只在当前进程中临时加载：
 
 ```bash
-pi -e npm:@sunnyx11/pi-press@0.2.0
+pi -e npm:@sunnyx11/pi-press@0.2.1
 ```
 
 更新未固定版本或卸载：

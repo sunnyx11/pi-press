@@ -311,16 +311,21 @@ checkpoint 不复制原始消息，不可原地更新。原始消息继续由 Pi
 3. 按正式复用规则扫描 ready checkpoint，但不领取候选。虚拟应用可以并发读取同一不可变 checkpoint；正式 compaction 才需要 claim。
 4. 在当前分支中定位 `firstKeptEntryId` 和 `snapshotLeafId`，使用 `sessionEntryToContextMessages()` 推导从保留边界到当前叶子的原生消息序列。
 5. 构造仅存在于返回数组中的合成 compaction entry，并通过 `sessionEntryToContextMessages()` 取得 `role: "compactionSummary"` 消息。合成 entry 使用 checkpoint 的 summary、`firstKeptEntryId`、`tokensBefore`、details 和 checkpoint 创建时间，不调用 `pi.appendEntry()`。
-6. 将 branch 派生的原生消息与 `event.messages` 对应，确定保留边界在事件消息中的位置。返回数组必须包含合成摘要、边界后的全部原生消息，以及能够保持顺序的其他扩展注入消息。消息被过滤、重排或替换后无法无歧义确定边界时，返回 `event.messages`。
+6. 将 branch 派生的原生消息按角色、时间戳和角色特有稳定元数据与 `event.messages` 对应；前置 `context` handler 可以转换消息内容。最早和最晚子序列匹配必须产生同一组位置，以证明原生消息和保留边界能够无歧义映射。返回数组必须包含合成摘要、边界后的全部原生消息，以及能够保持顺序的其他扩展注入消息。消息被过滤、重排或替换，或者稳定元数据碰撞导致映射不唯一时，返回 `event.messages`。
 7. 估算当前虚拟上下文容量：
 
 ```text
-trailingTokens = snapshotLeafId 之后新增 context-visible 消息的估算值
-estimatedVirtualTokens = estimatedTokensAfterAtSnapshot + trailingTokens
+additionalMessageTokens = 未被快照估算覆盖的注入消息和 snapshotLeafId 后新增消息的估算值
+transformedGrowthTokens = 快照内保留消息转换后的正向 token 差额
+estimatedVirtualTokens = estimatedTokensAfterAtSnapshot
+  + additionalMessageTokens
+  + transformedGrowthTokens
 safetyMargin = max(4096, ceil(contextWindow * 0.02))
 hardLimit = contextWindow - summaryReserveTokens - safetyMargin
 targetLimit = floor(contextWindow * targetPostCompactionPercent / 100)
 ```
+
+消息转换后 token 减少时不从快照估算中扣减；任一消息无法估算时返回 `event.messages`。
 
 8. `estimatedVirtualTokens <= targetLimit` 时应用候选；大于 target limit 但不超过 hard limit 时继续应用，并在后续 `turn_end` 请求刷新 checkpoint。超过 hard limit 时先在 `hookWaitTimeoutMs` 内等待已经存在的兼容刷新任务；仍无可用候选时返回事件原消息并记录诊断，禁止丢弃尚未进入摘要的尾部消息。
 9. 返回新数组后记录本次实际使用的 checkpoint ID、session、epoch 和事件时的 branch leaf。后续请求重复执行全部校验，不能仅依赖内存标记。
@@ -620,7 +625,7 @@ Promise
 - `event.messages`、agent 内部 transcript、SessionManager entry 和 checkpoint 数据均未被虚拟转换修改。
 - 虚拟 provider usage 小于完整 transcript usage 时，Pi 原生 threshold 可能不执行；该情况仍会进入 `agent_settled` 正式化。
 - 虚拟容量不超过 target limit 时应用；超过 target 但未超过 hard limit 时继续应用并请求刷新；超过 hard limit 且等待刷新失败时保留原消息并记录诊断。
-- Pi-press 前后存在其他 `context` handler 时保持扩展注册顺序；边界无法无歧义映射时不丢弃其他扩展消息。
+- Pi-press 前后存在其他 `context` handler 时保持扩展注册顺序；前置 handler 转换消息内容后仍保留转换结果，注入消息及保留消息的 token 增量计入虚拟容量，边界无法无歧义映射时不丢弃其他扩展消息。
 - `turn_end` 和 `agent_end` 不调用 `ctx.compact()`；`agent_settled` handler 返回后才运行正式化回调。
 - `ctx.isIdle()` 为假、session/branch/epoch 已变化、没有实际应用的虚拟 checkpoint 或存在 pending 请求时不发起 compaction。
 - Pi 原生 compaction 先完成时，`session_compact` 清除虚拟状态，延迟回调不再发起 manual compaction。
