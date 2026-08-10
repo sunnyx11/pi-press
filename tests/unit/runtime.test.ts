@@ -80,6 +80,42 @@ test("checkpoint claim stays exclusive within one attempt and recovers for a new
   assert.equal(runtime.getDiagnostics().counters.task_started ?? 0, 0);
 });
 
+test("context returns original messages and records a diagnostic when projection fails", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-runtime-context-error");
+  manager.appendMessage(makeUserMessage("current context"));
+  const messages = manager.buildSessionContext().messages;
+  const failingManager = new Proxy(manager, {
+    get(target, property) {
+      if (property === "getBranch") {
+        return () => {
+          throw new Error("branch unavailable");
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const model = makeModel();
+  const ctx = {
+    cwd: "/tmp/pi-press-runtime-context-error",
+    sessionManager: failingManager,
+    model,
+    modelRegistry: {},
+    thinkingLevel: "medium",
+  } as unknown as ExtensionContext;
+  const runtime = new ExtensionRuntime({ appendEntry: () => undefined });
+  runtime.onSessionStart(ctx);
+
+  const result = runtime.onContext({ type: "context", messages }, ctx);
+
+  assert.equal(result.messages, messages);
+  assert.equal(runtime.getDiagnostics().counters.virtual_failed, 1);
+  assert.match(
+    runtime.getDiagnostics().records.at(-1)?.message ?? "",
+    /branch unavailable/,
+  );
+});
+
 test("capacity-rejected ready checkpoint shows a fallback warning", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-press-runtime-reuse-capacity-"));
   mkdirSync(join(cwd, ".pi"));

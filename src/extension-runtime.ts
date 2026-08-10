@@ -208,6 +208,22 @@ export class ExtensionRuntime {
   }
 
   onContext(event: ContextEvent, ctx: ExtensionContext): Pick<ContextEvent, "messages"> {
+    try {
+      return this.applyVirtualContext(event, ctx);
+    } catch (error: unknown) {
+      this.diagnostics.count("virtual_failed");
+      this.diagnostics.record(
+        "checkpoint",
+        `虚拟上下文处理失败：${describeError(error)}`,
+      );
+      return { messages: event.messages };
+    }
+  }
+
+  private applyVirtualContext(
+    event: ContextEvent,
+    ctx: ExtensionContext,
+  ): Pick<ContextEvent, "messages"> {
     this.bindContext(ctx);
     if (this.currentConfig.precomputeMode === "off") {
       return { messages: event.messages };

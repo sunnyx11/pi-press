@@ -46,10 +46,11 @@ export type VirtualCheckpointCapacityEstimate = {
 
 export function estimateVirtualCheckpointCapacity(
   data: CheckpointData,
-  trailingMessages: readonly AgentMessage[],
+  additionalMessages: readonly AgentMessage[],
   contextWindow: number,
   summaryReserveTokens: number,
   targetPostCompactionPercent: number,
+  additionalTokens = 0,
 ): VirtualCheckpointCapacityEstimate | undefined {
   if (
     !Number.isFinite(contextWindow) ||
@@ -58,7 +59,9 @@ export function estimateVirtualCheckpointCapacity(
     summaryReserveTokens < 0 ||
     !Number.isFinite(targetPostCompactionPercent) ||
     targetPostCompactionPercent < 0 ||
-    targetPostCompactionPercent > 100
+    targetPostCompactionPercent > 100 ||
+    !Number.isFinite(additionalTokens) ||
+    additionalTokens < 0
   ) {
     return undefined;
   }
@@ -67,7 +70,9 @@ export function estimateVirtualCheckpointCapacity(
     return undefined;
   }
   const estimatedTokens =
-    data.estimatedTokensAfterAtSnapshot + sumMessageTokens(trailingMessages);
+    data.estimatedTokensAfterAtSnapshot +
+    sumMessageTokens(additionalMessages) +
+    additionalTokens;
   const safetyMargin = Math.max(4096, Math.ceil(contextWindow * 0.02));
   const hardLimit = contextWindow - summaryReserveTokens - safetyMargin;
   const targetLimit = Math.floor((contextWindow * targetPostCompactionPercent) / 100);

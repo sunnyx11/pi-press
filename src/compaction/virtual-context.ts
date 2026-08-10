@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   buildContextEntries,
+  estimateTokens,
   sessionEntryToContextMessages,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
@@ -32,12 +33,29 @@ type SourceMessage = {
   message: AgentMessage;
 };
 
-function messageKey(message: AgentMessage): string | undefined {
-  try {
-    const value = JSON.stringify(message);
-    return value === undefined ? undefined : value;
-  } catch {
+function messageIdentityKey(message: AgentMessage): string | undefined {
+  if (!Number.isFinite(message.timestamp)) {
     return undefined;
+  }
+  switch (message.role) {
+    case "user":
+    case "assistant":
+      return JSON.stringify([message.role, message.timestamp]);
+    case "toolResult":
+      return JSON.stringify([
+        message.role,
+        message.timestamp,
+        message.toolCallId,
+        message.toolName,
+      ]);
+    case "bashExecution":
+      return JSON.stringify([message.role, message.timestamp, message.command]);
+    case "custom":
+      return JSON.stringify([message.role, message.timestamp, message.customType]);
+    case "branchSummary":
+      return JSON.stringify([message.role, message.timestamp, message.fromId]);
+    case "compactionSummary":
+      return JSON.stringify([message.role, message.timestamp, message.tokensBefore]);
   }
 }
 
@@ -78,6 +96,22 @@ function findLatestMatches(
     eventIndex -= 1;
   }
   return matches;
+}
+
+function estimateMessageTokenGrowth(
+  sourceMessage: AgentMessage,
+  eventMessage: AgentMessage,
+): number | undefined {
+  try {
+    const sourceTokens = estimateTokens(sourceMessage);
+    const eventTokens = estimateTokens(eventMessage);
+    if (!Number.isFinite(sourceTokens) || !Number.isFinite(eventTokens)) {
+      return undefined;
+    }
+    return Math.max(0, eventTokens - sourceTokens);
+  } catch {
+    return undefined;
+  }
 }
 
 function collectSourceMessages(branch: readonly SessionEntry[]): SourceMessage[] {
@@ -140,26 +174,24 @@ export function projectCheckpointToVirtualContext(
   }
   const boundarySourceIndex = firstKeptSourceIndex < 0 ? sourceMessages.length : firstKeptSourceIndex;
   const sourceKeys = sourceMessages
-    .map((source) => messageKey(source.message));
+    .map((source) => messageIdentityKey(source.message));
   if (sourceKeys.some((key) => key === undefined)) {
     return undefined;
   }
-  const eventKeys = eventMessages.map(messageKey);
+  const eventKeys = eventMessages.map(messageIdentityKey);
   const earliestMatches = findEarliestMatches(sourceKeys as string[], eventKeys);
   const latestMatches = findLatestMatches(sourceKeys as string[], eventKeys);
-  if (!earliestMatches || !latestMatches) {
+  if (
+    !earliestMatches ||
+    !latestMatches ||
+    earliestMatches.some((match, index) => match !== latestMatches[index])
+  ) {
     return undefined;
   }
 
   const boundaryEventIndex = boundarySourceIndex >= sourceMessages.length
     ? (earliestMatches.length === 0 ? 0 : earliestMatches[earliestMatches.length - 1]! + 1)
     : earliestMatches[boundarySourceIndex]!;
-  const latestBoundaryEventIndex = boundarySourceIndex >= sourceMessages.length
-    ? (latestMatches.length === 0 ? 0 : latestMatches[latestMatches.length - 1]! + 1)
-    : latestMatches[boundarySourceIndex]!;
-  if (boundaryEventIndex !== latestBoundaryEventIndex) {
-    return undefined;
-  }
 
   const matchedSourceByEvent = new Map<number, number>();
   for (let sourceIndex = 0; sourceIndex < earliestMatches.length; sourceIndex += 1) {
@@ -185,6 +217,23 @@ export function projectCheckpointToVirtualContext(
     messages.push(summaryMessage);
   }
 
+  let transformedTokenGrowth = 0;
+  for (let sourceIndex = boundarySourceIndex; sourceIndex < sourceMessages.length; sourceIndex += 1) {
+    const source = sourceMessages[sourceIndex]!;
+    if (source.branchIndex > snapshotIndex) {
+      break;
+    }
+    const eventMessage = eventMessages[earliestMatches[sourceIndex]!];
+    if (!eventMessage) {
+      return undefined;
+    }
+    const tokenGrowth = estimateMessageTokenGrowth(source.message, eventMessage);
+    if (tokenGrowth === undefined) {
+      return undefined;
+    }
+    transformedTokenGrowth += tokenGrowth;
+  }
+
   let lastPreSnapshotEventIndex = -1;
   for (let sourceIndex = 0; sourceIndex < sourceMessages.length; sourceIndex += 1) {
     if (sourceMessages[sourceIndex]!.branchIndex <= snapshotIndex) {
@@ -195,13 +244,19 @@ export function projectCheckpointToVirtualContext(
     }
   }
   const tailStart = lastPreSnapshotEventIndex + 1;
-  const trailingMessages = eventMessages.slice(tailStart);
+  const additionalMessages = [
+    ...eventMessages
+      .slice(0, tailStart)
+      .filter((_message, eventIndex) => !matchedSourceByEvent.has(eventIndex)),
+    ...eventMessages.slice(tailStart),
+  ];
   const capacity = estimateVirtualCheckpointCapacity(
     checkpoint,
-    trailingMessages,
+    additionalMessages,
     contextWindow,
     summaryReserveTokens,
     targetPostCompactionPercent,
+    transformedTokenGrowth,
   );
   if (!capacity || capacity.estimatedTokens > capacity.hardLimit) {
     return undefined;
