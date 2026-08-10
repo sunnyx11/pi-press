@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-10
+
 ### Added
 
 - 在公开 `context` 事件中应用 checkpoint 的虚拟 `compactionSummary` 和当前未压缩尾部，并在 hard limit、边界映射不明确或 checkpoint 失效时回退原消息。
@@ -32,5 +34,6 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sunnyx11/pi-press/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sunnyx11/pi-press/releases/tag/v0.1.0
