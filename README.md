@@ -39,13 +39,13 @@ pi install npm:@sunnyx11/pi-press
 固定安装指定版本：
 
 ```bash
-pi install npm:@sunnyx11/pi-press@0.2.1
+pi install npm:@sunnyx11/pi-press@0.2.2
 ```
 
 只在当前进程中临时加载：
 
 ```bash
-pi -e npm:@sunnyx11/pi-press@0.2.1
+pi -e npm:@sunnyx11/pi-press@0.2.2
 ```
 
 更新未固定版本或卸载：

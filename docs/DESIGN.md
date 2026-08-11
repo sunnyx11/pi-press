@@ -157,7 +157,7 @@ checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只
 - 虚拟上下文由一个 `role: "compactionSummary"` 消息和 `firstKeptEntryId` 开始的当前 context-visible 消息组成，使用 Pi 的公开 entry-to-message 语义构造。
 - 新增 assistant 消息、工具结果、steering 消息和 follow-up 消息在下一次 `context` 事件中进入当前尾部，不修改 checkpoint 摘要。
 - 虚拟转换不得修改 `event.messages`、`agent.state.messages` 或 SessionManager 返回的数据；必须返回新数组和新建的摘要消息。
-- 候选压缩后大小超过 `targetPostCompactionPercent` 时可以继续使用已有虚拟上下文，但必须请求 checkpoint 刷新；超过 hard limit 时不得将该候选标记为已应用，并记录保护能力不足的诊断。
+- 候选压缩后大小超过 `targetPostCompactionPercent` 时可以继续使用已有虚拟上下文，但必须请求 checkpoint 刷新；超过 hard limit 时不得将该候选标记为已应用，应在 `hookWaitTimeoutMs` 内等待已有的兼容刷新任务，仍无可用候选时返回事件原消息并记录诊断。
 - `context` 与其他扩展按注册顺序串行执行。Pi-press 必须证明当前事件消息与 SessionManager 派生的边界能够无歧义对应；无法保留其他扩展的上下文变换时返回事件原消息，禁止静默丢弃其他扩展注入的消息。
 - checkpoint 首次成功用于请求时记录 `virtualCheckpointId`、session ID 和 epoch。后续每次成功应用更新使用状态，供 `agent_settled` 判断是否需要正式持久化。
 - 正式 compaction entry 出现、session 或分支变化、checkpoint 失效以及 `precomputeMode: "off"` 时立即停止应用旧虚拟状态。
@@ -190,7 +190,7 @@ Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项�
 | `softThresholdPercent` | `80` | 最早启动后台任务的上下文百分比 |
 | `summaryReserveTokens` | `16384` | 传给候选 preparation 的摘要输出预算，默认取当前 Pi 的 `DEFAULT_COMPACTION_SETTINGS` |
 | `taskTimeoutMs` | `300000` | 单次后台任务总超时 |
-| `hookWaitTimeoutMs` | `1000` | 正式 compaction 等待兼容 in-flight 任务的最长时间 |
+| `hookWaitTimeoutMs` | `1000` | 正式 compaction 等待兼容 in-flight 任务，以及虚拟上下文超过 hard limit 时等待兼容刷新任务的最长时间 |
 | `targetPostCompactionPercent` | `60` | 正式复用 checkpoint 的最大上下文比例，也是虚拟上下文请求刷新 checkpoint 的目标比例 |
 
 候选 preparation 固定使用 `keepRecentTokens: 2000`，用于在预压缩 checkpoint 中保留少量近期内容，同时覆盖 snapshot 前尽可能多的完整消息；后台摘要请求固定允许一次瞬时错误重试；同一正式 compaction epoch 最多刷新一次 checkpoint。虚拟上下文超过目标比例时仍可在 hard limit 内继续使用，但只允许一次刷新；刷新后仍超过 hard limit 时按保护能力不足处理。这些值都不是配置项。

@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-11
+
+### Fixed
+
+- 保留虚拟上下文的 checkpoint 刷新请求，确保后续 `turn_end` 能够生成刷新 checkpoint。
+- 虚拟上下文超过 hard limit 时，有界等待正在生成的刷新 checkpoint；等待超时后保留原消息。
+- 正式化失败后释放 checkpoint claim，使下一次 `agent_settled` 能够重试一次。
+
 ## [0.2.1] - 2026-08-11
 
 ### Fixed
@@ -40,7 +48,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/sunnyx11/pi-press/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/sunnyx11/pi-press/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/sunnyx11/pi-press/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sunnyx11/pi-press/releases/tag/v0.1.0
