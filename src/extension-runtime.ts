@@ -25,7 +25,9 @@ import { isJsonObject, isUsage, parseCheckpointData } from "./checkpoint/schema.
 import { loadConfig, createSnapshotKey, configFingerprint, DEFAULT_CONFIG } from "./config.js";
 import { Diagnostics } from "./diagnostics.js";
 import { buildCheckpointCompactionResult } from "./compaction/reuse.js";
-import { projectCheckpointToVirtualContext } from "./compaction/virtual-context.js";
+import {
+  tryProjectCheckpointToVirtualContext,
+} from "./compaction/virtual-context.js";
 import {
   createPreparationSettings,
   estimateMessagesTokens,
@@ -92,6 +94,7 @@ type VirtualApplication = {
   sessionId: string;
   epochCompactionId: string | null;
   lastAppliedLeafId: string;
+  refreshRequested: boolean;
 };
 
 type FormalizationSchedule = {
@@ -207,23 +210,37 @@ export class ExtensionRuntime {
     this.invalidate("session_shutdown", true);
   }
 
-  onContext(event: ContextEvent, ctx: ExtensionContext): Pick<ContextEvent, "messages"> {
+  onContext(
+    event: ContextEvent,
+    ctx: ExtensionContext,
+  ): Pick<ContextEvent, "messages"> | Promise<Pick<ContextEvent, "messages">> {
     try {
-      return this.applyVirtualContext(event, ctx);
+      const result = this.applyVirtualContext(event, ctx);
+      return result instanceof Promise
+        ? result.catch((error: unknown) => this.handleVirtualContextError(event, error))
+        : result;
     } catch (error: unknown) {
-      this.diagnostics.count("virtual_failed");
-      this.diagnostics.record(
-        "checkpoint",
-        `虚拟上下文处理失败：${describeError(error)}`,
-      );
-      return { messages: event.messages };
+      return this.handleVirtualContextError(event, error);
     }
+  }
+
+  private handleVirtualContextError(
+    event: ContextEvent,
+    error: unknown,
+  ): Pick<ContextEvent, "messages"> {
+    this.diagnostics.count("virtual_failed");
+    this.diagnostics.record(
+      "checkpoint",
+      `虚拟上下文处理失败：${describeError(error)}`,
+    );
+    return { messages: event.messages };
   }
 
   private applyVirtualContext(
     event: ContextEvent,
     ctx: ExtensionContext,
-  ): Pick<ContextEvent, "messages"> {
+    allowWait = true,
+  ): Pick<ContextEvent, "messages"> | Promise<Pick<ContextEvent, "messages">> {
     this.bindContext(ctx);
     if (this.currentConfig.precomputeMode === "off") {
       return { messages: event.messages };
@@ -252,8 +269,9 @@ export class ExtensionRuntime {
       this.virtualApplication = undefined;
     }
 
+    let hardLimitExceeded = false;
     for (const candidate of candidates) {
-      const projection = projectCheckpointToVirtualContext({
+      const attempt = tryProjectCheckpointToVirtualContext({
         branch,
         eventMessages: event.messages,
         checkpoint: candidate.data,
@@ -261,19 +279,33 @@ export class ExtensionRuntime {
         summaryReserveTokens: this.currentConfig.summaryReserveTokens,
         targetPostCompactionPercent: this.currentConfig.targetPostCompactionPercent,
       });
-      if (!projection) {
+      if (attempt.status === "hard-limit") {
+        hardLimitExceeded = true;
         continue;
       }
+      if (attempt.status === "unavailable") {
+        continue;
+      }
+      const projection = attempt.projection;
       const leafId = ctx.sessionManager.getLeafId();
       if (!leafId) {
         this.diagnostics.count("virtual_skipped_empty_branch");
         return { messages: event.messages };
       }
+      const previousApplication = this.virtualApplication;
+      const refreshRequested = projection.needsRefresh || Boolean(
+        previousApplication &&
+        previousApplication.checkpointId === candidate.data.checkpointId &&
+        previousApplication.sessionId === sessionId &&
+        previousApplication.epochCompactionId === epochCompactionId &&
+        previousApplication.refreshRequested
+      );
       this.virtualApplication = {
         checkpointId: candidate.data.checkpointId,
         sessionId,
         epochCompactionId,
         lastAppliedLeafId: leafId,
+        refreshRequested,
       };
       this.diagnostics.count("virtual_applied");
       if (projection.needsRefresh) {
@@ -282,8 +314,53 @@ export class ExtensionRuntime {
       return { messages: projection.messages };
     }
 
+    if (hardLimitExceeded && allowWait && this.currentConfig.hookWaitTimeoutMs > 0) {
+      const task = this.findCompatibleTask(ctx);
+      if (task) {
+        return this.waitForVirtualRefresh(
+          event,
+          ctx,
+          task,
+          this.currentConfig.hookWaitTimeoutMs,
+        );
+      }
+    }
+    if (hardLimitExceeded) {
+      this.diagnostics.count("virtual_skipped_hard_limit");
+    }
     this.diagnostics.count("virtual_skipped");
     return { messages: event.messages };
+  }
+
+  private async waitForVirtualRefresh(
+    event: ContextEvent,
+    ctx: ExtensionContext,
+    task: BackgroundTask,
+    timeoutMs: number,
+  ): Promise<Pick<ContextEvent, "messages">> {
+    const waitOutcome = await this.waitForTask(
+      task,
+      timeoutMs,
+      new AbortController().signal,
+    );
+    if (
+      waitOutcome === "timeout" ||
+      task.runEpoch !== this.runEpoch ||
+      task.sessionId !== this.currentSessionId
+    ) {
+      if (waitOutcome === "timeout") {
+        this.diagnostics.count("virtual_refresh_wait_timed_out");
+        this.diagnostics.record(
+          "capacity",
+          "虚拟上下文超过 hard limit，等待后台刷新超时。",
+        );
+      }
+      this.diagnostics.count("virtual_skipped");
+      return { messages: event.messages };
+    }
+
+    this.diagnostics.count("virtual_refresh_waited");
+    return await this.applyVirtualContext(event, ctx, false);
   }
 
   onAgentSettled(ctx: ExtensionContext): void {
@@ -405,8 +482,14 @@ export class ExtensionRuntime {
     const virtualCandidate = this.virtualApplication
       ? candidates.find((candidate) => candidate.data.checkpointId === this.virtualApplication?.checkpointId)
       : undefined;
+    const virtualRefreshRequested = Boolean(
+      virtualCandidate &&
+      this.virtualApplication?.checkpointId === virtualCandidate.data.checkpointId &&
+      this.virtualApplication.refreshRequested,
+    );
     const virtualRefreshNeeded = Boolean(
-      virtualCandidate && this.shouldRefresh(virtualCandidate, branchEntries, model, config),
+      virtualCandidate &&
+      (virtualRefreshRequested || this.shouldRefresh(virtualCandidate, branchEntries, model, config)),
     );
     if (!virtualRefreshNeeded) {
       if (!usageKnown) {
@@ -436,9 +519,14 @@ export class ExtensionRuntime {
         this.refreshesByEpoch.get(epochKey) ?? 0,
         persistedRefreshCount,
       );
+      const existingRefreshRequested = Boolean(
+        virtualRefreshRequested &&
+        virtualCandidate?.data.checkpointId === existingCandidate.data.checkpointId,
+      );
       if (
         refreshCount >= MAX_REFRESHES_PER_EPOCH ||
-        !this.shouldRefresh(existingCandidate, branchEntries, model, config)
+        (!existingRefreshRequested &&
+          !this.shouldRefresh(existingCandidate, branchEntries, model, config))
       ) {
         return;
       }
@@ -461,6 +549,12 @@ export class ExtensionRuntime {
       thinkingLevel: ctx.thinkingLevel ?? "medium",
       config,
     });
+    if (
+      existingCandidate &&
+      this.virtualApplication?.checkpointId === existingCandidate.data.checkpointId
+    ) {
+      this.virtualApplication.refreshRequested = false;
+    }
   }
 
   async beforeCompact(
@@ -627,6 +721,7 @@ export class ExtensionRuntime {
     if (this.pendingFormalization?.requestId !== pending.requestId) {
       return;
     }
+    this.releaseCheckpointClaim(pending.checkpointId);
     this.pendingFormalization = undefined;
     this.diagnostics.count("formalization_failed");
 

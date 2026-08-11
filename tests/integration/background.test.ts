@@ -94,7 +94,7 @@ test("context applies a ready checkpoint and settled formalization runs after th
     scenario.runtime.onTurnEnd(ctx);
     await waitFor(() => scenario.appended.length === 1);
     const eventMessages = scenario.manager.buildSessionContext().messages;
-    const contextResult = scenario.runtime.onContext({
+    const contextResult = await scenario.runtime.onContext({
       type: "context",
       messages: eventMessages,
     }, ctx);
@@ -102,6 +102,11 @@ test("context applies a ready checkpoint and settled formalization runs after th
     assert.ok(contextResult?.messages);
     assert.equal(contextResult.messages[0]?.role, "compactionSummary");
     assert.equal(scenario.runtime.getDiagnostics().counters.virtual_applied, 1);
+
+    scenario.runtime.onTurnEnd(ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(scenario.appended.length, 1);
+    assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 1);
 
     scenario.runtime.onAgentSettled(ctx);
     scenario.runtime.onAgentSettled(ctx);
@@ -230,6 +235,47 @@ test("formalization failure allows one retry and then stops", async () => {
   }
 });
 
+test("formalization failure after checkpoint reuse releases the claim for one retry", async () => {
+  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const compactCalls: Array<{ onError?: (error: Error) => void }> = [];
+  const ctx = {
+    ...scenario.ctx,
+    isIdle: () => true,
+    compact: (options?: { onError?: (error: Error) => void }) => {
+      compactCalls.push(options ?? {});
+    },
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, ctx);
+
+    scenario.runtime.onAgentSettled(ctx);
+    await waitFor(() => compactCalls.length === 1);
+    const manualEvent = {
+      ...makeCompactEvent(scenario, new AbortController().signal),
+      reason: "manual" as const,
+    };
+    assert.ok(await scenario.runtime.beforeCompact(manualEvent, ctx));
+
+    compactCalls[0]?.onError?.(new Error("simulated persistence failure"));
+    scenario.runtime.onAgentSettled(ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(compactCalls.length, 2);
+    assert.equal(scenario.runtime.getDiagnostics().counters.formalization_failed, 1);
+    assert.equal(scenario.runtime.getDiagnostics().counters.formalization_started, 2);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
 test("branch switching cancels a scheduled formalization", async () => {
   const scenario = createScenario({ summaryReserveTokens: 1 });
   let compactCalls = 0;
@@ -317,6 +363,62 @@ test("virtual context refreshes from trailing growth below the original threshol
 
     scenario.runtime.onTurnEnd(lowUsageCtx);
     await waitFor(() => scenario.appended.length === 2);
+    assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 2);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("virtual context refresh request from an injected message survives until turn_end", async () => {
+  const scenario = createScenario({
+    targetPostCompactionPercent: 20,
+    summaryReserveTokens: 1,
+  });
+  const response: ResponseFactory = async () => fauxAssistantMessage("refreshed checkpoint summary");
+  scenario.faux.setResponses([response, response]);
+  const lowUsageCtx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: 10_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 10,
+    }),
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    const baseMessages = scenario.manager.buildSessionContext().messages;
+    const injectedMessage = {
+      ...makeUserMessage("x".repeat(60_000)),
+      timestamp: Date.now() + 10_000,
+    };
+    const contextResult = await scenario.runtime.onContext({
+      type: "context",
+      messages: [baseMessages[0]!, injectedMessage, ...baseMessages.slice(1)],
+    }, scenario.ctx);
+
+    assert.equal(
+      contextResult.messages.some((message) => message.role === "compactionSummary"),
+      true,
+    );
+    assert.equal(
+      contextResult.messages.some(
+        (message) => message.role === "user" && message.content === injectedMessage.content,
+      ),
+      true,
+    );
+    assert.equal(scenario.runtime.getDiagnostics().counters.virtual_refresh_needed, 1);
+
+    scenario.runtime.onTurnEnd(lowUsageCtx);
+    await waitFor(() => scenario.appended.length === 2);
+    assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 2);
+
+    scenario.runtime.onTurnEnd(lowUsageCtx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(scenario.appended.length, 2);
     assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 2);
   } finally {
     scenario.runtime.onSessionShutdown();

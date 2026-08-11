@@ -80,7 +80,7 @@ test("checkpoint claim stays exclusive within one attempt and recovers for a new
   assert.equal(runtime.getDiagnostics().counters.task_started ?? 0, 0);
 });
 
-test("context returns original messages and records a diagnostic when projection fails", () => {
+test("context returns original messages and records a diagnostic when projection fails", async () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime-context-error");
   manager.appendMessage(makeUserMessage("current context"));
   const messages = manager.buildSessionContext().messages;
@@ -106,7 +106,7 @@ test("context returns original messages and records a diagnostic when projection
   const runtime = new ExtensionRuntime({ appendEntry: () => undefined });
   runtime.onSessionStart(ctx);
 
-  const result = runtime.onContext({ type: "context", messages }, ctx);
+  const result = await runtime.onContext({ type: "context", messages }, ctx);
 
   assert.equal(result.messages, messages);
   assert.equal(runtime.getDiagnostics().counters.virtual_failed, 1);

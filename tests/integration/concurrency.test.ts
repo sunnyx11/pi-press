@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 import test from "node:test";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import type { SessionCompactEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, SessionCompactEvent } from "@earendil-works/pi-coding-agent";
 import { ExtensionRuntime } from "../../src/extension-runtime.js";
+import { makeUserMessage } from "../unit/fixtures.js";
 import {
   createScenario,
   makeCompactEvent,
@@ -100,6 +101,117 @@ test("hook waits for an in-flight checkpoint and reuses it", async () => {
     assert.equal(scenario.appended.length, 1);
     assert.equal(scenario.runtime.getDiagnostics().counters.checkpoint_reused, 1);
   } finally {
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("context above the hard limit waits for an in-flight refresh checkpoint", async () => {
+  let resolveRefreshStarted!: () => void;
+  const refreshStarted = new Promise<void>((resolve) => {
+    resolveRefreshStarted = resolve;
+  });
+  const initialResponse: ResponseFactory = async () => fauxAssistantMessage("initial checkpoint summary");
+  const scenario = createScenario({ hookWaitTimeoutMs: 300 });
+  scenario.faux.setResponses([
+    initialResponse,
+    delayedResponse(40, resolveRefreshStarted),
+  ]);
+  const lowUsageCtx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: 10_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 10,
+    }),
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    const initialContext = await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, scenario.ctx);
+    assert.equal(initialContext.messages[0]?.role, "compactionSummary");
+
+    for (let index = 0; index < 140; index += 1) {
+      scenario.manager.appendMessage(makeUserMessage("x".repeat(3_000)));
+    }
+    scenario.runtime.onTurnEnd(lowUsageCtx);
+    await refreshStarted;
+
+    const refreshedContext = await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, lowUsageCtx);
+
+    assert.equal(scenario.appended.length, 2);
+    assert.equal(refreshedContext.messages[0]?.role, "compactionSummary");
+    assert.equal(
+      (refreshedContext.messages[0] as { summary?: string }).summary,
+      "checkpoint summary",
+    );
+    assert.equal(scenario.runtime.getDiagnostics().counters.virtual_refresh_waited, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("context above the hard limit falls back after the refresh wait times out", async () => {
+  let resolveRefreshStarted!: () => void;
+  const refreshStarted = new Promise<void>((resolve) => {
+    resolveRefreshStarted = resolve;
+  });
+  const initialResponse: ResponseFactory = async () => fauxAssistantMessage("initial checkpoint summary");
+  const scenario = createScenario({ hookWaitTimeoutMs: 20 });
+  scenario.faux.setResponses([
+    initialResponse,
+    delayedResponse(100, resolveRefreshStarted),
+  ]);
+  const lowUsageCtx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: 10_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 10,
+    }),
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, scenario.ctx);
+
+    for (let index = 0; index < 140; index += 1) {
+      scenario.manager.appendMessage(makeUserMessage("x".repeat(3_000)));
+    }
+    scenario.runtime.onTurnEnd(lowUsageCtx);
+    await refreshStarted;
+    const sourceMessages = scenario.manager.buildSessionContext().messages;
+
+    const contextResult = await scenario.runtime.onContext({
+      type: "context",
+      messages: sourceMessages,
+    }, lowUsageCtx);
+
+    assert.equal(contextResult.messages, sourceMessages);
+    assert.equal(scenario.appended.length, 1);
+    assert.equal(scenario.runtime.getDiagnostics().counters.virtual_refresh_wait_timed_out, 1);
+    assert.ok(
+      scenario.runtime.getDiagnostics().records.some(
+        (record) => record.message.includes("等待后台刷新超时"),
+      ),
+    );
+
+    await waitFor(() => scenario.appended.length === 2);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 120));
     rmSync(scenario.cwd, { recursive: true, force: true });
   }
 });

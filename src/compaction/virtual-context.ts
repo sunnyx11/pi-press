@@ -130,13 +130,17 @@ function collectSourceMessages(branch: readonly SessionEntry[]): SourceMessage[]
   return messages;
 }
 
+export type VirtualContextProjectionAttempt =
+  | { status: "projected"; projection: VirtualContextProjection }
+  | { status: "unavailable" }
+  | { status: "hard-limit" };
+
 /**
- * 将有效 checkpoint 投影为当前 provider 请求使用的虚拟上下文。
- * 返回 undefined 表示边界无法映射或消息容量超过 hard limit。
+ * 将有效 checkpoint 投影为当前 provider 请求使用的虚拟上下文，并保留容量拒绝原因。
  */
-export function projectCheckpointToVirtualContext(
+export function tryProjectCheckpointToVirtualContext(
   input: VirtualContextProjectionInput,
-): VirtualContextProjection | undefined {
+): VirtualContextProjectionAttempt {
   const {
     branch,
     eventMessages,
@@ -154,7 +158,7 @@ export function projectCheckpointToVirtualContext(
     targetPostCompactionPercent < 0 ||
     targetPostCompactionPercent > 100
   ) {
-    return undefined;
+    return { status: "unavailable" };
   }
 
   const snapshotIndex = branch.findIndex((entry) => entry.id === checkpoint.snapshotLeafId);
@@ -162,7 +166,7 @@ export function projectCheckpointToVirtualContext(
     (entry) => entry.id === checkpoint.compaction.firstKeptEntryId,
   );
   if (snapshotIndex < 0 || firstKeptIndex < 0 || firstKeptIndex > snapshotIndex) {
-    return undefined;
+    return { status: "unavailable" };
   }
 
   const sourceMessages = collectSourceMessages(branch);
@@ -170,13 +174,13 @@ export function projectCheckpointToVirtualContext(
     (source) => source.branchIndex >= firstKeptIndex,
   );
   if (firstKeptSourceIndex < 0 && sourceMessages.some((source) => source.branchIndex >= firstKeptIndex)) {
-    return undefined;
+    return { status: "unavailable" };
   }
   const boundarySourceIndex = firstKeptSourceIndex < 0 ? sourceMessages.length : firstKeptSourceIndex;
   const sourceKeys = sourceMessages
     .map((source) => messageIdentityKey(source.message));
   if (sourceKeys.some((key) => key === undefined)) {
-    return undefined;
+    return { status: "unavailable" };
   }
   const eventKeys = eventMessages.map(messageIdentityKey);
   const earliestMatches = findEarliestMatches(sourceKeys as string[], eventKeys);
@@ -186,7 +190,7 @@ export function projectCheckpointToVirtualContext(
     !latestMatches ||
     earliestMatches.some((match, index) => match !== latestMatches[index])
   ) {
-    return undefined;
+    return { status: "unavailable" };
   }
 
   const boundaryEventIndex = boundarySourceIndex >= sourceMessages.length
@@ -199,7 +203,7 @@ export function projectCheckpointToVirtualContext(
   }
   const summaryMessage = checkpointToCompactionSummaryMessage(checkpoint);
   if (!summaryMessage) {
-    return undefined;
+    return { status: "unavailable" };
   }
 
   const messages: AgentMessage[] = [];
@@ -225,11 +229,11 @@ export function projectCheckpointToVirtualContext(
     }
     const eventMessage = eventMessages[earliestMatches[sourceIndex]!];
     if (!eventMessage) {
-      return undefined;
+      return { status: "unavailable" };
     }
     const tokenGrowth = estimateMessageTokenGrowth(source.message, eventMessage);
     if (tokenGrowth === undefined) {
-      return undefined;
+      return { status: "unavailable" };
     }
     transformedTokenGrowth += tokenGrowth;
   }
@@ -258,15 +262,32 @@ export function projectCheckpointToVirtualContext(
     targetPostCompactionPercent,
     transformedTokenGrowth,
   );
-  if (!capacity || capacity.estimatedTokens > capacity.hardLimit) {
-    return undefined;
+  if (!capacity) {
+    return { status: "unavailable" };
+  }
+  if (capacity.estimatedTokens > capacity.hardLimit) {
+    return { status: "hard-limit" };
   }
 
   return {
-    messages,
-    estimatedTokens: capacity.estimatedTokens,
-    hardLimit: capacity.hardLimit,
-    targetLimit: capacity.targetLimit,
-    needsRefresh: capacity.needsRefresh,
+    status: "projected",
+    projection: {
+      messages,
+      estimatedTokens: capacity.estimatedTokens,
+      hardLimit: capacity.hardLimit,
+      targetLimit: capacity.targetLimit,
+      needsRefresh: capacity.needsRefresh,
+    },
   };
+}
+
+/**
+ * 将有效 checkpoint 投影为当前 provider 请求使用的虚拟上下文。
+ * 返回 undefined 表示边界无法映射或消息容量超过 hard limit。
+ */
+export function projectCheckpointToVirtualContext(
+  input: VirtualContextProjectionInput,
+): VirtualContextProjection | undefined {
+  const attempt = tryProjectCheckpointToVirtualContext(input);
+  return attempt.status === "projected" ? attempt.projection : undefined;
 }
