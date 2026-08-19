@@ -1,6 +1,6 @@
 {
   "name": "@sunnyx11/pi-press",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Precompute Pi compaction summaries in the background and reuse them when compaction starts.",
   "type": "module",
   "license": "MIT",
