@@ -75,7 +75,7 @@ src/
 ├── types.ts                         # 公共内部类型和版本常量
 ├── diagnostics.ts                   # 诊断与指标，不记录敏感信息
 ├── checkpoint/
-│   ├── schema.ts                    # checkpoint v3 运行时校验
+│   ├── schema.ts                    # checkpoint v4 与兼容 v3 的运行时校验
 │   ├── store.ts                     # custom entry 读取、追加和恢复
 │   └── selection.ts                 # 祖先、epoch、消费状态和容量筛选
 ├── compaction/
@@ -225,7 +225,7 @@ import {
 | `session_start` | 通过 `ctx.sessionManager.getEntries()`、`getBranch()` 恢复 checkpoint、正式 compaction epoch、消费状态和当前分支。 |
 | `turn_end` | 读取 `ctx.getContextUsage()`，判断软阈值或已应用虚拟 checkpoint 的尾部容量，获取快照并调度后台任务。处理器必须在后台摘要完成前返回。 |
 | `context` | 每次 provider 请求前重新校验 ready checkpoint，构造虚拟 `compactionSummary` 和当前未压缩尾部；映射不明确时返回原消息。 |
-| `agent_settled` | 在 Pi 完成重试、原生 compaction 和排队续跑后，延迟检查并按需调用 `ctx.compact()`；正式 entry、上下文重建和持久化由 Pi 完成。 |
+| `agent_settled` | 在 Pi 完成重试、原生 compaction 和排队续跑后，等待兼容后台任务，选择最新 checkpoint，再延迟调用 `ctx.compact()`；正式 entry、上下文重建和持久化由 Pi 完成。 |
 | `session_before_compact` | 校验 reason、signal、分支、epoch、checkpoint 和容量；可返回兼容 `CompactionResult`，否则返回 `undefined` 让 Pi 使用原生实现。 |
 | `session_compact` | 记录正式 entry 对 checkpoint 的消费，递增运行 epoch，取消旧 epoch 任务。 |
 | `session_before_tree` | 递增运行 epoch，取消当前任务，释放当前分支绑定状态；不读取将要失效的旧 session 对象。 |
@@ -234,7 +234,7 @@ import {
 | `model_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取模型 provenance，不废弃已有 ready checkpoint，也不改变 snapshot key。 |
 | `thinking_level_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取 thinking level，不承担 checkpoint 失效和消费判断。 |
 
-`turn_end` 不调用 `ctx.compact()`，因为当前 agent loop 仍可能继续采样。`agent_end` 之后仍可能发生自动重试、原生压缩或排队消息续跑；只有 `agent_settled` 后，且虚拟 checkpoint 已实际用于请求、上下文仍有效并且 `ctx.isIdle()` 为真时，才允许通过延迟回调调用 `ctx.compact()`。正式 `compaction` entry 由 Pi 写入，失败时保留虚拟 checkpoint 并按限制重试。`session_before_compact` 不支持的 `overflow`、`willRetry: true`、带 `customInstructions` 的请求必须回退 Pi 原生 compaction。
+`turn_end` 不调用 `ctx.compact()`，因为当前 agent loop 仍可能继续采样。`agent_end` 之后仍可能发生自动重试、原生压缩或排队消息续跑；只有 `agent_settled` 后，且虚拟 checkpoint 已实际用于请求、上下文仍有效并且 `ctx.isIdle()` 为真时，才允许等待兼容后台任务并通过延迟回调调用 `ctx.compact()`。正式 `compaction` entry 由 Pi 写入，失败时保留虚拟 checkpoint 并按限制重试。overflow 或 `willRetry: true` 只复用比失败请求更新的 checkpoint；等待失败时返回 `undefined`，保留 Pi 原生压缩和自动重试。带 `customInstructions` 的请求使用 Pi 原生 compaction。
 
 `session_before_compact` 的 handler 只在 checkpoint 完整满足项目设计时返回：
 
@@ -311,10 +311,11 @@ function startTask(input: TaskInput): void {
 - checkpoint 被领取后，取消同 epoch 中不再需要的后台任务；
 - checkpoint claim 必须绑定事件 signal；signal 取消、正式消费或新 attempt 使用不同 signal 时释放；
 - ready checkpoint 生成成功后，同一 snapshot key 不得重复请求；
-- 刷新任务必须使用新的 `snapshotSourceLeafId`，且同一 epoch 最多刷新一次；
+- 刷新任务必须使用新的 `snapshotSourceLeafId` 和最新兼容 parent checkpoint；同一 epoch 不限制刷新次数；
+- parent 链中的 session、epoch、Pi 版本、snapshot 顺序和保留边界必须全部有效；
 - 不以 Promise 的完成顺序代替 epoch、祖先和身份校验。
 
-后台摘要与正式 compaction 之间存在竞争时，正式 compaction 优先。等待 in-flight 任务必须同时受 `hookWaitTimeoutMs` 和事件 `signal` 限制；等待失败后清除任务身份、发送 abort 并返回 `undefined`。
+后台摘要与正式 compaction 之间存在竞争时，正式 compaction 优先。普通等待 in-flight 任务受 `hookWaitTimeoutMs` 和事件 `signal` 限制，等待失败后清除任务身份、发送 abort 并返回 `undefined`。overflow 等待以任务剩余的 `taskTimeoutMs` 为上限，超时后不取消任务，并返回 `undefined` 让 Pi 继续处理。
 
 ## Pi API 使用规范
 
@@ -340,7 +341,7 @@ pi.appendEntry("pi-press.precompaction", checkpointData);
 pi.appendEntry("pi-press.metrics", metricsData);
 ```
 
-custom entry 不进入 LLM 上下文，可以作为 session tree 的 metadata。entry 必须是可序列化数据，追加后不得原地更新。checkpoint 在 `pi.appendEntry()` 前必须通过统一的完整 v3 parser，禁止只校验本次 provider 返回的局部字段。扩展不得手工追加正式 `type: "compaction"` entry；正式 entry 由 Pi 根据 `session_before_compact` 的返回值写入。
+custom entry 不进入 LLM 上下文，可以作为 session tree 的 metadata。entry 必须是可序列化数据，追加后不得原地更新。checkpoint 在 `pi.appendEntry()` 前必须通过统一的完整 parser，禁止只校验本次 provider 返回的局部字段。当前写入 v4；v3 只允许作为没有 parent 的兼容根节点。扩展不得手工追加正式 `type: "compaction"` entry；正式 entry 由 Pi 根据 `session_before_compact` 的返回值写入。
 
 消费状态从正式 compaction entry 的 `details.piPress.checkpointId` 推导，不新增 consumed entry。metrics entry 只用于扩展诊断，不能改变 checkpoint 的有效性和 session 上下文。
 
@@ -443,11 +444,9 @@ fixedOverhead = max(0, currentPreparation.tokensBefore - currentMessagesEstimate
 estimatedTokensAfter = fixedOverhead + summaryEstimatedTokens + keptMessagesEstimatedTokens
 safetyMargin = max(4096, ceil(contextWindow * 0.02))
 hardLimit = contextWindow - reserveTokens - safetyMargin
-targetLimit = floor(contextWindow * targetPostCompactionPercent / 100)
-acceptLimit = min(hardLimit, targetLimit)
 ```
 
-`estimatedTokensAfter` 超过 `acceptLimit`、当前模型 context window 不可用或当前限制无法确定时，checkpoint 不可消费，返回 `undefined`。
+`estimatedTokensAfter` 超过 `hardLimit`、当前模型 context window 不可用或当前限制无法确定时，checkpoint 不可消费，返回 `undefined`。虚拟上下文达到 `softThresholdPercent` 时仍可在 hard limit 内应用，同时调度下一代增量 checkpoint。
 
 ## 配置与错误处理
 
@@ -459,10 +458,9 @@ acceptLimit = min(hardLimit, targetLimit)
 - `softThresholdPercent: 80`；
 - `summaryReserveTokens: 16384`；
 - `taskTimeoutMs: 300000`；
-- `hookWaitTimeoutMs: 1000`；
-- `targetPostCompactionPercent: 60`。
+- `hookWaitTimeoutMs: 1000`。
 
-候选 preparation 固定使用 `keepRecentTokens: 2000`，该值不属于 Pi-press 配置字段；后台摘要请求固定允许一次瞬时错误重试；同一正式 compaction epoch 最多刷新一次 checkpoint，这些限制均固定实现。
+候选 preparation 固定使用 `keepRecentTokens: 2000`，该值不属于 Pi-press 配置字段；后台摘要请求固定允许一次瞬时错误重试。同一正式 compaction epoch 可按 `softThresholdPercent` 连续刷新，每代使用 parent summary 和 parent snapshot 后的新增历史。旧配置中的 `targetPostCompactionPercent` 记录一次警告并忽略。
 
 配置 fingerprint 必须参与 snapshot key。`precomputeMode` 切换为 `"off"` 时中止 in-flight 任务并停止消费 ready checkpoint。
 
@@ -472,8 +470,8 @@ acceptLimit = min(hardLimit, targetLimit)
 | --- | --- |
 | checkpoint Pi 版本不匹配、schema 未知或 entry 引用损坏 | 记录诊断，忽略 checkpoint，返回 `undefined`；正式 compaction 继续使用 Pi 原生实现。 |
 | 达到阈值但 preparation 不可用 | 记录诊断并静默跳过；后续 `turn_end` 可以再次尝试。 |
-| 生成阶段容量预测超过目标比例或无法计算 | 记录容量诊断，通过 CLI warning 显示容量数值或不可用状态，丢弃本次摘要 usage，不追加 checkpoint；正式 compaction 继续使用 Pi 原生实现。 |
-| 消费阶段容量预测超过目标比例或无法计算 | 记录容量诊断，通过 CLI warning 显示 checkpoint ID、容量数值和 Pi 原生回退状态。 |
+| 生成阶段容量预测超过 hard limit 或无法计算 | 记录容量诊断，通过 CLI warning 显示容量数值或不可用状态，丢弃本次摘要 usage，不追加 checkpoint；正式 compaction 继续使用 Pi 原生实现。 |
+| 消费阶段容量预测超过 hard limit 或无法计算 | 记录容量诊断，通过 CLI warning 显示 checkpoint ID、容量数值和 Pi 原生处理状态。 |
 | provider、公开 API、结果或 checkpoint 追加失败 | 记录不含认证信息和完整响应的失败原因，通过 CLI error 通知显示，清除任务状态并回退 Pi 原生 compaction。 |
 | 后台任务总超时 | 清除任务身份，发送 abort，记录超时并通过 CLI error 通知显示；正式 compaction 回退 Pi 原生实现。 |
 | hook 等待后台任务超时 | 中止对应任务，记录等待超时并通过 CLI warning 显示 Pi 原生回退状态。 |
@@ -531,9 +529,9 @@ acceptLimit = min(hardLimit, targetLimit)
 纯函数至少覆盖：
 
 - 配置默认值、范围校验和 fingerprint；
-- checkpoint v3 schema、未知版本、空 summary、非有限数值和非法引用；
+- checkpoint v4、兼容 v3 根节点、parent 链、未知版本、空 summary、非有限数值和非法引用；
 - snapshot key、epoch 和祖先判断；
-- 容量公式、安全余量和目标比例；
+- 容量公式、容量余量和 soft threshold；
 - task identity、runEpoch 和状态转换；
 - provider header 的覆盖、删除和环境变量传递。
 
@@ -551,8 +549,9 @@ acceptLimit = min(hardLimit, targetLimit)
 - checkpoint、metrics custom entry 不进入 LLM 上下文；
 - 正式 compaction entry 由 Pi 写入，保留原生 `readFiles`、`modifiedFiles` 和 `details.piPress`；
 - session 重启、tree 切换、返回旧分支和正式 compaction 后状态正确恢复；
-- 同一 snapshot 去重、epoch 变化失效、每 epoch 刷新次数限制和旧 Promise 追加保护；
-- manual、customInstructions、overflow、`willRetry` 和 `precomputeMode` 三种取值的复用或回退规则。
+- 同一 snapshot 去重、epoch 变化失效、同 epoch 至少三代增量刷新和旧 Promise 追加保护；
+- 虚拟投影缓存的追加扩展、截断重建、分支切换和正式 compaction 失效；
+- manual、customInstructions、overflow、`willRetry` 和 `precomputeMode` 三种取值的复用或 Pi 原生处理规则。
 
 ### 命令
 

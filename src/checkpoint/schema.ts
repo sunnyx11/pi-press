@@ -2,8 +2,10 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   CHECKPOINT_VERSION,
+  LEGACY_CHECKPOINT_VERSION,
   CHECKPOINT_CUSTOM_TYPE,
   PREPARATION_ALGORITHM_VERSION,
+  LEGACY_PREPARATION_ALGORITHM_VERSION,
   SUMMARY_FORMAT_VERSION,
   type CheckpointData,
   type JsonObject,
@@ -157,7 +159,7 @@ function isProvenance(value: unknown): boolean {
   );
 }
 
-/** 校验 checkpoint v3 的持久化数据，不读取 session 文件。 */
+/** 校验 checkpoint v3/v4 的持久化数据，不读取 session 文件。 */
 export function parseCheckpointData(
   value: unknown,
   versions: {
@@ -176,15 +178,21 @@ export function parseCheckpointData(
   ) {
     return undefined;
   }
+  const supportedVersion =
+    (value.version === CHECKPOINT_VERSION && value.algorithmVersion === PREPARATION_ALGORITHM_VERSION) ||
+    (value.version === LEGACY_CHECKPOINT_VERSION &&
+      value.algorithmVersion === LEGACY_PREPARATION_ALGORITHM_VERSION);
   if (
-    value.version !== CHECKPOINT_VERSION ||
-    value.algorithmVersion !== (versions.algorithmVersion ?? PREPARATION_ALGORITHM_VERSION) ||
+    !supportedVersion ||
+    (versions.algorithmVersion !== undefined && value.algorithmVersion !== versions.algorithmVersion) ||
     value.summaryFormatVersion !== (versions.summaryFormatVersion ?? SUMMARY_FORMAT_VERSION)
   ) {
     return undefined;
   }
   if (
     !isNonEmptyString(value.checkpointId) ||
+    (value.parentCheckpointId !== undefined && !isNonEmptyString(value.parentCheckpointId)) ||
+    (value.version === LEGACY_CHECKPOINT_VERSION && value.parentCheckpointId !== undefined) ||
     !isNonEmptyString(value.sessionId) ||
     !isNonEmptyString(value.snapshotLeafId) ||
     !isNonEmptyString(value.snapshotSourceLeafId) ||
@@ -205,11 +213,12 @@ export function parseCheckpointData(
   }
 
   const result: CheckpointData = {
-    version: CHECKPOINT_VERSION,
+    version: value.version as CheckpointData["version"],
     piVersion,
-    algorithmVersion: PREPARATION_ALGORITHM_VERSION,
+    algorithmVersion: value.algorithmVersion as CheckpointData["algorithmVersion"],
     summaryFormatVersion: SUMMARY_FORMAT_VERSION,
     checkpointId: value.checkpointId,
+    ...(value.parentCheckpointId === undefined ? {} : { parentCheckpointId: value.parentCheckpointId }),
     sessionId: value.sessionId,
     snapshotLeafId: value.snapshotLeafId,
     snapshotSourceLeafId: value.snapshotSourceLeafId,

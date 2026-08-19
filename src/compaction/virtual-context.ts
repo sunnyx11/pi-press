@@ -17,20 +17,40 @@ export interface VirtualContextProjectionInput {
   checkpoint: CheckpointData;
   contextWindow: number;
   summaryReserveTokens: number;
-  targetPostCompactionPercent: number;
+  softThresholdPercent: number;
+  cache?: VirtualContextProjectionCache;
 }
 
 export interface VirtualContextProjection {
   messages: AgentMessage[];
   estimatedTokens: number;
   hardLimit: number;
-  targetLimit: number;
+  refreshLimit: number;
   needsRefresh: boolean;
 }
 
 type SourceMessage = {
   branchIndex: number;
   message: AgentMessage;
+  estimatedTokens: number | undefined;
+};
+
+type CheckpointBoundary = {
+  snapshotIndex: number;
+  firstKeptIndex: number;
+  boundarySourceIndex: number;
+};
+
+type CachedSourceIndex = {
+  sourceMessages: readonly SourceMessage[];
+  sourceKeys: readonly string[];
+};
+
+export type VirtualContextCacheStats = {
+  rebuilds: number;
+  incrementallyIndexedEntries: number;
+  branchEntries: number;
+  sourceMessages: number;
 };
 
 function messageIdentityKey(message: AgentMessage): string | undefined {
@@ -99,16 +119,25 @@ function findLatestMatches(
 }
 
 function estimateMessageTokenGrowth(
-  sourceMessage: AgentMessage,
+  sourceMessage: SourceMessage,
   eventMessage: AgentMessage,
 ): number | undefined {
   try {
-    const sourceTokens = estimateTokens(sourceMessage);
+    const sourceTokens = sourceMessage.estimatedTokens ?? estimateTokens(sourceMessage.message);
     const eventTokens = estimateTokens(eventMessage);
     if (!Number.isFinite(sourceTokens) || !Number.isFinite(eventTokens)) {
       return undefined;
     }
     return Math.max(0, eventTokens - sourceTokens);
+  } catch {
+    return undefined;
+  }
+}
+
+function estimateMessageTokens(message: AgentMessage): number | undefined {
+  try {
+    const tokens = estimateTokens(message);
+    return Number.isFinite(tokens) && tokens >= 0 ? tokens : undefined;
   } catch {
     return undefined;
   }
@@ -124,10 +153,168 @@ function collectSourceMessages(branch: readonly SessionEntry[]): SourceMessage[]
       continue;
     }
     for (const message of sessionEntryToContextMessages(entry)) {
-      messages.push({ branchIndex, message });
+      messages.push({
+        branchIndex,
+        message,
+        estimatedTokens: estimateMessageTokens(message),
+      });
     }
   }
   return messages;
+}
+
+/** 缓存分支到 provider 消息的稳定映射，并在分支仅追加时增量扩展索引。 */
+export class VirtualContextProjectionCache {
+  private branchIds: string[] = [];
+  private sourceMessages: SourceMessage[] = [];
+  private sourceKeys: string[] = [];
+  private tokenTotals: number[] = [0];
+  private invalidTokenTotals: number[] = [0];
+  private initialized = false;
+  private readonly boundaries = new Map<string, CheckpointBoundary>();
+  private rebuildCount = 0;
+  private incrementalEntryCount = 0;
+
+  clear(): void {
+    this.branchIds = [];
+    this.sourceMessages = [];
+    this.sourceKeys = [];
+    this.tokenTotals = [0];
+    this.invalidTokenTotals = [0];
+    this.initialized = false;
+    this.boundaries.clear();
+  }
+
+  prepare(branch: readonly SessionEntry[]): CachedSourceIndex | undefined {
+    const sharedPrefix =
+      branch.length >= this.branchIds.length &&
+      this.branchIds.every((id, index) => branch[index]?.id === id);
+    const appendedEntries = sharedPrefix ? branch.slice(this.branchIds.length) : [];
+    const canExtend =
+      this.initialized &&
+      sharedPrefix &&
+      !appendedEntries.some((entry) => entry.type === "compaction");
+    if (!canExtend) {
+      this.rebuild(branch);
+    } else if (appendedEntries.length > 0) {
+      this.extend(appendedEntries, this.branchIds.length);
+      this.branchIds.push(...appendedEntries.map((entry) => entry.id));
+      this.incrementalEntryCount += appendedEntries.length;
+    }
+    if (this.sourceKeys.length !== this.sourceMessages.length) {
+      return undefined;
+    }
+    return {
+      sourceMessages: this.sourceMessages,
+      sourceKeys: this.sourceKeys,
+    };
+  }
+
+  getBoundary(branch: readonly SessionEntry[], checkpoint: CheckpointData): CheckpointBoundary | undefined {
+    const index = this.prepare(branch);
+    if (!index) {
+      return undefined;
+    }
+    const cached = this.boundaries.get(checkpoint.checkpointId);
+    if (cached) {
+      return cached;
+    }
+    const snapshotIndex = branch.findIndex((entry) => entry.id === checkpoint.snapshotLeafId);
+    const firstKeptIndex = branch.findIndex(
+      (entry) => entry.id === checkpoint.compaction.firstKeptEntryId,
+    );
+    if (snapshotIndex < 0 || firstKeptIndex < 0 || firstKeptIndex > snapshotIndex) {
+      return undefined;
+    }
+    const firstKeptSourceIndex = index.sourceMessages.findIndex(
+      (source) => source.branchIndex >= firstKeptIndex,
+    );
+    const boundarySourceIndex = firstKeptSourceIndex < 0
+      ? index.sourceMessages.length
+      : firstKeptSourceIndex;
+    const boundary = { snapshotIndex, firstKeptIndex, boundarySourceIndex };
+    this.boundaries.set(checkpoint.checkpointId, boundary);
+    return boundary;
+  }
+
+  estimateTokensAfter(branch: readonly SessionEntry[], branchIndex: number): number | undefined {
+    const index = this.prepare(branch);
+    if (!index) {
+      return undefined;
+    }
+    let low = 0;
+    let high = index.sourceMessages.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (index.sourceMessages[middle]!.branchIndex <= branchIndex) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    const invalidTokens = this.invalidTokenTotals.at(-1)! - this.invalidTokenTotals[low]!;
+    if (invalidTokens > 0) {
+      return undefined;
+    }
+    return this.tokenTotals.at(-1)! - this.tokenTotals[low]!;
+  }
+
+  stats(): VirtualContextCacheStats {
+    return {
+      rebuilds: this.rebuildCount,
+      incrementallyIndexedEntries: this.incrementalEntryCount,
+      branchEntries: this.branchIds.length,
+      sourceMessages: this.sourceMessages.length,
+    };
+  }
+
+  private rebuild(branch: readonly SessionEntry[]): void {
+    this.branchIds = branch.map((entry) => entry.id);
+    this.sourceMessages = collectSourceMessages(branch);
+    this.sourceKeys = [];
+    this.tokenTotals = [0];
+    this.invalidTokenTotals = [0];
+    this.boundaries.clear();
+    this.initialized = true;
+    for (const source of this.sourceMessages) {
+      this.appendSourceMetadata(source);
+    }
+    this.rebuildCount += 1;
+  }
+
+  private extend(entries: readonly SessionEntry[], offset: number): void {
+    for (let entryOffset = 0; entryOffset < entries.length; entryOffset += 1) {
+      const entry = entries[entryOffset]!;
+      for (const message of sessionEntryToContextMessages(entry)) {
+        const source = {
+          branchIndex: offset + entryOffset,
+          message,
+          estimatedTokens: estimateMessageTokens(message),
+        };
+        this.sourceMessages.push(source);
+        this.appendSourceMetadata(source);
+      }
+    }
+  }
+
+  private appendSourceMetadata(source: SourceMessage): void {
+    const key = messageIdentityKey(source.message);
+    if (key !== undefined) {
+      this.sourceKeys.push(key);
+    }
+    const tokens = source.estimatedTokens;
+    this.tokenTotals.push(this.tokenTotals.at(-1)! + (tokens ?? 0));
+    this.invalidTokenTotals.push(this.invalidTokenTotals.at(-1)! + (tokens === undefined ? 1 : 0));
+  }
+}
+
+function makeUncachedSourceIndex(branch: readonly SessionEntry[]): CachedSourceIndex | undefined {
+  const sourceMessages = collectSourceMessages(branch);
+  const sourceKeys = sourceMessages.map((source) => messageIdentityKey(source.message));
+  if (sourceKeys.some((key) => key === undefined)) {
+    return undefined;
+  }
+  return { sourceMessages, sourceKeys: sourceKeys as string[] };
 }
 
 export type VirtualContextProjectionAttempt =
@@ -147,44 +334,53 @@ export function tryProjectCheckpointToVirtualContext(
     checkpoint,
     contextWindow,
     summaryReserveTokens,
-    targetPostCompactionPercent,
+    softThresholdPercent,
+    cache,
   } = input;
   if (
     !Number.isFinite(contextWindow) ||
     contextWindow <= 0 ||
     !Number.isFinite(summaryReserveTokens) ||
     summaryReserveTokens < 0 ||
-    !Number.isFinite(targetPostCompactionPercent) ||
-    targetPostCompactionPercent < 0 ||
-    targetPostCompactionPercent > 100
+    !Number.isFinite(softThresholdPercent) ||
+    softThresholdPercent < 0 ||
+    softThresholdPercent > 100
   ) {
     return { status: "unavailable" };
   }
 
-  const snapshotIndex = branch.findIndex((entry) => entry.id === checkpoint.snapshotLeafId);
-  const firstKeptIndex = branch.findIndex(
-    (entry) => entry.id === checkpoint.compaction.firstKeptEntryId,
-  );
-  if (snapshotIndex < 0 || firstKeptIndex < 0 || firstKeptIndex > snapshotIndex) {
+  const sourceIndex = cache?.prepare(branch) ?? makeUncachedSourceIndex(branch);
+  if (!sourceIndex) {
     return { status: "unavailable" };
   }
-
-  const sourceMessages = collectSourceMessages(branch);
-  const firstKeptSourceIndex = sourceMessages.findIndex(
-    (source) => source.branchIndex >= firstKeptIndex,
-  );
-  if (firstKeptSourceIndex < 0 && sourceMessages.some((source) => source.branchIndex >= firstKeptIndex)) {
-    return { status: "unavailable" };
-  }
-  const boundarySourceIndex = firstKeptSourceIndex < 0 ? sourceMessages.length : firstKeptSourceIndex;
-  const sourceKeys = sourceMessages
-    .map((source) => messageIdentityKey(source.message));
-  if (sourceKeys.some((key) => key === undefined)) {
-    return { status: "unavailable" };
+  const { sourceMessages, sourceKeys } = sourceIndex;
+  let snapshotIndex: number;
+  let boundarySourceIndex: number;
+  if (cache) {
+    const boundary = cache.getBoundary(branch, checkpoint);
+    if (!boundary) {
+      return { status: "unavailable" };
+    }
+    snapshotIndex = boundary.snapshotIndex;
+    boundarySourceIndex = boundary.boundarySourceIndex;
+  } else {
+    snapshotIndex = branch.findIndex((entry) => entry.id === checkpoint.snapshotLeafId);
+    const firstKeptIndex = branch.findIndex(
+      (entry) => entry.id === checkpoint.compaction.firstKeptEntryId,
+    );
+    if (snapshotIndex < 0 || firstKeptIndex < 0 || firstKeptIndex > snapshotIndex) {
+      return { status: "unavailable" };
+    }
+    const firstKeptSourceIndex = sourceMessages.findIndex(
+      (source) => source.branchIndex >= firstKeptIndex,
+    );
+    boundarySourceIndex = firstKeptSourceIndex < 0
+      ? sourceMessages.length
+      : firstKeptSourceIndex;
   }
   const eventKeys = eventMessages.map(messageIdentityKey);
-  const earliestMatches = findEarliestMatches(sourceKeys as string[], eventKeys);
-  const latestMatches = findLatestMatches(sourceKeys as string[], eventKeys);
+  const earliestMatches = findEarliestMatches(sourceKeys, eventKeys);
+  const latestMatches = findLatestMatches(sourceKeys, eventKeys);
   if (
     !earliestMatches ||
     !latestMatches ||
@@ -231,7 +427,7 @@ export function tryProjectCheckpointToVirtualContext(
     if (!eventMessage) {
       return { status: "unavailable" };
     }
-    const tokenGrowth = estimateMessageTokenGrowth(source.message, eventMessage);
+    const tokenGrowth = estimateMessageTokenGrowth(source, eventMessage);
     if (tokenGrowth === undefined) {
       return { status: "unavailable" };
     }
@@ -259,7 +455,7 @@ export function tryProjectCheckpointToVirtualContext(
     additionalMessages,
     contextWindow,
     summaryReserveTokens,
-    targetPostCompactionPercent,
+    softThresholdPercent,
     transformedTokenGrowth,
   );
   if (!capacity) {
@@ -275,7 +471,7 @@ export function tryProjectCheckpointToVirtualContext(
       messages,
       estimatedTokens: capacity.estimatedTokens,
       hardLimit: capacity.hardLimit,
-      targetLimit: capacity.targetLimit,
+      refreshLimit: capacity.refreshLimit,
       needsRefresh: capacity.needsRefresh,
     },
   };

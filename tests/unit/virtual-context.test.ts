@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { projectCheckpointToVirtualContext } from "../../src/compaction/virtual-context.js";
+import {
+  projectCheckpointToVirtualContext,
+  VirtualContextProjectionCache,
+} from "../../src/compaction/virtual-context.js";
 import { makeCheckpointData, makeUsage, makeUserMessage } from "./fixtures.js";
 
 test("virtual context replaces the summarized prefix and preserves the current tail", () => {
@@ -31,7 +34,7 @@ test("virtual context replaces the summarized prefix and preserves the current t
     checkpoint: data,
     contextWindow: 100_000,
     summaryReserveTokens: 1,
-    targetPostCompactionPercent: 50,
+    softThresholdPercent: 50,
   });
 
   assert.ok(result);
@@ -89,7 +92,7 @@ test("virtual context preserves a transformed message identified by stable metad
     checkpoint: data,
     contextWindow: 100_000,
     summaryReserveTokens: 1,
-    targetPostCompactionPercent: 50,
+    softThresholdPercent: 50,
   });
 
   assert.ok(result);
@@ -135,7 +138,7 @@ test("virtual context counts transformed kept-message growth toward the hard lim
     checkpoint: data,
     contextWindow: 10_000,
     summaryReserveTokens: 1,
-    targetPostCompactionPercent: 50,
+    softThresholdPercent: 50,
   });
 
   assert.equal(result, undefined);
@@ -171,7 +174,7 @@ test("virtual context keeps an unmatched message from another context handler", 
     checkpoint: data,
     contextWindow: 100_000,
     summaryReserveTokens: 1,
-    targetPostCompactionPercent: 50,
+    softThresholdPercent: 50,
   });
 
   assert.ok(result);
@@ -211,7 +214,7 @@ test("virtual context counts an unmatched pre-snapshot message toward the hard l
     checkpoint: data,
     contextWindow: 10_000,
     summaryReserveTokens: 1,
-    targetPostCompactionPercent: 50,
+    softThresholdPercent: 50,
   });
 
   assert.equal(result, undefined);
@@ -243,10 +246,66 @@ test("virtual context refuses an ambiguous duplicate at the compaction boundary"
     checkpoint: data,
     contextWindow: 100_000,
     summaryReserveTokens: 1,
-    targetPostCompactionPercent: 50,
+    softThresholdPercent: 50,
+    cache: new VirtualContextProjectionCache(),
   });
 
   assert.equal(result, undefined);
+});
+
+test("virtual context cache incrementally indexes appended entries and rebuilds after branch changes", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-cache");
+  manager.appendMessage(makeUserMessage("old history"));
+  const keptId = manager.appendMessage(makeUserMessage("kept message"));
+  const snapshotId = manager.appendMessage(makeUserMessage("snapshot message"));
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "virtual-checkpoint-cache",
+    estimatedTokensAfterAtSnapshot: 100,
+  });
+  manager.appendCustomEntry("pi-press.precompaction", data);
+  const cache = new VirtualContextProjectionCache();
+  const baseInput = {
+    checkpoint: data,
+    contextWindow: 100_000,
+    summaryReserveTokens: 1,
+    softThresholdPercent: 50,
+  };
+
+  const initial = projectCheckpointToVirtualContext({
+    ...baseInput,
+    branch: manager.getBranch(),
+    eventMessages: manager.buildSessionContext().messages,
+    cache,
+  });
+  assert.ok(initial);
+  assert.deepEqual(cache.stats(), {
+    rebuilds: 1,
+    incrementallyIndexedEntries: 0,
+    branchEntries: 4,
+    sourceMessages: 3,
+  });
+
+  manager.appendMessage(makeUserMessage("new tail"));
+  const branch = manager.getBranch();
+  const eventMessages = manager.buildSessionContext().messages;
+  const cached = projectCheckpointToVirtualContext({
+    ...baseInput,
+    branch,
+    eventMessages,
+    cache,
+  });
+  const uncached = projectCheckpointToVirtualContext({
+    ...baseInput,
+    branch,
+    eventMessages,
+  });
+  assert.deepEqual(cached, uncached);
+  assert.equal(cache.stats().rebuilds, 1);
+  assert.equal(cache.stats().incrementallyIndexedEntries, 1);
+  assert.ok((cache.estimateTokensAfter(branch, 2) ?? 0) > 0);
+
+  cache.prepare(branch.slice(0, -1));
+  assert.equal(cache.stats().rebuilds, 2);
 });
 
 test("virtual context returns no projection when the hard limit is exceeded", () => {
@@ -273,7 +332,7 @@ test("virtual context returns no projection when the hard limit is exceeded", ()
     checkpoint: data,
     contextWindow: 10_000,
     summaryReserveTokens: 1,
-    targetPostCompactionPercent: 50,
+    softThresholdPercent: 50,
   });
 
   assert.equal(result, undefined);

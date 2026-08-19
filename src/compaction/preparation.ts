@@ -9,6 +9,7 @@ import {
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Usage } from "@earendil-works/pi-ai";
 import type {
+  CheckpointData,
   CompactionPreparation,
   CompactionSettings,
   FileOperations,
@@ -131,6 +132,15 @@ function addPreviousCompactionFileOps(fileOps: FileOperations, entry: SessionEnt
   addFileList(fileOps.edited, entry.details.modifiedFiles);
 }
 
+function addCheckpointFileOps(fileOps: FileOperations, checkpoint: CheckpointData): void {
+  const details = checkpoint.compaction.details;
+  if (!details) {
+    return;
+  }
+  addFileList(fileOps.read, details.readFiles);
+  addFileList(fileOps.edited, details.modifiedFiles);
+}
+
 function collectMessages(
   entries: readonly SessionEntry[],
   startIndex: number,
@@ -154,6 +164,7 @@ function collectMessages(
 export function prepareCompactionFromBranch(
   pathEntries: readonly SessionEntry[],
   settings: CompactionSettings,
+  parentCheckpoint?: CheckpointData,
 ): CompactionPreparation | undefined {
   if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1]?.type === "compaction") {
     return undefined;
@@ -169,7 +180,18 @@ export function prepareCompactionFromBranch(
 
   let previousSummary: string | undefined;
   let boundaryStart = 0;
-  if (previousCompactionIndex >= 0) {
+  if (parentCheckpoint) {
+    previousSummary = parentCheckpoint.compaction.summary;
+    boundaryStart = pathEntries.findIndex(
+      (entry) => entry.id === parentCheckpoint.compaction.firstKeptEntryId,
+    );
+    const parentSnapshotIndex = pathEntries.findIndex(
+      (entry) => entry.id === parentCheckpoint.snapshotLeafId,
+    );
+    if (boundaryStart < 0 || parentSnapshotIndex < boundaryStart) {
+      return undefined;
+    }
+  } else if (previousCompactionIndex >= 0) {
     const previousCompaction = pathEntries[previousCompactionIndex];
     if (!previousCompaction || previousCompaction.type !== "compaction") {
       return undefined;
@@ -203,7 +225,9 @@ export function prepareCompactionFromBranch(
   }
 
   const fileOps = createFileOps();
-  if (previousCompactionIndex >= 0) {
+  if (parentCheckpoint) {
+    addCheckpointFileOps(fileOps, parentCheckpoint);
+  } else if (previousCompactionIndex >= 0) {
     const previousCompaction = pathEntries[previousCompactionIndex];
     if (previousCompaction) {
       addPreviousCompactionFileOps(fileOps, previousCompaction);

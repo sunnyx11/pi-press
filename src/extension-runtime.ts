@@ -27,6 +27,7 @@ import { Diagnostics } from "./diagnostics.js";
 import { buildCheckpointCompactionResult } from "./compaction/reuse.js";
 import {
   tryProjectCheckpointToVirtualContext,
+  VirtualContextProjectionCache,
 } from "./compaction/virtual-context.js";
 import {
   createPreparationSettings,
@@ -36,6 +37,7 @@ import {
 import { resolveProviderRequest } from "./provider/request.js";
 import {
   CHECKPOINT_CUSTOM_TYPE,
+  CHECKPOINT_VERSION,
   PREPARATION_ALGORITHM_VERSION,
   SUMMARY_FORMAT_VERSION,
   type CheckpointCandidate,
@@ -46,7 +48,6 @@ import {
 } from "./types.js";
 
 const RETRY_BASE_DELAY_MS = 250;
-const MAX_REFRESHES_PER_EPOCH = 1;
 const MAX_BACKGROUND_RETRIES = 1;
 const MAX_FORMALIZATION_ATTEMPTS = 2;
 
@@ -79,6 +80,7 @@ type BackgroundTask = {
   controller: AbortController;
   startedAt: number;
   firstKeptEntryId?: string;
+  parentCheckpoint?: CheckpointData;
   promise?: Promise<void>;
   discarded: boolean;
 };
@@ -145,7 +147,7 @@ function describeError(error: unknown): string {
 }
 
 function describeCapacityRejection(checkpointId: string, capacity: CompactionCapacityEstimate): string {
-  return `checkpoint ${checkpointId}：预计压缩后 ${capacity.estimatedTokensAfter} tokens，接受上限 ${capacity.acceptLimit} tokens`;
+  return `checkpoint ${checkpointId}：预计压缩后 ${capacity.estimatedTokensAfter} tokens，hard limit ${capacity.hardLimit} tokens`;
 }
 
 function sanitizeProvenanceBaseUrl(baseUrl: string): string | undefined {
@@ -177,11 +179,13 @@ export class ExtensionRuntime {
   private checkpointClaim: CheckpointClaim | undefined;
   private hookInFlight = false;
   private readonly attemptsBySnapshotKey = new Map<string, number>();
-  private readonly refreshesByEpoch = new Map<string, number>();
   private readonly formalizationAttemptsByEpoch = new Map<string, number>();
+  private readonly reportedConfigDiagnostics = new Set<string>();
+  private removedTargetPercentReported = false;
   private virtualApplication: VirtualApplication | undefined;
   private formalizationSchedule: FormalizationSchedule | undefined;
   private pendingFormalization: PendingFormalization | undefined;
+  private readonly virtualContextCache = new VirtualContextProjectionCache();
 
   constructor(private readonly pi: Pick<ExtensionAPI, "appendEntry">, diagnostics = new Diagnostics()) {
     this.diagnostics = diagnostics;
@@ -277,7 +281,8 @@ export class ExtensionRuntime {
         checkpoint: candidate.data,
         contextWindow: model.contextWindow,
         summaryReserveTokens: this.currentConfig.summaryReserveTokens,
-        targetPostCompactionPercent: this.currentConfig.targetPostCompactionPercent,
+        softThresholdPercent: this.currentConfig.softThresholdPercent,
+        cache: this.virtualContextCache,
       });
       if (attempt.status === "hard-limit") {
         hardLimitExceeded = true;
@@ -420,7 +425,9 @@ export class ExtensionRuntime {
     };
     this.formalizationSchedule = schedule;
     this.diagnostics.count("formalization_scheduled");
-    schedule.timer = setTimeout(() => this.runFormalization(schedule), 0);
+    schedule.timer = setTimeout(() => {
+      void this.runFormalization(schedule);
+    }, 0);
   }
 
   onSessionCompact(event: SessionCompactEvent, ctx: ExtensionContext): void {
@@ -512,25 +519,17 @@ export class ExtensionRuntime {
     }
 
     const existingCandidate = candidates[0];
-    const epochKey = `${sessionId}:${epochCompactionId ?? "null"}`;
-    if (existingCandidate) {
-      const persistedRefreshCount = candidates.length - 1;
-      const refreshCount = Math.max(
-        this.refreshesByEpoch.get(epochKey) ?? 0,
-        persistedRefreshCount,
-      );
-      const existingRefreshRequested = Boolean(
-        virtualRefreshRequested &&
-        virtualCandidate?.data.checkpointId === existingCandidate.data.checkpointId,
-      );
-      if (
-        refreshCount >= MAX_REFRESHES_PER_EPOCH ||
-        (!existingRefreshRequested &&
-          !this.shouldRefresh(existingCandidate, branchEntries, model, config))
-      ) {
-        return;
-      }
-      this.refreshesByEpoch.set(epochKey, refreshCount + 1);
+    const existingRefreshRequested = Boolean(
+      existingCandidate &&
+      virtualRefreshRequested &&
+      virtualCandidate?.data.checkpointId === existingCandidate.data.checkpointId,
+    );
+    if (
+      existingCandidate &&
+      !existingRefreshRequested &&
+      !this.shouldRefresh(existingCandidate, branchEntries, model, config)
+    ) {
+      return;
     }
 
     const attempts = this.attemptsBySnapshotKey.get(snapshotKey) ?? 0;
@@ -548,6 +547,7 @@ export class ExtensionRuntime {
       model,
       thinkingLevel: ctx.thinkingLevel ?? "medium",
       config,
+      ...(existingCandidate === undefined ? {} : { parentCheckpoint: existingCandidate.data }),
     });
     if (
       existingCandidate &&
@@ -577,28 +577,42 @@ export class ExtensionRuntime {
       return undefined;
     }
     this.hookInFlight = true;
+    const overflowRecovery = event.reason === "overflow" || event.willRetry;
+    const overflowBaselineCheckpointId = overflowRecovery
+      ? this.virtualApplication?.checkpointId
+      : undefined;
     try {
       let result = this.tryReuseCheckpoint(
         event,
         ctx,
-        config,
         internalCheckpointId,
+        overflowBaselineCheckpointId,
       );
       if (result) {
         return { compaction: result };
       }
 
       const task = this.findCompatibleTask(ctx);
-      if (!task || config.hookWaitTimeoutMs <= 0) {
+      const waitTimeoutMs = overflowRecovery
+        ? (task ? this.remainingTaskTime(task) : 0)
+        : config.hookWaitTimeoutMs;
+      if (!task || waitTimeoutMs <= 0) {
         return undefined;
       }
-      const waitOutcome = await this.waitForTask(task, config.hookWaitTimeoutMs, event.signal);
+      const waitOutcome = await this.waitForTask(task, waitTimeoutMs, event.signal);
       if (waitOutcome !== "finished") {
         if (waitOutcome === "timeout") {
-          this.diagnostics.count("hook_wait_timed_out");
-          this.notifyWarning("正式压缩等待预压缩结果超时，已取消后台任务并回退 Pi 原生压缩。");
+          if (overflowRecovery) {
+            this.diagnostics.count("overflow_wait_timed_out");
+            this.diagnostics.record("capacity", "overflow 等待增量 checkpoint 超时，交由 Pi 原生压缩处理。");
+          } else {
+            this.diagnostics.count("hook_wait_timed_out");
+            this.notifyWarning("正式压缩等待预压缩结果超时，已取消后台任务并回退 Pi 原生压缩。");
+            this.discardTask(task, "hook_timeout");
+          }
+        } else if (!overflowRecovery) {
+          this.discardTask(task, "hook_aborted");
         }
-        this.discardTask(task, waitOutcome === "timeout" ? "hook_timeout" : "hook_aborted");
         return undefined;
       }
       if (event.signal.aborted) {
@@ -607,8 +621,8 @@ export class ExtensionRuntime {
       result = this.tryReuseCheckpoint(
         event,
         ctx,
-        config,
         internalCheckpointId,
+        overflowBaselineCheckpointId,
       );
       return result ? { compaction: result } : undefined;
     } finally {
@@ -642,11 +656,15 @@ export class ExtensionRuntime {
     }
   }
 
+  private isPrecomputeDisabled(): boolean {
+    return this.currentConfig.precomputeMode === "off";
+  }
+
   private formalizationEpochKey(sessionId: string, epochCompactionId: string | null): string {
     return `${sessionId}:${epochCompactionId ?? "null"}`;
   }
 
-  private runFormalization(schedule: FormalizationSchedule): void {
+  private async runFormalization(schedule: FormalizationSchedule): Promise<void> {
     if (this.formalizationSchedule !== schedule) {
       return;
     }
@@ -655,13 +673,33 @@ export class ExtensionRuntime {
     if (
       schedule.runEpoch !== this.runEpoch ||
       this.currentSessionId !== schedule.sessionId ||
-      this.currentConfig.precomputeMode === "off" ||
+      this.isPrecomputeDisabled() ||
       !this.isIdle(ctx)
     ) {
       this.diagnostics.count("formalization_skipped_stale");
       return;
     }
 
+    const task = this.findCompatibleTask(ctx);
+    if (task) {
+      const timeoutMs = this.remainingTaskTime(task);
+      const waitOutcome = await this.waitForTask(task, timeoutMs, new AbortController().signal);
+      if (waitOutcome === "timeout") {
+        this.diagnostics.count("formalization_wait_timed_out");
+      } else {
+        this.diagnostics.count("formalization_waited");
+      }
+    }
+
+    if (
+      schedule.runEpoch !== this.runEpoch ||
+      this.currentSessionId !== schedule.sessionId ||
+      this.isPrecomputeDisabled() ||
+      !this.isIdle(ctx)
+    ) {
+      this.diagnostics.count("formalization_skipped_stale");
+      return;
+    }
     const branch = ctx.sessionManager.getBranch();
     const currentEpoch = getEpochCompactionId(branch);
     if (
@@ -671,13 +709,18 @@ export class ExtensionRuntime {
       this.diagnostics.count("formalization_skipped_stale");
       return;
     }
-    const candidate = findReadyCheckpointCandidates(
+    const candidates = findReadyCheckpointCandidates(
       branch,
       schedule.sessionId,
       currentEpoch,
       this.checkpointClaim?.checkpointId,
-    ).find((item) => item.data.checkpointId === schedule.checkpointId);
-    if (!candidate || !this.virtualApplication || this.virtualApplication.checkpointId !== schedule.checkpointId) {
+    );
+    const application = this.virtualApplication;
+    const applicationCandidate = application
+      ? candidates.find((item) => item.data.checkpointId === application.checkpointId)
+      : undefined;
+    const candidate = candidates[0];
+    if (!candidate || !applicationCandidate) {
       this.diagnostics.count("formalization_skipped_stale");
       return;
     }
@@ -691,7 +734,7 @@ export class ExtensionRuntime {
     const pending: PendingFormalization = {
       requestId: schedule.requestId,
       runEpoch: schedule.runEpoch,
-      checkpointId: schedule.checkpointId,
+      checkpointId: candidate.data.checkpointId,
       sessionId: schedule.sessionId,
       epochCompactionId: schedule.epochCompactionId,
       scheduledLeafId: schedule.scheduledLeafId,
@@ -788,6 +831,17 @@ export class ExtensionRuntime {
     const result = loadConfig(ctx.cwd);
     this.currentConfig = result.config;
     for (const message of result.diagnostics) {
+      const removedTargetPercent = message.includes("targetPostCompactionPercent");
+      if (
+        this.reportedConfigDiagnostics.has(message) ||
+        (removedTargetPercent && this.removedTargetPercentReported)
+      ) {
+        continue;
+      }
+      this.reportedConfigDiagnostics.add(message);
+      if (removedTargetPercent) {
+        this.removedTargetPercentReported = true;
+      }
       this.diagnostics.record("config", message);
     }
     if (result.config.precomputeMode === "off") {
@@ -824,8 +878,8 @@ export class ExtensionRuntime {
     this.releaseCheckpointClaim();
     this.clearVirtualState();
     this.attemptsBySnapshotKey.clear();
-    this.refreshesByEpoch.clear();
     this.formalizationAttemptsByEpoch.clear();
+    this.virtualContextCache.clear();
     if (clearContext) {
       this.currentSessionManager = undefined;
       this.currentModelRegistry = undefined;
@@ -908,6 +962,7 @@ export class ExtensionRuntime {
     const preparation = prepareCompactionFromBranch(
       task.branchEntries,
       createPreparationSettings(task.config),
+      task.parentCheckpoint,
     );
     if (!preparation) {
       const message = "当前分支无法构造可用 preparation";
@@ -1059,11 +1114,14 @@ export class ExtensionRuntime {
     const contextWindow = task.model.contextWindow;
     const provenanceBaseUrl = sanitizeProvenanceBaseUrl(requestModel.baseUrl);
     const candidateData: CheckpointData = {
-      version: 3,
+      version: CHECKPOINT_VERSION,
       piVersion: VERSION,
       algorithmVersion: PREPARATION_ALGORITHM_VERSION,
       summaryFormatVersion: SUMMARY_FORMAT_VERSION,
       checkpointId: randomUUID(),
+      ...(task.parentCheckpoint === undefined
+        ? {}
+        : { parentCheckpointId: task.parentCheckpoint.checkpointId }),
       sessionId: task.sessionId,
       snapshotLeafId: task.snapshotLeafId,
       snapshotSourceLeafId: task.snapshotSourceLeafId,
@@ -1096,7 +1154,6 @@ export class ExtensionRuntime {
       candidateData,
       preparation,
       contextWindow,
-      task.config.targetPostCompactionPercent,
     );
     if (!capacity) {
       this.diagnostics.count("checkpoint_skipped_capacity_unavailable");
@@ -1143,12 +1200,14 @@ export class ExtensionRuntime {
     if (snapshotIndex < 0) {
       return true;
     }
-    const trailingMessages = branch
-      .slice(snapshotIndex + 1)
-      .flatMap((entry) => sessionEntryToContextMessages(entry));
-    const trailingTokens = estimateMessagesTokens(trailingMessages);
-    const targetLimit = Math.floor(model.contextWindow * config.targetPostCompactionPercent / 100);
-    return candidate.data.estimatedTokensAfterAtSnapshot + trailingTokens > targetLimit;
+    const trailingTokens = this.virtualContextCache.estimateTokensAfter(branch, snapshotIndex) ??
+      estimateMessagesTokens(
+        branch
+          .slice(snapshotIndex + 1)
+          .flatMap((entry) => sessionEntryToContextMessages(entry)),
+      );
+    const refreshLimit = Math.floor(model.contextWindow * config.softThresholdPercent / 100);
+    return candidate.data.estimatedTokensAfterAtSnapshot + trailingTokens >= refreshLimit;
   }
 
   private isSupportedCompaction(
@@ -1156,11 +1215,11 @@ export class ExtensionRuntime {
     config: PiPressConfig,
     internalFormalization: boolean,
   ): boolean {
-    if (event.willRetry || event.reason === "overflow") {
-      return false;
-    }
     if (event.customInstructions !== undefined && event.customInstructions.trim().length > 0) {
       return false;
+    }
+    if (event.reason === "overflow" || event.willRetry) {
+      return true;
     }
     if (event.reason === "threshold") {
       return config.precomputeMode !== "off";
@@ -1171,8 +1230,8 @@ export class ExtensionRuntime {
   private tryReuseCheckpoint(
     event: SessionBeforeCompactEvent,
     ctx: ExtensionContext,
-    config: PiPressConfig,
     requiredCheckpointId?: string,
+    newerThanCheckpointId?: string,
   ): CompactionResult | undefined {
     if (event.signal.aborted) {
       return undefined;
@@ -1191,8 +1250,23 @@ export class ExtensionRuntime {
       this.diagnostics.count("reuse_skipped_unknown_model");
       return undefined;
     }
+    const baseline = newerThanCheckpointId === undefined
+      ? undefined
+      : candidates.find((candidate) => candidate.data.checkpointId === newerThanCheckpointId);
+    const baselineSnapshotIndex = baseline
+      ? getEntryIndex(branch, baseline.data.snapshotLeafId)
+      : undefined;
+    if (newerThanCheckpointId !== undefined && baselineSnapshotIndex === undefined) {
+      return undefined;
+    }
     for (const candidate of candidates) {
       if (requiredCheckpointId !== undefined && candidate.data.checkpointId !== requiredCheckpointId) {
+        continue;
+      }
+      if (
+        baselineSnapshotIndex !== undefined &&
+        getEntryIndex(branch, candidate.data.snapshotLeafId) <= baselineSnapshotIndex
+      ) {
         continue;
       }
       const capacity = estimateCheckpointCapacity(
@@ -1200,7 +1274,6 @@ export class ExtensionRuntime {
         candidate.data,
         event.preparation,
         model.contextWindow,
-        config.targetPostCompactionPercent,
       );
       if (!capacity) {
         this.diagnostics.count("checkpoint_rejected_capacity_unavailable");
@@ -1250,6 +1323,10 @@ export class ExtensionRuntime {
       return undefined;
     }
     return task;
+  }
+
+  private remainingTaskTime(task: BackgroundTask): number {
+    return Math.max(0, task.startedAt + task.config.taskTimeoutMs - Date.now());
   }
 
   private waitForTask(

@@ -15,7 +15,6 @@ export const DEFAULT_CONFIG: PiPressConfig = {
   summaryReserveTokens: 16_384,
   taskTimeoutMs: 300_000,
   hookWaitTimeoutMs: 1_000,
-  targetPostCompactionPercent: 60,
 };
 
 const CONFIG_FILE_NAME = "pi-press.json";
@@ -29,7 +28,6 @@ const CONFIG_KEYS: readonly ConfigKey[] = [
   "summaryReserveTokens",
   "taskTimeoutMs",
   "hookWaitTimeoutMs",
-  "targetPostCompactionPercent",
 ];
 
 export interface ConfigLoadResult {
@@ -66,7 +64,6 @@ function isValidValue(key: ConfigKey, value: unknown): boolean {
     case "precomputeMode":
       return isMode(value);
     case "softThresholdPercent":
-    case "targetPostCompactionPercent":
       return isPercent(value);
     case "summaryReserveTokens":
       return isIntegerAtLeast(value, 0);
@@ -91,6 +88,9 @@ function normalizeConfigLayer(raw: unknown): ConfigLayerResult {
 
   const config: Partial<PiPressConfig> = {};
   const diagnostics: string[] = [];
+  if ("targetPostCompactionPercent" in raw) {
+    diagnostics.push("配置字段 targetPostCompactionPercent 已移除，当前值已忽略");
+  }
   for (const key of CONFIG_KEYS) {
     if (!(key in raw)) {
       continue;

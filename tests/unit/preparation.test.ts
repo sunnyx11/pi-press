@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import type { CheckpointData, CompactionPreparation } from "../../src/types.js";
 import { estimateCheckpointCapacity } from "../../src/checkpoint/capacity.js";
 import { createPreparationSettings, prepareCompactionFromBranch } from "../../src/compaction/preparation.js";
 import { DEFAULT_CONFIG } from "../../src/config.js";
@@ -88,7 +89,55 @@ test("preparation carries previous summary and file operations into the next com
   );
 });
 
-test("capacity estimate includes fixed overhead and rejects an impossible limit", () => {
+test("preparation uses a checkpoint as the previous summary boundary", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-test-incremental");
+  manager.appendMessage(makeUserMessage("old history ".repeat(2_000)));
+  const parentKeptId = manager.appendMessage(makeUserMessage("parent kept context"));
+  const parentSnapshotId = manager.getLeafId();
+  assert.ok(parentSnapshotId);
+  const parent = makeCheckpointData(manager.getSessionId(), parentSnapshotId, parentKeptId, {
+    checkpointId: "checkpoint-parent",
+  });
+  manager.appendCustomEntry("pi-press.precompaction", parent);
+  manager.appendMessage(makeUserMessage("incremental history ".repeat(2_000)));
+  manager.appendMessage(makeUserMessage("recent context ".repeat(1_000)));
+
+  const prepareIncremental = prepareCompactionFromBranch as unknown as (
+    entries: ReturnType<typeof manager.getBranch>,
+    settings: ReturnType<typeof createPreparationSettings>,
+    parentCheckpoint: CheckpointData,
+  ) => CompactionPreparation | undefined;
+  const preparation = prepareIncremental(
+    manager.getBranch(),
+    createPreparationSettings(DEFAULT_CONFIG),
+    parent,
+  );
+
+  assert.ok(preparation);
+  assert.equal(preparation.previousSummary, parent.compaction.summary);
+  assert.equal(
+    preparation.messagesToSummarize.some(
+      (message) =>
+        message.role === "user" &&
+        typeof message.content === "string" &&
+        message.content.includes("old history"),
+    ),
+    false,
+  );
+  assert.equal(
+    preparation.messagesToSummarize.some(
+      (message) =>
+        message.role === "user" &&
+        typeof message.content === "string" &&
+        message.content.includes("parent kept context"),
+    ),
+    true,
+  );
+  assert.deepEqual([...preparation.fileOps.read], ["read.ts"]);
+  assert.deepEqual([...preparation.fileOps.edited], ["write.ts"]);
+});
+
+test("capacity estimate includes fixed overhead and rejects an impossible hard limit", () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-test");
   const firstId = manager.appendMessage(makeUserMessage("history"));
   const snapshotId = manager.appendMessage(makeUserMessage("recent"));
@@ -96,12 +145,12 @@ test("capacity estimate includes fixed overhead and rejects an impossible limit"
   manager.appendCustomEntry("pi-press.precompaction", data);
   const branch = manager.getBranch();
   const preparation = makePreparation(firstId, 100);
-  const accepted = estimateCheckpointCapacity(branch, data, preparation, 100_000, 50);
+  const accepted = estimateCheckpointCapacity(branch, data, preparation, 100_000);
   assert.ok(accepted);
   assert.equal(accepted.accepted, true);
   assert.equal(accepted.fixedOverhead, 100 - accepted.currentMessagesEstimatedTokens);
 
-  const rejected = estimateCheckpointCapacity(branch, data, preparation, 100, 50);
+  const rejected = estimateCheckpointCapacity(branch, data, preparation, 100);
   assert.ok(rejected);
   assert.equal(rejected.accepted, false);
   assert.equal(rejected.safetyMargin, 4096);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { estimateVirtualCheckpointCapacity } from "../../src/checkpoint/capacity.js";
 import {
   findReadyCheckpointCandidates,
   getConsumedCheckpointIds,
@@ -25,13 +26,24 @@ function makeBranch(): { branch: SessionEntry[]; data: ReturnType<typeof makeChe
   return { branch: [first, snapshot, checkpoint], data };
 }
 
-test("checkpoint schema accepts v3 and rejects unsupported or malformed data", () => {
+test("checkpoint schema accepts v4 with a parent and reads v3 as a root checkpoint", () => {
   const { branch, data } = makeBranch();
-  assert.deepEqual(parseCheckpointData(data)?.checkpointId, "checkpoint-1");
-  assert.equal(parseCheckpointData({ ...data, version: 2 }), undefined);
-  assert.equal(parseCheckpointData({ ...data, compaction: { ...data.compaction, summary: "" } }), undefined);
-  assert.equal(parseCheckpointData({ ...data, estimatedTokensAfterAtSnapshot: Number.NaN }), undefined);
-  assert.ok(parseCheckpointData(data, { piVersion: "0.84.1" }));
+  const legacy = { ...data, version: 3, algorithmVersion: 1 };
+  assert.deepEqual(parseCheckpointData(legacy)?.checkpointId, "checkpoint-1");
+
+  const current = {
+    ...data,
+    version: 4,
+    algorithmVersion: 2,
+    checkpointId: "checkpoint-2",
+    parentCheckpointId: data.checkpointId,
+  };
+  assert.deepEqual(parseCheckpointData(current)?.parentCheckpointId, data.checkpointId);
+  assert.equal(parseCheckpointData({ ...current, version: 2 }), undefined);
+  assert.equal(parseCheckpointData({ ...current, parentCheckpointId: "" }), undefined);
+  assert.equal(parseCheckpointData({ ...current, compaction: { ...current.compaction, summary: "" } }), undefined);
+  assert.equal(parseCheckpointData({ ...current, estimatedTokensAfterAtSnapshot: Number.NaN }), undefined);
+  assert.ok(parseCheckpointData(current, { piVersion: "0.84.1" }));
   assert.ok(branch.length > 0);
 });
 
@@ -64,6 +76,49 @@ test("selection requires current session, epoch and branch ancestry", () => {
   assert.equal(findReadyCheckpointCandidates(branch, "other", null, undefined).length, 0);
   assert.equal(findReadyCheckpointCandidates(branch, "session", "compaction-1", undefined).length, 0);
   assert.equal(findReadyCheckpointCandidates(branch, "session", null, data.checkpointId).length, 0);
+});
+
+test("virtual checkpoint refresh starts exactly at the soft threshold", () => {
+  const { data } = makeBranch();
+  const capacity = estimateVirtualCheckpointCapacity(data, [], 1_000, 0, 10);
+
+  assert.ok(capacity);
+  assert.equal(capacity.estimatedTokens, capacity.refreshLimit);
+  assert.equal(capacity.needsRefresh, true);
+});
+
+test("selection validates every checkpoint parent against the current branch", () => {
+  const { branch, data } = makeBranch();
+  const nextSnapshot = makeMessageEntry("entry-4", "entry-3", makeUserMessage("new work"));
+  const childData = makeCheckpointData("session", nextSnapshot.id, data.compaction.firstKeptEntryId, {
+    checkpointId: "checkpoint-2",
+    parentCheckpointId: data.checkpointId,
+    snapshotSourceLeafId: nextSnapshot.id,
+  });
+  const child: SessionEntry = {
+    type: "custom",
+    id: "entry-5",
+    parentId: nextSnapshot.id,
+    timestamp: "2026-01-01T00:00:05.000Z",
+    customType: "pi-press.precompaction",
+    data: childData,
+  };
+  const chainedBranch = [...branch, nextSnapshot, child];
+
+  assert.deepEqual(
+    findReadyCheckpointCandidates(chainedBranch, "session", null, undefined)
+      .map((candidate) => candidate.data.checkpointId),
+    ["checkpoint-2", "checkpoint-1"],
+  );
+  const brokenChild = {
+    ...child,
+    data: { ...childData, parentCheckpointId: "missing-checkpoint" },
+  } satisfies SessionEntry;
+  assert.deepEqual(
+    findReadyCheckpointCandidates([...branch, nextSnapshot, brokenChild], "session", null, undefined)
+      .map((candidate) => candidate.data.checkpointId),
+    ["checkpoint-1"],
+  );
 });
 
 test("formal compaction details mark a checkpoint as consumed", () => {

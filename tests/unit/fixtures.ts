@@ -85,16 +85,16 @@ export function makeCheckpointData(
   overrides: Partial<CheckpointData> = {},
 ): CheckpointData {
   return {
-    version: 3,
+    version: 4,
     piVersion: VERSION,
-    algorithmVersion: 1,
+    algorithmVersion: 2,
     summaryFormatVersion: 1,
     checkpointId: "checkpoint-1",
     sessionId,
     snapshotLeafId,
     snapshotSourceLeafId: snapshotLeafId,
     epochCompactionId: null,
-    snapshotKey: `session:null:source:${VERSION}:1:1:fingerprint`,
+    snapshotKey: `session:null:source:${VERSION}:2:1:fingerprint`,
     compaction: {
       summary: "A valid summary",
       firstKeptEntryId,

@@ -105,6 +105,158 @@ test("hook waits for an in-flight checkpoint and reuses it", async () => {
   }
 });
 
+test("settled formalization waits for an in-flight refresh and consumes the newest checkpoint", async () => {
+  let resolveRefreshStarted!: () => void;
+  const refreshStarted = new Promise<void>((resolve) => {
+    resolveRefreshStarted = resolve;
+  });
+  const scenario = createScenario({ softThresholdPercent: 20 });
+  scenario.faux.setResponses([
+    async () => fauxAssistantMessage("initial checkpoint summary"),
+    delayedResponse(40, resolveRefreshStarted),
+  ]);
+  const compactCalls: Array<{ onComplete?: (result: unknown) => void; onError?: (error: Error) => void }> = [];
+  const ctx = {
+    ...scenario.ctx,
+    isIdle: () => true,
+    compact: (options?: { onComplete?: (result: unknown) => void; onError?: (error: Error) => void }) => {
+      compactCalls.push(options ?? {});
+    },
+    getContextUsage: () => ({
+      tokens: 10_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 10,
+    }),
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, scenario.ctx);
+    for (let index = 0; index < 100; index += 1) {
+      scenario.manager.appendMessage(makeUserMessage("x".repeat(3_000)));
+    }
+    scenario.runtime.onTurnEnd(ctx);
+    await refreshStarted;
+
+    scenario.runtime.onAgentSettled(ctx);
+    await waitFor(() => compactCalls.length === 1);
+    assert.equal(scenario.appended.length, 2);
+
+    const event = {
+      ...makeCompactEvent(scenario, new AbortController().signal),
+      reason: "manual" as const,
+    };
+    const reuse = await scenario.runtime.beforeCompact(event, ctx);
+    assert.ok(reuse?.compaction);
+    assert.equal(reuse.compaction.summary, "checkpoint summary");
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("overflow waits for an in-flight refresh and reuses only the newer checkpoint", async () => {
+  let resolveRefreshStarted!: () => void;
+  const refreshStarted = new Promise<void>((resolve) => {
+    resolveRefreshStarted = resolve;
+  });
+  const scenario = createScenario({ softThresholdPercent: 20 });
+  scenario.faux.setResponses([
+    async () => fauxAssistantMessage("initial checkpoint summary"),
+    delayedResponse(40, resolveRefreshStarted),
+  ]);
+  const ctx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: 10_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 10,
+    }),
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, scenario.ctx);
+    for (let index = 0; index < 100; index += 1) {
+      scenario.manager.appendMessage(makeUserMessage("x".repeat(3_000)));
+    }
+    scenario.runtime.onTurnEnd(ctx);
+    await refreshStarted;
+
+    const result = await scenario.runtime.beforeCompact({
+      ...makeCompactEvent(scenario, new AbortController().signal),
+      reason: "overflow",
+      willRetry: true,
+    }, ctx);
+
+    assert.ok(result?.compaction);
+    assert.equal(result.compaction.summary, "checkpoint summary");
+    assert.equal(scenario.appended.length, 2);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("overflow falls back to Pi after the refresh task reaches its remaining timeout", async () => {
+  let resolveRefreshStarted!: () => void;
+  const refreshStarted = new Promise<void>((resolve) => {
+    resolveRefreshStarted = resolve;
+  });
+  const scenario = createScenario({ softThresholdPercent: 20, taskTimeoutMs: 60 });
+  scenario.faux.setResponses([
+    async () => fauxAssistantMessage("initial checkpoint summary"),
+    delayedResponse(150, resolveRefreshStarted),
+  ]);
+  const ctx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: 10_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 10,
+    }),
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, scenario.ctx);
+    for (let index = 0; index < 100; index += 1) {
+      scenario.manager.appendMessage(makeUserMessage("x".repeat(3_000)));
+    }
+    scenario.runtime.onTurnEnd(ctx);
+    await refreshStarted;
+
+    const startedAt = Date.now();
+    const result = await scenario.runtime.beforeCompact({
+      ...makeCompactEvent(scenario, new AbortController().signal),
+      reason: "overflow",
+      willRetry: true,
+    }, ctx);
+
+    assert.equal(result, undefined);
+    assert.ok(Date.now() - startedAt >= 30);
+    assert.equal(scenario.appended.length, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
 test("context above the hard limit waits for an in-flight refresh checkpoint", async () => {
   let resolveRefreshStarted!: () => void;
   const refreshStarted = new Promise<void>((resolve) => {

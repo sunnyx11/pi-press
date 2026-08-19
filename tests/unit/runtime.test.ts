@@ -116,7 +116,7 @@ test("context returns original messages and records a diagnostic when projection
   );
 });
 
-test("capacity-rejected ready checkpoint shows a fallback warning", async () => {
+test("removed target percentage is warned once and does not reject a checkpoint", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-press-runtime-reuse-capacity-"));
   mkdirSync(join(cwd, ".pi"));
   writeFileSync(
@@ -133,18 +133,12 @@ test("capacity-rejected ready checkpoint shows a fallback warning", async () => 
       makeCheckpointData(manager.getSessionId(), snapshotId, firstId),
     );
     const model = makeModel();
-    const notifications: Notification[] = [];
     const ctx = {
       cwd,
       sessionManager: manager,
       model,
       modelRegistry: {},
       thinkingLevel: "medium",
-      ui: {
-        notify: (message: string, type?: "info" | "warning" | "error") => {
-          notifications.push({ message, type });
-        },
-      },
     } as unknown as ExtensionContext;
     const runtime = new ExtensionRuntime({ appendEntry: () => undefined });
     runtime.onSessionStart(ctx);
@@ -158,16 +152,11 @@ test("capacity-rejected ready checkpoint shows a fallback warning", async () => 
       signal: new AbortController().signal,
     }, ctx);
 
-    assert.equal(result, undefined);
-    assert.equal(runtime.getDiagnostics().counters.checkpoint_rejected_capacity, 1);
-    assert.ok(
-      notifications.some(
-        (notification) =>
-          notification.type === "warning" &&
-          notification.message.includes("容量不足") &&
-          notification.message.includes("Pi 原生压缩"),
-      ),
+    assert.ok(result?.compaction);
+    const warnings = runtime.getDiagnostics().records.filter(
+      (record) => record.kind === "config" && record.message.includes("targetPostCompactionPercent"),
     );
+    assert.equal(warnings.length, 1);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -275,7 +264,7 @@ test("timed out authentication remains occupied across runtime instances until i
   }
 });
 
-test("persisted refresh checkpoint prevents another refresh after restore", () => {
+test("persisted checkpoint can continue refreshing after restore", () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime-refresh");
   const firstId = manager.appendMessage(makeUserMessage("old history"));
   const firstSnapshotId = manager.appendMessage(makeUserMessage("first snapshot"));
@@ -290,6 +279,7 @@ test("persisted refresh checkpoint prevents another refresh after restore", () =
     "pi-press.precompaction",
     makeCheckpointData(manager.getSessionId(), refreshSnapshotId, firstId, {
       checkpointId: "checkpoint-refresh",
+      parentCheckpointId: "checkpoint-initial",
     }),
   );
   manager.appendMessage(makeUserMessage("trailing context ".repeat(15_000)));
@@ -307,7 +297,7 @@ test("persisted refresh checkpoint prevents another refresh after restore", () =
   runtime.onSessionStart(ctx);
   runtime.onTurnEnd(ctx);
 
-  assert.equal(runtime.getDiagnostics().counters.task_started ?? 0, 0);
+  assert.equal(runtime.getDiagnostics().counters.task_started, 1);
 });
 
 test("unknown context usage does not schedule a task", () => {

@@ -2,7 +2,6 @@ import { VERSION } from "@earendil-works/pi-coding-agent";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   CHECKPOINT_CUSTOM_TYPE,
-  PREPARATION_ALGORITHM_VERSION,
   SUMMARY_FORMAT_VERSION,
   type CheckpointCandidate,
 } from "../types.js";
@@ -69,26 +68,61 @@ function isCompatibleCheckpoint(
   epochCompactionId: string | null,
   checkpointIndex: number,
 ): boolean {
-  if (
-    data.sessionId !== sessionId ||
-    data.piVersion !== VERSION ||
-    data.algorithmVersion !== PREPARATION_ALGORITHM_VERSION ||
-    data.summaryFormatVersion !== SUMMARY_FORMAT_VERSION ||
-    data.epochCompactionId !== epochCompactionId
-  ) {
-    return false;
+  let currentData = data;
+  let currentCheckpointIndex = checkpointIndex;
+  let childSnapshotIndex: number | undefined;
+  let childFirstKeptIndex: number | undefined;
+
+  while (true) {
+    if (
+      currentData.sessionId !== sessionId ||
+      currentData.piVersion !== VERSION ||
+      currentData.summaryFormatVersion !== SUMMARY_FORMAT_VERSION ||
+      currentData.epochCompactionId !== epochCompactionId
+    ) {
+      return false;
+    }
+    const snapshotIndex = getEntryIndex(branch, currentData.snapshotLeafId);
+    const sourceIndex = getEntryIndex(branch, currentData.snapshotSourceLeafId);
+    const firstKeptIndex = getEntryIndex(branch, currentData.compaction.firstKeptEntryId);
+    if (
+      snapshotIndex < 0 ||
+      sourceIndex < 0 ||
+      firstKeptIndex < 0 ||
+      sourceIndex > snapshotIndex ||
+      firstKeptIndex > snapshotIndex ||
+      currentCheckpointIndex <= snapshotIndex ||
+      (childSnapshotIndex !== undefined && snapshotIndex >= childSnapshotIndex) ||
+      (childFirstKeptIndex !== undefined && firstKeptIndex > childFirstKeptIndex)
+    ) {
+      return false;
+    }
+
+    const parentCheckpointId = currentData.parentCheckpointId;
+    if (!parentCheckpointId) {
+      return true;
+    }
+    let parentFound = false;
+    for (let index = currentCheckpointIndex - 1; index >= 0; index -= 1) {
+      const entry = branch[index];
+      if (!entry) {
+        continue;
+      }
+      const parent = getCheckpointDataFromEntry(entry);
+      if (!parent || parent.checkpointId !== parentCheckpointId) {
+        continue;
+      }
+      currentData = parent;
+      currentCheckpointIndex = index;
+      childSnapshotIndex = snapshotIndex;
+      childFirstKeptIndex = firstKeptIndex;
+      parentFound = true;
+      break;
+    }
+    if (!parentFound) {
+      return false;
+    }
   }
-  const snapshotIndex = getEntryIndex(branch, data.snapshotLeafId);
-  const sourceIndex = getEntryIndex(branch, data.snapshotSourceLeafId);
-  const firstKeptIndex = getEntryIndex(branch, data.compaction.firstKeptEntryId);
-  return (
-    snapshotIndex >= 0 &&
-    sourceIndex >= 0 &&
-    firstKeptIndex >= 0 &&
-    sourceIndex <= snapshotIndex &&
-    firstKeptIndex <= snapshotIndex &&
-    checkpointIndex > snapshotIndex
-  );
 }
 
 /** 从当前分支中按最新追加顺序返回可候选的 checkpoint。 */

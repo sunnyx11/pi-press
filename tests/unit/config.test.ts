@@ -11,17 +11,17 @@ import {
   normalizeConfig,
 } from "../../src/config.js";
 
-test("normalizeConfig returns design defaults and ignores removed fields", () => {
+test("normalizeConfig returns design defaults and reports removed fields", () => {
   const result = normalizeConfig({
     checkpointKeepRecentTokens: 1,
     maxRefreshesPerEpoch: 0,
     maxRetries: 0,
+    targetPostCompactionPercent: 50,
   });
   assert.deepEqual(result.config, DEFAULT_CONFIG);
   assert.equal(DEFAULT_CONFIG.softThresholdPercent, 80);
   assert.equal(DEFAULT_CONFIG.taskTimeoutMs, 300_000);
-  assert.equal(DEFAULT_CONFIG.targetPostCompactionPercent, 60);
-  assert.deepEqual(result.diagnostics, []);
+  assert.deepEqual(result.diagnostics, ["配置字段 targetPostCompactionPercent 已移除，当前值已忽略"]);
 });
 
 test("normalizeConfig falls back per invalid field", () => {
@@ -109,7 +109,7 @@ test("config fingerprint and snapshot key are deterministic", () => {
   const first = configFingerprint(DEFAULT_CONFIG);
   const second = configFingerprint({ ...DEFAULT_CONFIG });
   assert.equal(first, second);
-  assert.match(createSnapshotKey("session", null, "leaf", DEFAULT_CONFIG), /session:null:leaf:0\.84\.1:1:1:/);
+  assert.match(createSnapshotKey("session", null, "leaf", DEFAULT_CONFIG), /session:null:leaf:0\.84\.1:2:1:/);
 });
 
 test("normalizeConfig rejects timeout values above the Node timer limit", () => {

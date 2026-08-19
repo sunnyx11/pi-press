@@ -11,7 +11,8 @@
 - 后台生成摘要，不阻塞当前 agent。
 - 虚拟上下文只影响当前 provider 请求，不修改 Pi 内部消息或原始 session entry。
 - 正式压缩、上下文重建、session 恢复和分支管理继续使用 Pi 原生实现。
-- 检查点失效、容量不足或 provider 请求失败时，使用 Pi 原生压缩。
+- 同一正式压缩周期内可按增量历史连续刷新检查点，避免长时间工具调用使虚拟尾部持续增长。
+- 检查点失效、超过 hard limit 或 provider 请求失败时，使用 Pi 原生压缩。
 
 与 Pi 原生压缩相比，`pi-press` 可以减少正式压缩时等待摘要的时间，但可能产生额外的 provider 请求和 token 消耗，并需要维护额外配置。完整设计和边界规则见[预压缩设计](https://github.com/sunnyx11/pi-press/blob/main/docs/DESIGN.md)。
 
@@ -53,10 +54,11 @@ pi remove npm:@sunnyx11/pi-press
 {
   "precomputeMode": "threshold",
   "softThresholdPercent": 80,
-  "taskTimeoutMs": 300000,
-  "targetPostCompactionPercent": 60
+  "taskTimeoutMs": 300000
 }
 ```
+
+`softThresholdPercent` 同时用于首次预压缩和后续增量刷新。旧版 `targetPostCompactionPercent` 已移除；配置中仍存在该字段时会记录一次警告并忽略其值。
 
 `precomputeMode` 支持以下取值：
 

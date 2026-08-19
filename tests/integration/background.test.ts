@@ -78,7 +78,7 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
 
 test("context applies a ready checkpoint and settled formalization runs after the handler returns", async () => {
   const scenario = createScenario({
-    targetPostCompactionPercent: 50,
+    softThresholdPercent: 50,
     summaryReserveTokens: 1,
   });
   const compactCalls: Array<{ onComplete?: (result: unknown) => void; onError?: (error: Error) => void }> = [];
@@ -334,13 +334,16 @@ test("session shutdown cancels a scheduled formalization", async () => {
   }
 });
 
-test("virtual context refreshes from trailing growth below the original threshold", async () => {
+test("virtual context can refresh a checkpoint three times in one compaction epoch", async () => {
   const scenario = createScenario({
-    targetPostCompactionPercent: 50,
+    softThresholdPercent: 20,
     summaryReserveTokens: 1,
   });
-  const response: ResponseFactory = async () => fauxAssistantMessage("refreshed checkpoint summary");
-  scenario.faux.setResponses([response, response]);
+  scenario.faux.setResponses([
+    async () => fauxAssistantMessage("first checkpoint summary"),
+    async () => fauxAssistantMessage("second checkpoint summary"),
+    async () => fauxAssistantMessage("third checkpoint summary"),
+  ]);
   const lowUsageCtx = {
     ...scenario.ctx,
     getContextUsage: () => ({
@@ -353,17 +356,27 @@ test("virtual context refreshes from trailing growth below the original threshol
   try {
     scenario.runtime.onTurnEnd(scenario.ctx);
     await waitFor(() => scenario.appended.length === 1);
-    scenario.runtime.onContext({
-      type: "context",
-      messages: scenario.manager.buildSessionContext().messages,
-    }, scenario.ctx);
-    for (let index = 0; index < 100; index += 1) {
-      scenario.manager.appendMessage(makeUserMessage("x".repeat(3_000)));
+    for (let generation = 2; generation <= 3; generation += 1) {
+      await scenario.runtime.onContext({
+        type: "context",
+        messages: scenario.manager.buildSessionContext().messages,
+      }, scenario.ctx);
+      for (let index = 0; index < 100; index += 1) {
+        scenario.manager.appendMessage(makeUserMessage("x".repeat(3_000)));
+      }
+      scenario.runtime.onTurnEnd(lowUsageCtx);
+      await waitFor(() => scenario.appended.length === generation);
     }
 
-    scenario.runtime.onTurnEnd(lowUsageCtx);
-    await waitFor(() => scenario.appended.length === 2);
-    assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 2);
+    const checkpoints = scenario.appended.map((value) => parseCheckpointData(value));
+    assert.ok(checkpoints[0]);
+    assert.ok(checkpoints[1]);
+    assert.ok(checkpoints[2]);
+    assert.equal(checkpoints[0].parentCheckpointId, undefined);
+    assert.equal(checkpoints[1].parentCheckpointId, checkpoints[0].checkpointId);
+    assert.equal(checkpoints[2].parentCheckpointId, checkpoints[1].checkpointId);
+    assert.equal(checkpoints[2].compaction.summary, "third checkpoint summary");
+    assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 3);
   } finally {
     scenario.runtime.onSessionShutdown();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -373,7 +386,7 @@ test("virtual context refreshes from trailing growth below the original threshol
 
 test("virtual context refresh request from an injected message survives until turn_end", async () => {
   const scenario = createScenario({
-    targetPostCompactionPercent: 20,
+    softThresholdPercent: 20,
     summaryReserveTokens: 1,
   });
   const response: ResponseFactory = async () => fauxAssistantMessage("refreshed checkpoint summary");
@@ -412,6 +425,7 @@ test("virtual context refresh request from an injected message survives until tu
     );
     assert.equal(scenario.runtime.getDiagnostics().counters.virtual_refresh_needed, 1);
 
+    scenario.manager.appendMessage(injectedMessage);
     scenario.runtime.onTurnEnd(lowUsageCtx);
     await waitFor(() => scenario.appended.length === 2);
     assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 2);
@@ -543,32 +557,23 @@ test("invalid checkpoint data is rejected by the full schema before persistence"
   }
 });
 
-test("capacity-rejected checkpoint shows a warning without persistence", async () => {
+test("checkpoint above the refresh threshold is persisted for immediate use", async () => {
   const scenario = createScenario({
-    softThresholdPercent: 80,
+    softThresholdPercent: 0,
     summaryReserveTokens: 1,
-    targetPostCompactionPercent: 0,
     taskTimeoutMs: 2_000,
   });
-  const { appended, ctx, cwd, faux, notifications, runtime } = scenario;
+  const { appended, ctx, cwd, faux, runtime } = scenario;
 
   try {
     runtime.onTurnEnd(ctx);
-
-    await waitFor(
-      () => Boolean(runtime.getDiagnostics().counters.checkpoint_skipped_capacity),
-    );
+    await waitFor(() => appended.length === 1);
 
     const diagnostics = runtime.getDiagnostics();
     assert.equal(faux.state.callCount, 1);
-    assert.equal(appended.length, 0);
-    assert.equal(diagnostics.counters.checkpoint_skipped_capacity, 1);
-    assert.equal(diagnostics.counters.checkpoint_ready ?? 0, 0);
+    assert.equal(diagnostics.counters.checkpoint_ready, 1);
+    assert.equal(diagnostics.counters.checkpoint_skipped_capacity ?? 0, 0);
     assert.equal(diagnostics.counters.task_failed ?? 0, 0);
-    assert.equal(notifications.length, 1);
-    assert.equal(notifications[0]?.type, "warning");
-    assert.match(notifications[0]?.message ?? "", /容量不足/);
-    assert.ok(diagnostics.records.some((record) => record.kind === "capacity"));
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

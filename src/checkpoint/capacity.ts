@@ -40,7 +40,7 @@ export function checkpointToCompactionSummaryMessage(data: CheckpointData): Agen
 export type VirtualCheckpointCapacityEstimate = {
   estimatedTokens: number;
   hardLimit: number;
-  targetLimit: number;
+  refreshLimit: number;
   needsRefresh: boolean;
 };
 
@@ -49,7 +49,7 @@ export function estimateVirtualCheckpointCapacity(
   additionalMessages: readonly AgentMessage[],
   contextWindow: number,
   summaryReserveTokens: number,
-  targetPostCompactionPercent: number,
+  softThresholdPercent: number,
   additionalTokens = 0,
 ): VirtualCheckpointCapacityEstimate | undefined {
   if (
@@ -57,9 +57,9 @@ export function estimateVirtualCheckpointCapacity(
     contextWindow <= 0 ||
     !Number.isFinite(summaryReserveTokens) ||
     summaryReserveTokens < 0 ||
-    !Number.isFinite(targetPostCompactionPercent) ||
-    targetPostCompactionPercent < 0 ||
-    targetPostCompactionPercent > 100 ||
+    !Number.isFinite(softThresholdPercent) ||
+    softThresholdPercent < 0 ||
+    softThresholdPercent > 100 ||
     !Number.isFinite(additionalTokens) ||
     additionalTokens < 0
   ) {
@@ -75,12 +75,12 @@ export function estimateVirtualCheckpointCapacity(
     additionalTokens;
   const safetyMargin = Math.max(4096, Math.ceil(contextWindow * 0.02));
   const hardLimit = contextWindow - summaryReserveTokens - safetyMargin;
-  const targetLimit = Math.floor((contextWindow * targetPostCompactionPercent) / 100);
+  const refreshLimit = Math.floor((contextWindow * softThresholdPercent) / 100);
   return {
     estimatedTokens,
     hardLimit,
-    targetLimit,
-    needsRefresh: estimatedTokens > targetLimit,
+    refreshLimit,
+    needsRefresh: estimatedTokens >= refreshLimit,
   };
 }
 
@@ -90,7 +90,6 @@ export function estimateCheckpointCapacity(
   data: CheckpointData,
   preparation: CompactionPreparation,
   contextWindow: number,
-  targetPostCompactionPercent: number,
 ): CompactionCapacityEstimate | undefined {
   if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
     return undefined;
@@ -120,8 +119,6 @@ export function estimateCheckpointCapacity(
     fixedOverhead + summaryEstimatedTokens + keptMessagesEstimatedTokens;
   const safetyMargin = Math.max(4096, Math.ceil(contextWindow * 0.02));
   const hardLimit = contextWindow - preparation.settings.reserveTokens - safetyMargin;
-  const targetLimit = Math.floor((contextWindow * targetPostCompactionPercent) / 100);
-  const acceptLimit = Math.min(hardLimit, targetLimit);
 
   return {
     currentMessagesEstimatedTokens,
@@ -131,8 +128,6 @@ export function estimateCheckpointCapacity(
     estimatedTokensAfter,
     safetyMargin,
     hardLimit,
-    targetLimit,
-    acceptLimit,
-    accepted: estimatedTokensAfter <= acceptLimit,
+    accepted: estimatedTokensAfter <= hardLimit,
   };
 }
