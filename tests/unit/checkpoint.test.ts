@@ -9,6 +9,12 @@ import {
   getSnapshotSourceLeafId,
 } from "../../src/checkpoint/selection.js";
 import { parseCheckpointData } from "../../src/checkpoint/schema.js";
+import {
+  CHECKPOINT_VERSION,
+  LEGACY_CHECKPOINT_VERSION,
+  LEGACY_PREPARATION_ALGORITHM_VERSION,
+  PREPARATION_ALGORITHM_VERSION,
+} from "../../src/types.js";
 import { makeCheckpointData, makeMessageEntry, makeUserMessage } from "./fixtures.js";
 
 function makeBranch(): { branch: SessionEntry[]; data: ReturnType<typeof makeCheckpointData> } {
@@ -26,19 +32,24 @@ function makeBranch(): { branch: SessionEntry[]; data: ReturnType<typeof makeChe
   return { branch: [first, snapshot, checkpoint], data };
 }
 
-test("checkpoint schema accepts v4 with a parent and reads v3 as a root checkpoint", () => {
+test("checkpoint schema accepts current v4, rejects v4 algorithm 2, and reads v3 roots", () => {
   const { branch, data } = makeBranch();
-  const legacy = { ...data, version: 3, algorithmVersion: 1 };
+  const legacy = {
+    ...data,
+    version: LEGACY_CHECKPOINT_VERSION,
+    algorithmVersion: LEGACY_PREPARATION_ALGORITHM_VERSION,
+  };
   assert.deepEqual(parseCheckpointData(legacy)?.checkpointId, "checkpoint-1");
 
   const current = {
     ...data,
-    version: 4,
-    algorithmVersion: 2,
+    version: CHECKPOINT_VERSION,
+    algorithmVersion: PREPARATION_ALGORITHM_VERSION,
     checkpointId: "checkpoint-2",
     parentCheckpointId: data.checkpointId,
   };
   assert.deepEqual(parseCheckpointData(current)?.parentCheckpointId, data.checkpointId);
+  assert.equal(parseCheckpointData({ ...current, algorithmVersion: 2 }), undefined);
   assert.equal(parseCheckpointData({ ...current, version: 2 }), undefined);
   assert.equal(parseCheckpointData({ ...current, parentCheckpointId: "" }), undefined);
   assert.equal(parseCheckpointData({ ...current, compaction: { ...current.compaction, summary: "" } }), undefined);

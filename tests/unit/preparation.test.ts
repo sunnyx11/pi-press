@@ -3,7 +3,11 @@ import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { CheckpointData, CompactionPreparation } from "../../src/types.js";
 import { estimateCheckpointCapacity } from "../../src/checkpoint/capacity.js";
-import { createPreparationSettings, prepareCompactionFromBranch } from "../../src/compaction/preparation.js";
+import {
+  createCheckpointPreparationSettings,
+  createFormalizationPreparationSettings,
+  prepareCompactionFromBranch,
+} from "../../src/compaction/preparation.js";
 import { DEFAULT_CONFIG } from "../../src/config.js";
 import { makeCheckpointData, makePreparation, makeUsage, makeUserMessage } from "./fixtures.js";
 
@@ -18,11 +22,11 @@ test("preparation preserves Pi metadata boundary and message selection", () => {
   );
   const preparation = prepareCompactionFromBranch(
     manager.getBranch(),
-    createPreparationSettings(DEFAULT_CONFIG),
+    createCheckpointPreparationSettings(DEFAULT_CONFIG),
   );
 
   assert.ok(preparation);
-  assert.equal(preparation.settings.keepRecentTokens, 2_000);
+  assert.equal(preparation.settings.keepRecentTokens, 10_000);
   assert.equal(preparation.messagesToSummarize.length, 0);
   assert.equal(preparation.turnPrefixMessages.length, 1);
   assert.equal(preparation.turnPrefixMessages[0]?.role, "user");
@@ -63,7 +67,7 @@ test("preparation carries previous summary and file operations into the next com
   manager.appendMessage(makeUserMessage("continue the current turn"));
   manager.appendMessage({
     role: "assistant",
-    content: [{ type: "text", text: "current progress ".repeat(1_000) }],
+    content: [{ type: "text", text: "current progress ".repeat(4_000) }],
     api: "openai-responses",
     provider: "test",
     model: "model-id",
@@ -74,7 +78,7 @@ test("preparation carries previous summary and file operations into the next com
 
   const preparation = prepareCompactionFromBranch(
     manager.getBranch(),
-    createPreparationSettings(DEFAULT_CONFIG),
+    createCheckpointPreparationSettings(DEFAULT_CONFIG),
   );
 
   assert.ok(preparation);
@@ -99,24 +103,28 @@ test("preparation uses a checkpoint as the previous summary boundary", () => {
     checkpointId: "checkpoint-parent",
   });
   manager.appendCustomEntry("pi-press.precompaction", parent);
-  manager.appendMessage(makeUserMessage("incremental history ".repeat(2_000)));
+  manager.appendMessage(makeUserMessage("incremental history ".repeat(5_000)));
   manager.appendMessage(makeUserMessage("recent context ".repeat(1_000)));
 
   const prepareIncremental = prepareCompactionFromBranch as unknown as (
     entries: ReturnType<typeof manager.getBranch>,
-    settings: ReturnType<typeof createPreparationSettings>,
+    settings: ReturnType<typeof createCheckpointPreparationSettings>,
     parentCheckpoint: CheckpointData,
   ) => CompactionPreparation | undefined;
   const preparation = prepareIncremental(
     manager.getBranch(),
-    createPreparationSettings(DEFAULT_CONFIG),
+    createCheckpointPreparationSettings(DEFAULT_CONFIG),
     parent,
   );
 
   assert.ok(preparation);
   assert.equal(preparation.previousSummary, parent.compaction.summary);
+  const summarizedMessages = [
+    ...preparation.messagesToSummarize,
+    ...preparation.turnPrefixMessages,
+  ];
   assert.equal(
-    preparation.messagesToSummarize.some(
+    summarizedMessages.some(
       (message) =>
         message.role === "user" &&
         typeof message.content === "string" &&
@@ -125,7 +133,7 @@ test("preparation uses a checkpoint as the previous summary boundary", () => {
     false,
   );
   assert.equal(
-    preparation.messagesToSummarize.some(
+    summarizedMessages.some(
       (message) =>
         message.role === "user" &&
         typeof message.content === "string" &&
@@ -135,6 +143,15 @@ test("preparation uses a checkpoint as the previous summary boundary", () => {
   );
   assert.deepEqual([...preparation.fileOps.read], ["read.ts"]);
   assert.deepEqual([...preparation.fileOps.edited], ["write.ts"]);
+});
+
+test("checkpoint and formalization preparation settings use independent retention", () => {
+  assert.equal(createCheckpointPreparationSettings(DEFAULT_CONFIG).keepRecentTokens, 10_000);
+  assert.equal(createFormalizationPreparationSettings(DEFAULT_CONFIG, 30_000).keepRecentTokens, 30_000);
+  assert.equal(
+    createCheckpointPreparationSettings(DEFAULT_CONFIG).reserveTokens,
+    createFormalizationPreparationSettings(DEFAULT_CONFIG, 30_000).reserveTokens,
+  );
 });
 
 test("capacity estimate includes fixed overhead and rejects an impossible hard limit", () => {

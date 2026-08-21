@@ -3,11 +3,13 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_CONFIG,
   configFingerprint,
   createSnapshotKey,
   loadConfig,
+  loadPiCompactionKeepRecentTokens,
   normalizeConfig,
 } from "../../src/config.js";
 
@@ -34,6 +36,13 @@ test("normalizeConfig falls back per invalid field", () => {
   assert.equal(result.config.taskTimeoutMs, DEFAULT_CONFIG.taskTimeoutMs);
   assert.equal(result.config.precomputeMode, "threshold-and-manual");
   assert.equal(result.diagnostics.length, 2);
+});
+
+test("normalizeConfig ignores formalization retention because Pi owns it", () => {
+  const result = normalizeConfig({ formalizationKeepRecentTokens: 30_000 });
+
+  assert.deepEqual(result.config, DEFAULT_CONFIG);
+  assert.deepEqual(result.diagnostics, []);
 });
 
 test("loadConfig merges global config before project overrides", () => {
@@ -105,11 +114,41 @@ test("loadConfig deduplicates a shared global and project file", () => {
   }
 });
 
+test("formalization retention comes from Pi settings with Pi defaults", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-press-pi-settings-"));
+  const agentDir = join(root, "agent");
+  const projectDir = join(root, "project");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(join(projectDir, ".pi"), { recursive: true });
+
+  try {
+    assert.equal(
+      loadPiCompactionKeepRecentTokens(projectDir, true, agentDir),
+      DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+    );
+
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ compaction: { keepRecentTokens: 25_000 } }),
+    );
+    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, true, agentDir), 25_000);
+
+    writeFileSync(
+      join(projectDir, ".pi", "settings.json"),
+      JSON.stringify({ compaction: { keepRecentTokens: 30_000 } }),
+    );
+    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, true, agentDir), 30_000);
+    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, false, agentDir), 25_000);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("config fingerprint and snapshot key are deterministic", () => {
   const first = configFingerprint(DEFAULT_CONFIG);
   const second = configFingerprint({ ...DEFAULT_CONFIG });
   assert.equal(first, second);
-  assert.match(createSnapshotKey("session", null, "leaf", DEFAULT_CONFIG), /session:null:leaf:0\.84\.1:2:1:/);
+  assert.match(createSnapshotKey("session", null, "leaf", DEFAULT_CONFIG), /session:null:leaf:0\.84\.1:3:1:/);
 });
 
 test("normalizeConfig rejects timeout values above the Node timer limit", () => {

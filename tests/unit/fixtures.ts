@@ -2,7 +2,12 @@ import type { Api, Message, Model, Usage } from "@earendil-works/pi-ai";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { CompactionPreparation } from "../../src/types.js";
-import type { CheckpointData } from "../../src/types.js";
+import {
+  CHECKPOINT_VERSION,
+  PREPARATION_ALGORITHM_VERSION,
+  SUMMARY_FORMAT_VERSION,
+  type CheckpointData,
+} from "../../src/types.js";
 
 export function makeUsage(totalTokens = 100): Usage {
   return {
@@ -85,16 +90,16 @@ export function makeCheckpointData(
   overrides: Partial<CheckpointData> = {},
 ): CheckpointData {
   return {
-    version: 4,
+    version: CHECKPOINT_VERSION,
     piVersion: VERSION,
-    algorithmVersion: 2,
-    summaryFormatVersion: 1,
+    algorithmVersion: PREPARATION_ALGORITHM_VERSION,
+    summaryFormatVersion: SUMMARY_FORMAT_VERSION,
     checkpointId: "checkpoint-1",
     sessionId,
     snapshotLeafId,
     snapshotSourceLeafId: snapshotLeafId,
     epochCompactionId: null,
-    snapshotKey: `session:null:source:${VERSION}:2:1:fingerprint`,
+    snapshotKey: `session:null:source:${VERSION}:${PREPARATION_ALGORITHM_VERSION}:${SUMMARY_FORMAT_VERSION}:fingerprint`,
     compaction: {
       summary: "A valid summary",
       firstKeptEntryId,

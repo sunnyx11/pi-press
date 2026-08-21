@@ -3,13 +3,19 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  DEFAULT_COMPACTION_SETTINGS,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import type {
   ExtensionAPI,
   ExtensionContext,
   SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
-import { createPreparationSettings, prepareCompactionFromBranch } from "../src/compaction/preparation.js";
+import {
+  createCheckpointPreparationSettings,
+  prepareCompactionFromBranch,
+} from "../src/compaction/preparation.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { ExtensionRuntime } from "../src/extension-runtime.js";
 import type { PiPressConfig } from "../src/types.js";
@@ -56,10 +62,16 @@ export function createScenario(
     ...overrides,
   };
   writeFileSync(join(cwd, ".pi", "pi-press.json"), JSON.stringify(config));
+  writeFileSync(
+    join(cwd, ".pi", "settings.json"),
+    JSON.stringify({
+      compaction: { keepRecentTokens: DEFAULT_COMPACTION_SETTINGS.keepRecentTokens },
+    }),
+  );
 
   const manager = SessionManager.inMemory(cwd);
-  const firstEntryId = manager.appendMessage(makeUserMessage("old history ".repeat(2_000)));
-  const recentEntryId = manager.appendMessage(makeUserMessage("recent context ".repeat(2_000)));
+  const firstEntryId = manager.appendMessage(makeUserMessage("old history ".repeat(6_000)));
+  const recentEntryId = manager.appendMessage(makeUserMessage("recent context ".repeat(6_000)));
   const faux = fauxProvider({
     api: "openai-responses",
     provider: "test",
@@ -90,6 +102,7 @@ export function createScenario(
       getProvider: () => faux.provider,
     },
     thinkingLevel: "medium",
+    isProjectTrusted: () => true,
     ui: {
       notify: (message: string, type?: "info" | "warning" | "error") => {
         notifications.push({ message, type });
@@ -121,7 +134,7 @@ export function makeCompactEvent(
 ): SessionBeforeCompactEvent {
   const preparation = prepareCompactionFromBranch(
     scenario.manager.getBranch(),
-    createPreparationSettings(scenario.config),
+    createCheckpointPreparationSettings(scenario.config),
   );
   assert.ok(preparation);
   return {

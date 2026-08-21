@@ -11,7 +11,7 @@ export type FileOperations = CompactionPreparation["fileOps"];
 
 export const CHECKPOINT_VERSION = 4 as const;
 export const LEGACY_CHECKPOINT_VERSION = 3 as const;
-export const PREPARATION_ALGORITHM_VERSION = 2 as const;
+export const PREPARATION_ALGORITHM_VERSION = 3 as const;
 export const LEGACY_PREPARATION_ALGORITHM_VERSION = 1 as const;
 export const SUMMARY_FORMAT_VERSION = 1 as const;
 export const CHECKPOINT_CUSTOM_TYPE = "pi-press.precompaction" as const;

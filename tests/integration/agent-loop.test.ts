@@ -12,9 +12,13 @@ import {
   type ExtensionAPI,
   type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
-import { createPreparationSettings, prepareCompactionFromBranch } from "../../src/compaction/preparation.js";
+import {
+  createCheckpointPreparationSettings,
+  prepareCompactionFromBranch,
+} from "../../src/compaction/preparation.js";
 import { DEFAULT_CONFIG } from "../../src/config.js";
 import registerPiPress from "../../src/index.js";
+import { waitFor } from "../runtime-fixture.js";
 import { makeCheckpointData, makeUsage, makeUserMessage } from "../unit/fixtures.js";
 
 test("public agent session applies virtual context and formalizes it after settlement", async () => {
@@ -24,12 +28,25 @@ test("public agent session applies virtual context and formalizes it after settl
   mkdirSync(agentDir, { recursive: true });
   writeFileSync(
     join(cwd, ".pi", "pi-press.json"),
-    JSON.stringify({ precomputeMode: "threshold", summaryReserveTokens: 1 }),
+    JSON.stringify({
+      precomputeMode: "threshold",
+      summaryReserveTokens: 1,
+    }),
+  );
+  writeFileSync(
+    join(cwd, ".pi", "settings.json"),
+    JSON.stringify({
+      compaction: {
+        enabled: true,
+        reserveTokens: 1,
+        keepRecentTokens: 30_000,
+      },
+    }),
   );
 
   const manager = SessionManager.create(cwd, join(cwd, "sessions"));
   const oldId = manager.appendMessage(makeUserMessage("old history"));
-  for (let index = 0; index < 40; index += 1) {
+  for (let index = 0; index < 5; index += 1) {
     manager.appendMessage(makeUserMessage(`old history ${index} `.repeat(1_000)));
   }
   manager.appendMessage({
@@ -56,7 +73,11 @@ test("public agent session applies virtual context and formalizes it after settl
   faux.setResponses([
     (context) => {
       observedContexts.push(context);
-      return fauxAssistantMessage("agent response");
+      return fauxAssistantMessage("first agent response");
+    },
+    (context) => {
+      observedContexts.push(context);
+      return fauxAssistantMessage("second agent response");
     },
   ]);
   const checkpoint = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
@@ -117,15 +138,31 @@ test("public agent session applies virtual context and formalizes it after settl
     });
 
     try {
+      const compactionEndErrors: string[] = [];
+      const unsubscribe = session.subscribe((event) => {
+        if (event.type === "compaction_end" && event.errorMessage) {
+          compactionEndErrors.push(event.errorMessage);
+        }
+      });
       assert.ok(oldId);
-      await session.prompt("continue the task");
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      assert.ok(
-        manager.getBranch().some((entry) => entry.type === "compaction"),
-        `entries=${JSON.stringify(manager.getBranch().map((entry) => entry.type))} contexts=${observedContexts.length}`,
-      );
+      try {
+        await session.prompt("continue the task");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.equal(
+          manager.getBranch().some((entry) => entry.type === "compaction"),
+          false,
+        );
+        assert.deepEqual(compactionEndErrors, []);
 
-      assert.equal(observedContexts.length, 1);
+        await session.prompt("additional history ".repeat(8_000));
+        await waitFor(
+          () => manager.getBranch().some((entry) => entry.type === "compaction"),
+        );
+      } finally {
+        unsubscribe();
+      }
+
+      assert.equal(observedContexts.length, 2);
       const requestMessages = observedContexts[0]?.messages ?? [];
       assert.equal(requestMessages[0]?.role, "user");
       const firstText = requestMessages[0]?.content;
@@ -186,7 +223,7 @@ test("preparation adapter matches Pi public compaction event for split turns and
       compaction: {
         enabled: true,
         reserveTokens: DEFAULT_CONFIG.summaryReserveTokens,
-        keepRecentTokens: 2_000,
+        keepRecentTokens: 10_000,
       },
     }),
   );
@@ -216,7 +253,7 @@ test("preparation adapter matches Pi public compaction event for split turns and
   const metadataId = manager.appendCustomEntry("fixture.metadata", { state: true });
   manager.appendMessage({
     role: "assistant",
-    content: [{ type: "text", text: "current progress ".repeat(1_000) }],
+    content: [{ type: "text", text: "current progress ".repeat(4_000) }],
     api: "openai-responses",
     provider: "test",
     model: "model-id",
@@ -227,7 +264,7 @@ test("preparation adapter matches Pi public compaction event for split turns and
   const branchBeforeCompaction = manager.getBranch();
   const adapterPreparation = prepareCompactionFromBranch(
     branchBeforeCompaction,
-    createPreparationSettings(DEFAULT_CONFIG),
+    createCheckpointPreparationSettings(DEFAULT_CONFIG),
   );
   assert.ok(adapterPreparation);
 

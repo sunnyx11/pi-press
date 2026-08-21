@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+### Changed
+
+- settled 后正式化通过 Pi 公开的 `SettingsManager` 获取当前 `compaction.keepRecentTokens`，该值只在 Pi settings 中配置；字段缺失时使用 Pi 默认值。
+- checkpoint preparation 固定保留 10000 token 的近期原始消息，preparation 算法版本为 3；v4/algorithm 2 checkpoint 不作为当前 checkpoint 使用。
+- settled 后正式化在调用 `ctx.compact()` 前模拟 Pi 原生 preparation；会话尚不足以压缩时按叶节点延期，不产生 warning 或正式化失败计数。
+
 ## [0.3.0] - 2026-08-19
 
 ### Added

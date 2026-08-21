@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext, SessionCompactEvent } from "@earendil-works/pi-coding-agent";
@@ -11,6 +11,44 @@ import {
   waitFor,
   type ResponseFactory,
 } from "../runtime-fixture.js";
+
+function getDeferredFormalization(runtime: ReturnType<typeof createScenario>["runtime"]): unknown {
+  return (runtime as unknown as { deferredFormalization?: unknown }).deferredFormalization;
+}
+
+function setPiCompactionKeepRecentTokens(
+  scenario: ReturnType<typeof createScenario>,
+  keepRecentTokens: number,
+): void {
+  writeFileSync(
+    `${scenario.cwd}/.pi/settings.json`,
+    JSON.stringify({ compaction: { keepRecentTokens } }),
+  );
+}
+
+async function createDeferredFormalizationScenario(): Promise<{
+  scenario: ReturnType<typeof createScenario>;
+  ctx: ExtensionContext;
+}> {
+  const scenario = createScenario({ summaryReserveTokens: 1 });
+  setPiCompactionKeepRecentTokens(scenario, 50_000);
+  const ctx = {
+    ...scenario.ctx,
+    isIdle: () => true,
+    compact: () => {
+      assert.fail("deferred formalization must not call compact");
+    },
+  } as ExtensionContext;
+  scenario.runtime.onTurnEnd(ctx);
+  await waitFor(() => scenario.appended.length === 1);
+  await scenario.runtime.onContext({
+    type: "context",
+    messages: scenario.manager.buildSessionContext().messages,
+  }, ctx);
+  scenario.runtime.onAgentSettled(ctx);
+  await waitFor(() => Boolean(getDeferredFormalization(scenario.runtime)));
+  return { scenario, ctx };
+}
 
 test("threshold turn schedules compact once and hook reuses the checkpoint", async () => {
   const scenario = createScenario({
@@ -120,6 +158,88 @@ test("context applies a ready checkpoint and settled formalization runs after th
     const reuse = await scenario.runtime.beforeCompact(manualEvent, ctx);
     assert.ok(reuse?.compaction);
     assert.equal(reuse.compaction.summary, "checkpoint summary");
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("formalization defers until a new leaf makes native preparation available", async () => {
+  const scenario = createScenario({ summaryReserveTokens: 1 });
+  setPiCompactionKeepRecentTokens(scenario, 50_000);
+  let compactCalls = 0;
+  const ctx = {
+    ...scenario.ctx,
+    isIdle: () => true,
+    compact: () => {
+      compactCalls += 1;
+    },
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, ctx);
+
+    scenario.runtime.onAgentSettled(ctx);
+    await waitFor(() => scenario.runtime.getDiagnostics().counters.formalization_deferred === 1);
+    scenario.runtime.onAgentSettled(ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(compactCalls, 0);
+    assert.equal(scenario.runtime.getDiagnostics().counters.formalization_deferred, 1);
+    assert.equal(scenario.runtime.getDiagnostics().counters.formalization_failed ?? 0, 0);
+    assert.equal(scenario.notifications.some((item) => item.type === "warning"), false);
+
+    scenario.manager.appendMessage(makeUserMessage("new history ".repeat(20_000)));
+    scenario.runtime.onAgentSettled(ctx);
+    await waitFor(() => compactCalls === 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("session too small callback remains deferred without consuming failure attempts", async () => {
+  const scenario = createScenario({ summaryReserveTokens: 1 });
+  let compactCalls = 0;
+  const ctx = {
+    ...scenario.ctx,
+    isIdle: () => true,
+    compact: (options?: { onError?: (error: Error) => void }) => {
+      compactCalls += 1;
+      options?.onError?.(new Error("Nothing to compact (session too small)"));
+    },
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, ctx);
+
+    for (let index = 1; index <= 3; index += 1) {
+      scenario.runtime.onAgentSettled(ctx);
+      await waitFor(() => compactCalls === index);
+      scenario.runtime.onAgentSettled(ctx);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(compactCalls, index);
+      if (index < 3) {
+        scenario.manager.appendMessage(makeUserMessage(`new leaf ${index}`));
+      }
+    }
+
+    const diagnostics = scenario.runtime.getDiagnostics();
+    assert.equal(diagnostics.counters.formalization_deferred, 3);
+    assert.equal(diagnostics.counters.formalization_failed ?? 0, 0);
+    assert.equal(scenario.notifications.some((item) => item.type === "warning"), false);
   } finally {
     scenario.runtime.onSessionShutdown();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -328,6 +448,100 @@ test("session shutdown cancels a scheduled formalization", async () => {
     scenario.runtime.onSessionShutdown();
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(compactCalls, 0);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("native compaction clears deferred formalization", async () => {
+  const { scenario, ctx } = await createDeferredFormalizationScenario();
+
+  try {
+    const compactionEntryId = scenario.manager.appendCompaction(
+      "native summary",
+      scenario.firstEntryId,
+      90_000,
+    );
+    const compactionEntry = scenario.manager.getEntry(compactionEntryId);
+    assert.ok(compactionEntry?.type === "compaction");
+    scenario.runtime.onSessionCompact({
+      type: "session_compact",
+      compactionEntry,
+      fromExtension: false,
+      reason: "threshold",
+      willRetry: false,
+    }, ctx);
+
+    assert.equal(getDeferredFormalization(scenario.runtime), undefined);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("a newly applied checkpoint clears deferred formalization", async () => {
+  const { scenario, ctx } = await createDeferredFormalizationScenario();
+
+  try {
+    const parent = parseCheckpointData(scenario.appended[0]);
+    assert.ok(parent);
+    const snapshotLeafId = scenario.manager.appendMessage(makeUserMessage("new checkpoint history"));
+    scenario.manager.appendCustomEntry("pi-press.precompaction", {
+      ...parent,
+      checkpointId: "refreshed-checkpoint",
+      parentCheckpointId: parent.checkpointId,
+      snapshotLeafId,
+      snapshotSourceLeafId: snapshotLeafId,
+      snapshotKey: "refreshed-snapshot",
+      createdAt: new Date().toISOString(),
+    });
+    await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, ctx);
+
+    assert.equal(getDeferredFormalization(scenario.runtime), undefined);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("branch switching clears deferred formalization", async () => {
+  const { scenario } = await createDeferredFormalizationScenario();
+
+  try {
+    scenario.runtime.onSessionBeforeTree();
+    assert.equal(getDeferredFormalization(scenario.runtime), undefined);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("session shutdown clears deferred formalization", async () => {
+  const { scenario } = await createDeferredFormalizationScenario();
+
+  try {
+    scenario.runtime.onSessionShutdown();
+    assert.equal(getDeferredFormalization(scenario.runtime), undefined);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("precomputeMode off clears deferred formalization", async () => {
+  const { scenario, ctx } = await createDeferredFormalizationScenario();
+
+  try {
+    writeFileSync(
+      `${scenario.cwd}/.pi/pi-press.json`,
+      JSON.stringify({ ...scenario.config, precomputeMode: "off" }),
+    );
+    scenario.runtime.onTurnEnd(ctx);
+    assert.equal(getDeferredFormalization(scenario.runtime), undefined);
   } finally {
     scenario.runtime.onSessionShutdown();
     rmSync(scenario.cwd, { recursive: true, force: true });

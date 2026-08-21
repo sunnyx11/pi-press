@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { CONFIG_DIR_NAME, getAgentDir, VERSION } from "@earendil-works/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  getAgentDir,
+  SettingsManager,
+  VERSION,
+} from "@earendil-works/pi-coding-agent";
 import {
   PREPARATION_ALGORITHM_VERSION,
   SUMMARY_FORMAT_VERSION,
@@ -162,6 +167,14 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 
 function stableConfigText(config: PiPressConfig): string {
   return JSON.stringify(CONFIG_KEYS.map((key) => [key, config[key]]));
+}
+
+export function loadPiCompactionKeepRecentTokens(
+  cwd: string,
+  projectTrusted: boolean,
+  agentDir = getAgentDir(),
+): number {
+  return SettingsManager.create(cwd, agentDir, { projectTrusted }).getCompactionKeepRecentTokens();
 }
 
 /** 返回参与 snapshot key 的配置指纹。 */

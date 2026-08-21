@@ -22,7 +22,13 @@ import {
   isBeforeOrSame,
 } from "./checkpoint/selection.js";
 import { isJsonObject, isUsage, parseCheckpointData } from "./checkpoint/schema.js";
-import { loadConfig, createSnapshotKey, configFingerprint, DEFAULT_CONFIG } from "./config.js";
+import {
+  loadConfig,
+  loadPiCompactionKeepRecentTokens,
+  createSnapshotKey,
+  configFingerprint,
+  DEFAULT_CONFIG,
+} from "./config.js";
 import { Diagnostics } from "./diagnostics.js";
 import { buildCheckpointCompactionResult } from "./compaction/reuse.js";
 import {
@@ -30,7 +36,8 @@ import {
   VirtualContextProjectionCache,
 } from "./compaction/virtual-context.js";
 import {
-  createPreparationSettings,
+  createCheckpointPreparationSettings,
+  createFormalizationPreparationSettings,
   estimateMessagesTokens,
   prepareCompactionFromBranch,
 } from "./compaction/preparation.js";
@@ -50,6 +57,7 @@ import {
 const RETRY_BASE_DELAY_MS = 250;
 const MAX_BACKGROUND_RETRIES = 1;
 const MAX_FORMALIZATION_ATTEMPTS = 2;
+const SESSION_TOO_SMALL_ERROR = "Nothing to compact (session too small)";
 
 // Pi reload 会重新创建模块实例；全局 Symbol 让未结束的请求继续占用后台名额。
 const SHARED_RUNTIME_STATE_KEY = Symbol.for("pi-press.runtime-state.v1");
@@ -114,6 +122,13 @@ type PendingFormalization = Omit<FormalizationSchedule, "ctx" | "timer"> & {
   attempt: number;
 };
 
+type DeferredFormalization = {
+  checkpointId: string;
+  sessionId: string;
+  epochCompactionId: string | null;
+  checkedLeafId: string;
+};
+
 type WaitOutcome = "finished" | "timeout" | "aborted";
 type CheckpointAppendOutcome = "appended" | "skipped" | "failed";
 type NotificationType = "info" | "warning" | "error";
@@ -130,6 +145,10 @@ function isAbortLike(error: unknown): boolean {
 
 function isTimeoutError(error: unknown): boolean {
   return error instanceof Error && error.name === "TimeoutError";
+}
+
+function isSessionTooSmallError(error: unknown): boolean {
+  return error instanceof Error && error.message === SESSION_TOO_SMALL_ERROR;
 }
 
 function getCheckpointIdFromDetails(details: unknown): string | undefined {
@@ -185,6 +204,7 @@ export class ExtensionRuntime {
   private virtualApplication: VirtualApplication | undefined;
   private formalizationSchedule: FormalizationSchedule | undefined;
   private pendingFormalization: PendingFormalization | undefined;
+  private deferredFormalization: DeferredFormalization | undefined;
   private readonly virtualContextCache = new VirtualContextProjectionCache();
 
   constructor(private readonly pi: Pick<ExtensionAPI, "appendEntry">, diagnostics = new Diagnostics()) {
@@ -271,6 +291,7 @@ export class ExtensionRuntime {
         getEntryIndex(branch, this.virtualApplication.lastAppliedLeafId) < 0)
     ) {
       this.virtualApplication = undefined;
+      this.deferredFormalization = undefined;
     }
 
     let hardLimitExceeded = false;
@@ -296,6 +317,15 @@ export class ExtensionRuntime {
       if (!leafId) {
         this.diagnostics.count("virtual_skipped_empty_branch");
         return { messages: event.messages };
+      }
+      const deferred = this.deferredFormalization;
+      if (
+        deferred &&
+        (deferred.sessionId !== sessionId ||
+          deferred.epochCompactionId !== epochCompactionId ||
+          deferred.checkpointId !== candidate.data.checkpointId)
+      ) {
+        this.deferredFormalization = undefined;
       }
       const previousApplication = this.virtualApplication;
       const refreshRequested = projection.needsRefresh || Boolean(
@@ -393,16 +423,22 @@ export class ExtensionRuntime {
       getEntryIndex(branch, application.lastAppliedLeafId) < 0
     ) {
       this.virtualApplication = undefined;
+      this.deferredFormalization = undefined;
       return;
     }
-    const candidate = findReadyCheckpointCandidates(
+    const candidates = findReadyCheckpointCandidates(
       branch,
       sessionId,
       epochCompactionId,
       this.checkpointClaim?.checkpointId,
-    ).find((item) => item.data.checkpointId === application.checkpointId);
-    if (!candidate) {
+    );
+    const applicationCandidate = candidates.find(
+      (item) => item.data.checkpointId === application.checkpointId,
+    );
+    const candidate = candidates[0];
+    if (!candidate || !applicationCandidate) {
       this.virtualApplication = undefined;
+      this.deferredFormalization = undefined;
       return;
     }
 
@@ -412,6 +448,17 @@ export class ExtensionRuntime {
     }
     const scheduledLeafId = ctx.sessionManager.getLeafId();
     if (!scheduledLeafId) {
+      return;
+    }
+    const deferred = this.deferredFormalization;
+    if (
+      deferred &&
+      (deferred.sessionId !== sessionId ||
+        deferred.epochCompactionId !== epochCompactionId ||
+        deferred.checkpointId !== candidate.data.checkpointId)
+    ) {
+      this.deferredFormalization = undefined;
+    } else if (deferred?.checkedLeafId === scheduledLeafId) {
       return;
     }
     const schedule: FormalizationSchedule = {
@@ -725,20 +772,44 @@ export class ExtensionRuntime {
       return;
     }
 
-    const epochKey = this.formalizationEpochKey(schedule.sessionId, schedule.epochCompactionId);
-    const attempt = (this.formalizationAttemptsByEpoch.get(epochKey) ?? 0) + 1;
-    if (attempt > MAX_FORMALIZATION_ATTEMPTS) {
+    const checkedLeafId = ctx.sessionManager.getLeafId();
+    if (!checkedLeafId) {
+      this.diagnostics.count("formalization_skipped_stale");
       return;
     }
-    this.formalizationAttemptsByEpoch.set(epochKey, attempt);
+    const preparation = prepareCompactionFromBranch(
+      branch,
+      createFormalizationPreparationSettings(
+        this.currentConfig,
+        loadPiCompactionKeepRecentTokens(ctx.cwd, ctx.isProjectTrusted()),
+      ),
+    );
+    if (!preparation) {
+      this.deferredFormalization = {
+        checkpointId: candidate.data.checkpointId,
+        sessionId: schedule.sessionId,
+        epochCompactionId: schedule.epochCompactionId,
+        checkedLeafId,
+      };
+      this.diagnostics.count("formalization_deferred");
+      this.diagnostics.record("lifecycle", "当前分支尚未达到 Pi 正式压缩边界，正式化已延期。");
+      return;
+    }
+    this.deferredFormalization = undefined;
+
+    const epochKey = this.formalizationEpochKey(schedule.sessionId, schedule.epochCompactionId);
+    const failureCount = this.formalizationAttemptsByEpoch.get(epochKey) ?? 0;
+    if (failureCount >= MAX_FORMALIZATION_ATTEMPTS) {
+      return;
+    }
     const pending: PendingFormalization = {
       requestId: schedule.requestId,
       runEpoch: schedule.runEpoch,
       checkpointId: candidate.data.checkpointId,
       sessionId: schedule.sessionId,
       epochCompactionId: schedule.epochCompactionId,
-      scheduledLeafId: schedule.scheduledLeafId,
-      attempt,
+      scheduledLeafId: checkedLeafId,
+      attempt: failureCount + 1,
     };
     this.pendingFormalization = pending;
     this.diagnostics.count("formalization_started");
@@ -766,8 +837,22 @@ export class ExtensionRuntime {
     }
     this.releaseCheckpointClaim(pending.checkpointId);
     this.pendingFormalization = undefined;
-    this.diagnostics.count("formalization_failed");
+    if (isSessionTooSmallError(error)) {
+      this.deferredFormalization = {
+        checkpointId: pending.checkpointId,
+        sessionId: pending.sessionId,
+        epochCompactionId: pending.epochCompactionId,
+        checkedLeafId: pending.scheduledLeafId,
+      };
+      this.diagnostics.count("formalization_deferred");
+      this.diagnostics.record("lifecycle", "Pi 未找到可压缩内容，正式化已延期。");
+      return;
+    }
 
+    const epochKey = this.formalizationEpochKey(pending.sessionId, pending.epochCompactionId);
+    const failureCount = (this.formalizationAttemptsByEpoch.get(epochKey) ?? 0) + 1;
+    this.formalizationAttemptsByEpoch.set(epochKey, failureCount);
+    this.diagnostics.count("formalization_failed");
     this.diagnostics.record("lifecycle", `正式化失败：${describeError(error)}`);
     this.notifyWarning("虚拟压缩正式化失败，后续 settled 状态最多再试一次。");
   }
@@ -787,6 +872,7 @@ export class ExtensionRuntime {
     this.virtualApplication = undefined;
     this.cancelFormalizationSchedule();
     this.pendingFormalization = undefined;
+    this.deferredFormalization = undefined;
   }
 
   private bindContext(ctx: ExtensionContext): void {
@@ -961,7 +1047,7 @@ export class ExtensionRuntime {
     }
     const preparation = prepareCompactionFromBranch(
       task.branchEntries,
-      createPreparationSettings(task.config),
+      createCheckpointPreparationSettings(task.config),
       task.parentCheckpoint,
     );
     if (!preparation) {
