@@ -7,11 +7,13 @@
 
 ## [Unreleased]
 
-### Changed
+## [0.3.1] - 2026-08-21
 
-- settled 后正式化通过 Pi 公开的 `SettingsManager` 获取当前 `compaction.keepRecentTokens`，该值只在 Pi settings 中配置；字段缺失时使用 Pi 默认值。
-- checkpoint preparation 固定保留 10000 token 的近期原始消息，preparation 算法版本为 3；v4/algorithm 2 checkpoint 不作为当前 checkpoint 使用。
-- settled 后正式化在调用 `ctx.compact()` 前模拟 Pi 原生 preparation；会话尚不足以压缩时按叶节点延期，不产生 warning 或正式化失败计数。
+### Fixed
+
+- 正式化预检查读取 Pi 当前生效的 `compaction.keepRecentTokens`，无需在 Pi-press 配置中重复维护保留量；字段未配置时使用 Pi 默认值。
+- checkpoint preparation 固定保留 10000 token 的近期原始消息，并拒绝使用旧 preparation 算法生成的 v4 checkpoint。
+- 会话尚未达到 Pi 正式压缩边界时按叶节点延期，不显示 warning，也不计入正式化失败次数。
 
 ## [0.3.0] - 2026-08-19
 
@@ -71,7 +73,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/sunnyx11/pi-press/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sunnyx11/pi-press/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/sunnyx11/pi-press/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/sunnyx11/pi-press/compare/v0.2.0...v0.2.1

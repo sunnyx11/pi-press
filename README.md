@@ -29,10 +29,10 @@
 pi install npm:@sunnyx11/pi-press
 
 # 固定安装指定版本
-pi install npm:@sunnyx11/pi-press@0.3.0
+pi install npm:@sunnyx11/pi-press@0.3.1
 
 # 在当前进程中临时加载
-pi -e npm:@sunnyx11/pi-press@0.3.0
+pi -e npm:@sunnyx11/pi-press@0.3.1
 
 # 更新未固定版本或卸载
 pi update npm:@sunnyx11/pi-press
