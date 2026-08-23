@@ -239,11 +239,16 @@ import {
 `session_before_compact` 的 handler 只在 checkpoint 完整满足项目设计时返回：
 
 ```ts
+const originalTokensBefore = calculateOriginalTokensBefore(
+  checkpoint,
+  branch,
+);
+
 return {
   compaction: {
     summary: checkpoint.compaction.summary,
     firstKeptEntryId: checkpoint.compaction.firstKeptEntryId,
-    tokensBefore: preparation.tokensBefore,
+    tokensBefore: originalTokensBefore,
     usage: checkpoint.compaction.usage,
     details: {
       ...checkpoint.compaction.details,
@@ -255,7 +260,7 @@ return {
 };
 ```
 
-`tokensBefore` 必须来自本次事件的 `preparation`。checkpoint 中保存的快照值只用于诊断和生成阶段校验。
+`tokensBefore` 表示本次正式 compaction 所代表的原始上下文量。该值由 checkpoint 快照的 `compaction.tokensBefore` 加上 `snapshotLeafId` 后 context-visible session 消息的 `estimateTokens()` 估算值组成。Pi-press 状态 entry 和其他 context-invisible metadata 不产生 token。
 
 ### Session 对象有效期
 
@@ -365,7 +370,7 @@ custom entry 不进入 LLM 上下文，可以作为 session tree 的 metadata。
 3. 使用公开转换函数构造 `messagesToSummarize` 和 `turnPrefixMessages`；
 4. 保留 Pi 对 context-visible message、split turn、相邻 metadata 和 tool result 的边界规则；
 5. 累计前次兼容 details 中的 `readFiles` 和 `modifiedFiles`；
-6. 使用公开 usage 和 token 函数生成 `tokensBefore`；
+6. 首次 checkpoint 使用公开 usage 和 token 函数生成 `tokensBefore`；增量 checkpoint 使用 parent 原始计数加快照后的 context-visible session 消息估算值；
 7. 产出 `Parameters<typeof compact>[0]` 所表示的 preparation。
 
 `firstKeptEntryId` 是 Pi preparation 产生的不透明 entry ID。实现不得自行把它限制为 user 或 assistant entry，也不得在 tool result 上自行创建无 Pi 依据的切分规则。
@@ -392,7 +397,7 @@ provider 请求适配必须：
 
 ### Schema
 
-checkpoint 当前写入 `version: 4`、`algorithmVersion: 3`。v4/algorithm 2 不作为当前 checkpoint 读取；v3/algorithm 1 只允许作为没有 parent 的兼容根节点。
+checkpoint 当前写入 `version: 4`、`algorithmVersion: 4`。其他 v4 算法版本不作为当前 checkpoint 读取；v3/algorithm 1 只允许作为没有 parent 的兼容根节点。
 
 - `piVersion` 为生成 checkpoint 的 Pi 版本，消费时必须与当前运行时 `VERSION` 相同；
 - `algorithmVersion` 和 `summaryFormatVersion` 为受支持版本；
@@ -437,10 +442,11 @@ firstKeptEntryId 位于 snapshotLeafId 之前或与其相同
 
 ### 容量校验
 
-消费 checkpoint 前，使用当前分支和当前 preparation 模拟压缩后的上下文：
+消费 checkpoint 前，根据当前分支计算本次正式 compaction 所代表的原始上下文量，并使用包含该值的 preparation 副本模拟压缩后的上下文：
 
 ```text
-fixedOverhead = max(0, currentPreparation.tokensBefore - currentMessagesEstimatedTokens)
+originalTokensBefore = checkpoint.compaction.tokensBefore + estimatedMessagesAfterSnapshot
+fixedOverhead = max(0, originalTokensBefore - currentMessagesEstimatedTokens)
 estimatedTokensAfter = fixedOverhead + summaryEstimatedTokens + keptMessagesEstimatedTokens
 safetyMargin = max(4096, ceil(contextWindow * 0.02))
 hardLimit = contextWindow - reserveTokens - safetyMargin
@@ -533,7 +539,7 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 纯函数至少覆盖：
 
 - Pi-press 配置默认值、范围校验和 fingerprint，以及 Pi `SettingsManager` 的正式化保留量默认、覆盖和项目信任规则；
-- checkpoint v4/algorithm 3、拒绝 v4/algorithm 2、兼容 v3/algorithm 1 根节点、parent 链、未知版本、空 summary、非有限数值和非法引用；
+- checkpoint v4/algorithm 4、拒绝其他 v4 算法版本、兼容 v3/algorithm 1 根节点、parent 链、未知版本、空 summary、非有限数值和非法引用；
 - snapshot key、epoch 和祖先判断；
 - 容量公式、容量余量和 soft threshold；
 - task identity、runEpoch 和状态转换；
@@ -567,7 +573,10 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 ```bash
 npm run typecheck
 npm test
+npm run test:smoke:pi
 ```
+
+`npm run test:smoke:pi` 使用当前 shell 环境安装的仓库外部 Pi 可执行文件和当前配置模型，调用真实 provider，并验证 checkpoint 原始计数与正式 `tokensBefore`。可通过 `PI_BIN` 指定 Pi 可执行文件。
 
 涉及公开 API、版本适配、provider、session 生命周期或并发控制时，必须同时运行相关集成测试。测试未覆盖的行为应在变更说明中列出，不能仅以主流程通过作为完成依据。
 
@@ -582,7 +591,7 @@ npm test
 - [ ] `session_before_compact` 仅在容量和契约全部满足时返回结果，其他情况返回 `undefined` 走原生实现；新 signal 可以释放旧 attempt 的 claim。
 - [ ] provider signal、headers、baseUrl、env 和认证失败处理经过测试；provenance 保存实际 endpoint 的脱敏副本，日志没有敏感信息。
 - [ ] 已覆盖 split turn、metadata 边界、分支、重启、取消、超时、跨 Runtime 重复任务和旧 epoch。
-- [ ] `npm run typecheck` 与 `npm test` 通过，未验证项已记录。
+- [ ] `npm run typecheck`、`npm test` 与 `npm run test:smoke:pi` 通过，未验证项已记录；真实冒烟报告包含 Pi 可执行文件、版本、模型、checkpoint token、尾部 token 和正式 `tokensBefore`。
 
 ## 版本升级规则
 

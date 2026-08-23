@@ -2,9 +2,18 @@ import assert from "node:assert/strict";
 import { rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import type { ExtensionContext, SessionCompactEvent } from "@earendil-works/pi-coding-agent";
+import {
+  estimateTokens,
+  sessionEntryToContextMessages,
+  type ExtensionContext,
+  type SessionCompactEvent,
+} from "@earendil-works/pi-coding-agent";
 import { parseCheckpointData } from "../../src/checkpoint/schema.js";
-import { makeUserMessage } from "../unit/fixtures.js";
+import {
+  makeAssistantMessage,
+  makeUsage,
+  makeUserMessage,
+} from "../unit/fixtures.js";
 import {
   createScenario,
   makeCompactEvent,
@@ -575,6 +584,9 @@ test("virtual context can refresh a checkpoint three times in one compaction epo
         type: "context",
         messages: scenario.manager.buildSessionContext().messages,
       }, scenario.ctx);
+      scenario.manager.appendMessage(
+        makeAssistantMessage(`virtual response ${generation}`, makeUsage(1_000)),
+      );
       for (let index = 0; index < 100; index += 1) {
         scenario.manager.appendMessage(makeUserMessage("x".repeat(3_000)));
       }
@@ -589,6 +601,27 @@ test("virtual context can refresh a checkpoint three times in one compaction epo
     assert.equal(checkpoints[0].parentCheckpointId, undefined);
     assert.equal(checkpoints[1].parentCheckpointId, checkpoints[0].checkpointId);
     assert.equal(checkpoints[2].parentCheckpointId, checkpoints[1].checkpointId);
+    const branch = scenario.manager.getBranch();
+    for (let index = 1; index < checkpoints.length; index += 1) {
+      const parent = checkpoints[index - 1]!;
+      const checkpoint = checkpoints[index]!;
+      const parentSnapshotIndex = branch.findIndex(
+        (entry) => entry.id === parent.snapshotLeafId,
+      );
+      const checkpointSnapshotIndex = branch.findIndex(
+        (entry) => entry.id === checkpoint.snapshotLeafId,
+      );
+      assert.ok(parentSnapshotIndex >= 0);
+      assert.ok(checkpointSnapshotIndex > parentSnapshotIndex);
+      const originalTailTokens = branch
+        .slice(parentSnapshotIndex + 1, checkpointSnapshotIndex + 1)
+        .flatMap((entry) => sessionEntryToContextMessages(entry))
+        .reduce((total, message) => total + estimateTokens(message), 0);
+      assert.equal(
+        checkpoint.compaction.tokensBefore,
+        parent.compaction.tokensBefore + originalTailTokens,
+      );
+    }
     assert.equal(checkpoints[2].compaction.summary, "third checkpoint summary");
     assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 3);
   } finally {

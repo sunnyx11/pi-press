@@ -27,10 +27,13 @@ npm whoami
 npm config get registry
 npm view '@sunnyx11/pi-press@X.Y.Z' version
 git diff --check
+npm run typecheck
+npm test
+npm run test:smoke:pi
 npm publish --dry-run --access public
 ```
 
-候选版本查询应返回 `E404`；registry 应为 `https://registry.npmjs.org/`；dry-run 必须通过类型检查、测试和发布文件检查。
+候选版本查询应返回 `E404`；registry 应为 `https://registry.npmjs.org/`；类型检查、测试和 dry-run 必须通过。`npm run test:smoke:pi` 使用当前 shell 环境安装的仓库外部 Pi 和当前配置模型，可能产生真实 provider 调用费用；报告必须包含 Pi 可执行文件、版本、模型、checkpoint token、尾部 token 和正式 `tokensBefore`。
 
 ## 5. 提交并推送
 

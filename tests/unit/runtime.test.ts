@@ -3,7 +3,10 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  SessionManager,
+  estimateTokens,
+} from "@earendil-works/pi-coding-agent";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -78,6 +81,45 @@ test("checkpoint claim stays exclusive within one attempt and recovers for a new
   } as ExtensionContext;
   runtime.onTurnEnd(highUsageCtx);
   assert.equal(runtime.getDiagnostics().counters.task_started ?? 0, 0);
+});
+
+test("formal reuse reports checkpoint history plus the original session tail", async () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-runtime-original-tokens");
+  const firstId = manager.appendMessage(makeUserMessage("old history"));
+  const snapshotId = manager.appendMessage(makeUserMessage("snapshot content"));
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, firstId, {
+    checkpointId: "checkpoint-original-tokens",
+  });
+  data.compaction.tokensBefore = 160_000;
+  manager.appendCustomEntry("pi-press.precompaction", data);
+  const tailMessage = makeUserMessage("new work after the checkpoint");
+  manager.appendMessage(tailMessage);
+
+  const model = makeModel(500_000);
+  const ctx = {
+    cwd: "/tmp/pi-press-runtime-original-tokens",
+    sessionManager: manager,
+    model,
+    modelRegistry: {},
+    thinkingLevel: "medium",
+  } as unknown as ExtensionContext;
+  const runtime = new ExtensionRuntime({ appendEntry: () => undefined });
+  runtime.onSessionStart(ctx);
+
+  const result = await runtime.beforeCompact({
+    type: "session_before_compact",
+    preparation: makePreparation(firstId, 67_049),
+    branchEntries: manager.getBranch(),
+    reason: "threshold",
+    willRetry: false,
+    signal: new AbortController().signal,
+  }, ctx);
+
+  assert.ok(result?.compaction);
+  assert.equal(
+    result.compaction.tokensBefore,
+    data.compaction.tokensBefore + estimateTokens(tailMessage),
+  );
 });
 
 test("context returns original messages and records a diagnostic when projection fails", async () => {
@@ -282,7 +324,7 @@ test("persisted checkpoint can continue refreshing after restore", () => {
       parentCheckpointId: "checkpoint-initial",
     }),
   );
-  manager.appendMessage(makeUserMessage("trailing context ".repeat(15_000)));
+  manager.appendMessage(makeUserMessage("trailing context ".repeat(20_000)));
 
   const model = makeModel();
   const ctx = {

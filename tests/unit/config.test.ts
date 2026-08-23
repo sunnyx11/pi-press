@@ -3,7 +3,10 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
+import {
+  DEFAULT_COMPACTION_SETTINGS,
+  VERSION,
+} from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_CONFIG,
   configFingerprint,
@@ -148,7 +151,8 @@ test("config fingerprint and snapshot key are deterministic", () => {
   const first = configFingerprint(DEFAULT_CONFIG);
   const second = configFingerprint({ ...DEFAULT_CONFIG });
   assert.equal(first, second);
-  assert.match(createSnapshotKey("session", null, "leaf", DEFAULT_CONFIG), /session:null:leaf:0\.84\.1:3:1:/);
+  const snapshotKey = createSnapshotKey("session", null, "leaf", DEFAULT_CONFIG);
+  assert.deepEqual(snapshotKey.split(":"), ["session", "null", "leaf", VERSION, "4", "1", first]);
 });
 
 test("normalizeConfig rejects timeout values above the Node timer limit", () => {

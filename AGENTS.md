@@ -7,6 +7,13 @@
 - 代码注释统一使用规范简体中文。代码标识符、协议字段、API 名称、命令、路径、版本号和必要的原文引用按实际形式保留。
 - Git 提交信息的标题、正文和脚注统一使用规范简体中文。代码标识符、协议字段、API 名称、命令、路径和版本号可按实际形式保留。
 
+## 测试运行时
+
+- `npm run typecheck` 和 `npm test` 使用 `package-lock.json` 固定的 Pi 开发依赖。
+- 涉及代码的变更完成前必须运行 `npm run test:smoke:pi`。该命令使用当前 shell 环境安装的 Pi 和当前 Pi 配置的模型，可能产生真实 provider 调用费用。
+- 真实 Pi 冒烟测试禁止使用 `npx pi`、仓库 `node_modules/.bin/pi` 或仓库本地 `cli.js`。`scripts/smoke-real-pi.ts` 必须解析仓库外部的 Pi 可执行文件；特殊环境通过 `PI_BIN` 指定。
+- 冒烟测试报告必须包含 Pi 可执行文件、Pi 版本、模型、checkpoint token、尾部 token 和正式 `tokensBefore`。Pi 不可用、认证失败或正式 compaction 不匹配均视为测试失败，禁止回退到仓库本地 Pi。
+
 ## 文档导航
 
 `AGENTS.md` 是本仓库 `docs/` 目录的唯一导航入口。阅读或查找仓库文档时，先查看本文件，再根据下方索引进入具体文档。

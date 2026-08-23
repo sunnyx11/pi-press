@@ -209,7 +209,7 @@ checkpoint preparation 固定使用 `keepRecentTokens: 10000`，用于在 checkp
   "data": {
     "version": 4,
     "piVersion": "current-pi-version",
-    "algorithmVersion": 3,
+    "algorithmVersion": 4,
     "summaryFormatVersion": 1,
     "checkpointId": "checkpoint-2",
     "parentCheckpointId": "checkpoint-1",
@@ -217,7 +217,7 @@ checkpoint preparation 固定使用 `keepRecentTokens: 10000`，用于在 checkp
     "snapshotLeafId": "entry-42",
     "snapshotSourceLeafId": "entry-41",
     "epochCompactionId": null,
-    "snapshotKey": "session-1:null:entry-41:current-pi-version:3:1:config",
+    "snapshotKey": "session-1:null:entry-41:current-pi-version:4:1:config",
     "compaction": {
       "summary": "...",
       "firstKeptEntryId": "entry-18",
@@ -250,7 +250,7 @@ checkpoint preparation 固定使用 `keepRecentTokens: 10000`，用于在 checkp
 
 - `version`：checkpoint schema 版本。当前写入版本为 `4`；版本 `3`、`algorithmVersion: 1` 的旧 checkpoint 可作为无 parent 的根节点读取。
 - `piVersion`：生成结果的 Pi 版本，必须与运行时 `VERSION` 相同。
-- `algorithmVersion`：Pi-press preparation 适配算法版本；当前值为 `3`。v4/algorithm 2 checkpoint 不属于当前 checkpoint；v3/algorithm 1 仅作为无 parent 根节点兼容读取。
+- `algorithmVersion`：Pi-press preparation 适配算法版本；当前值为 `4`。其他 v4 算法版本不属于当前 checkpoint；v3/algorithm 1 仅作为无 parent 根节点兼容读取。
 - `summaryFormatVersion`：摘要格式和原生 compact 编排版本。
 - `checkpointId`：扩展生成的逻辑唯一标识；不依赖 Pi 自动生成的 custom entry ID。
 - `parentCheckpointId`：同 epoch 上一代 checkpoint 的 ID。首代 v4 checkpoint 可以省略；v3 checkpoint 必须省略。选择候选时校验完整 parent 链的先后顺序、epoch、session、Pi 版本和保留边界。
@@ -259,7 +259,7 @@ checkpoint preparation 固定使用 `keepRecentTokens: 10000`，用于在 checkp
 - `snapshotSourceLeafId`：忽略所有 `customType` 以 `pi-press.` 开头的状态 entry 后，最新的其他 entry ID。该字段用于 snapshot 去重，只表示生成输入边界，不替代实际叶子。
 - `epochCompactionId`：快照分支最近的正式 compaction entry ID；没有时为 `null`。该字段是唯一的持久化 compaction epoch，不再维护整数 generation。
 - `snapshotKey`：后台任务去重键，不作为正式 compaction 的相等匹配条件。
-- `compaction`：公开 `compact()` 生成的结果。`tokensBefore` 只记录快照值；正式返回时替换为当前 preparation 的值。
+- `compaction`：公开 `compact()` 生成的结果。`tokensBefore` 记录 `snapshotLeafId` 时本次摘要所代表的原始上下文量。
 - `compaction.firstKeptEntryId`：摘要后保留的第一个 entry ID，必须是 `snapshotLeafId` 的祖先或与其相同；其 entry 类型按 Pi preparation 语义处理。
 - `compaction.details`：保留原生 `readFiles` 和 `modifiedFiles`。未知附加字段允许原样持久化。
 - `estimatedTokensAfterAtSnapshot`：生成时的预计压缩后 token，仅用于诊断和刷新判断。
@@ -284,7 +284,8 @@ checkpoint 不复制原始消息，不可原地更新。原始消息继续由 Pi
    - 使用 `sessionEntryToContextMessages` 构造 `messagesToSummarize` 和 `turnPrefixMessages`；
    - 保留 Pi 对 context-visible message、split turn、相邻 metadata 和 tool result 的边界语义；
    - 累计当前摘要范围及前次兼容 details 中的文件操作；
-   - 使用快照时的公开 usage 与 `estimateTokens` 计算 `tokensBefore`。
+   - 首次 checkpoint 使用快照时的公开 usage 与 `estimateTokens` 计算 `tokensBefore`；
+   - 增量 checkpoint 使用 parent 的 `tokensBefore` 加上 parent `snapshotLeafId` 后 context-visible session 消息的 `estimateTokens` 估算值。
 5. `firstKeptEntryId` 视为 preparation 生成的不透明 entry ID。它可以指向 user、assistant、bash execution、custom message、branch summary 或相邻的 context-invisible metadata；禁止自行限定为 user/assistant。
 6. 解析摘要请求运行时：
    - 捕获当前活动模型和 thinking level；
@@ -346,9 +347,11 @@ softLimit = floor(contextWindow * softThresholdPercent / 100)
 4. 通过 `ctx.sessionManager.getBranch()` 获取最新分支，并计算当前 `sessionId` 与 `epochCompactionId`。内部 manual 请求必须与 pending 记录的 session 和 epoch 相同；overflow 恢复还记录失败请求实际使用的虚拟 checkpoint ID。
 5. 从当前分支由新到旧扫描 `pi-press.precompaction` entry，依次执行 schema、完整 parent 链、版本、session、epoch 和分支先后顺序校验。内部请求只检查指定 checkpoint；overflow 只接受比失败请求所用 checkpoint 更新的候选。
 6. 确认 checkpoint 尚未被正式 compaction entry 的 `details.piPress.checkpointId` 引用，也未被当前 compaction attempt 领取。
-7. 使用 checkpoint 摘要和 `firstKeptEntryId` 模拟压缩后上下文：
+7. 根据当前分支计算本次正式 compaction 所代表的原始上下文量，并使用 checkpoint 摘要和 `firstKeptEntryId` 模拟压缩后上下文：
+   - `originalTokensBefore = checkpoint.compaction.tokensBefore + estimatedMessagesAfterSnapshot`；
+   - `estimatedMessagesAfterSnapshot` 是 `snapshotLeafId` 后 context-visible session 消息的 `estimateTokens` 估算值；
    - 通过公开 `buildSessionContext` 取得当前 active messages，并对其使用 `estimateTokens`；
-   - 计算 `fixedOverhead = max(0, currentPreparation.tokensBefore - currentMessagesEstimatedTokens)`，保留系统提示词、工具定义及其他未体现在消息字符数中的估算开销；
+   - 计算 `fixedOverhead = max(0, originalTokensBefore - currentMessagesEstimatedTokens)`，保留系统提示词、工具定义及其他未体现在消息字符数中的估算开销；
    - 以 checkpoint summary 作为 compaction summary；
    - 从当前分支的 `firstKeptEntryId` 开始，通过 `sessionEntryToContextMessages` 收集保留消息；
    - Pi-press custom entry 和其他 context-invisible metadata 不产生消息；
@@ -368,14 +371,14 @@ estimatedTokensAfter <= hardLimit
 11. 普通等待超时或取消时废弃并中止后台任务。overflow 等待超时、任务失败或没有更新 checkpoint 时保留 Pi 的默认处理，由 Pi 生成原生摘要并执行一次自动重试。
 12. 同一时间只允许一个 compaction hook 领取 checkpoint。
 
-返回值复用 checkpoint 的摘要、边界、usage 和原生文件 details，但 `tokensBefore` 使用当前 preparation 的值：
+返回值复用 checkpoint 的摘要、边界、usage 和原生文件 details。`tokensBefore` 表示 checkpoint 快照原始上下文及其后续 session 消息所代表的总量：
 
 ```ts
 {
   compaction: {
     summary: checkpoint.compaction.summary,
     firstKeptEntryId: checkpoint.compaction.firstKeptEntryId,
-    tokensBefore: currentPreparation.tokensBefore,
+    tokensBefore: originalTokensBefore,
     usage: checkpoint.compaction.usage,
     details: {
       ...(checkpoint.compaction.details ?? {}),
@@ -612,13 +615,13 @@ Promise
 - checkpoint v4、兼容 v3 根节点、parent 链、未知版本、非有限数字、空 summary、无效 usage/details 和损坏 entry 引用均有验证；
 - 生成结果在 `pi.appendEntry()` 前通过完整 checkpoint parser，非法 provenance 不得持久化；
 - `pi.appendEntry()` 写入的 checkpoint 和 metrics custom entry 不进入 LLM 上下文；
-- ready checkpoint 返回兼容 `CompactionResult`，并使用当前 preparation 的 `tokensBefore`；
+- ready checkpoint 返回兼容 `CompactionResult`，`tokensBefore` 等于 checkpoint 快照原始量加 `snapshotLeafId` 后 context-visible session 消息的估算量；
 - 正式 compaction details 同时保留 `readFiles`、`modifiedFiles` 和 `piPress`；
 - Pi 写入正式 compaction 后能够正确重建上下文，后续 Pi-press compaction 与原生回退均保留文件上下文；
 - session 重启后通过 `getEntries()`/`getBranch()` 恢复 ready checkpoint、epoch 和消费状态，不读取 JSONL 文件；
 - 同一 signal 内 checkpoint claim 保持独占，新的 compaction signal 可以恢复领取未消费候选；
 - snapshot key 只用于去重；当前叶子变化后，祖先兼容的 ready 或 in-flight checkpoint 仍可消费；
-- 模拟正式压缩后的 token 包含从当前 preparation 推导的 fixed overhead；超过 hard limit 时返回空结果。
+- 模拟正式压缩后的 token 包含从原始上下文量推导的 fixed overhead；超过 hard limit 时返回空结果。
 
 ### 虚拟上下文与正式化
 
@@ -687,7 +690,7 @@ Promise
 16. deferred 在同一叶节点静默跳过，新叶节点重新检查；`Nothing to compact (session too small)` 不产生 warning、`formalization_failed` 或失败次数，其他错误在同一 session 和 epoch 最多累计两次失败。
 17. 默认 `precomputeMode: "threshold"` 下，内部 `reason: "manual"` 事件通过 `pendingFormalization` 精确匹配并复用指定 checkpoint；使用者 `/compact` 只有在 `"threshold-and-manual"` 且无自定义指令时复用。
 18. 内部 checkpoint 在正式化时失效或超过 hard limit 时，Pi 原生摘要继续完成正式 compaction；overflow 和 `willRetry: true` 只复用比失败请求更新的 checkpoint，等待失败时保持 Pi 原生压缩和自动重试。
-19. 正式 `compaction` entry 只由 Pi 写入，包含摘要、边界、当前 `tokensBefore`、usage、原生文件 details 和 `details.piPress`；Pi 随后重建 `agent.state.messages`。
+19. 正式 `compaction` entry 只由 Pi 写入，包含摘要、边界、checkpoint 快照原始量与后续原始 session 消息估算量之和、usage、原生文件 details 和 `details.piPress`；Pi 随后重建 `agent.state.messages`。
 20. Pi 原生 compaction 在正式化回调前完成时以 `session_compact` 为准；`session_compact` 清除 virtual、deferred、pending、claim 和旧 epoch 任务，其后 `context` 使用 Pi 正式摘要和保留尾部。
 21. session 重启后，正式压缩成功的分支由 Pi 从正式 entry 重建；正式化尚未成功时，持久化 checkpoint 可以重新通过虚拟校验，并在后续 `agent_settled` 再次正式化。
 22. 当前叶子晚于 snapshot 时，祖先兼容的 checkpoint 仍可使用；分支切换和返回旧分支后按 session、祖先、epoch 和容量重新判断，snapshot key 不作为消费相等条件。
@@ -698,3 +701,4 @@ Promise
 27. `session_compact`、`onComplete`、`onError`、session shutdown 和分支事件以任意有效顺序到达时，状态清理保持幂等；正式化失败后，同一 Runtime 实例、session 和 epoch 最多重试一次。
 28. Pi-press 区分 virtual、consumed 和 discarded 统计；正式 compaction usage 不重复计费，未消费费用单独记录，成功、回退和保护能力不足均提供对应诊断。
 29. `npm run typecheck` 和 `npm test` 通过，并包含上述版本适配、provider、checkpoint、虚拟上下文、正式化、并发、生命周期和原生后备处理测试。
+30. `npm run test:smoke:pi` 使用当前 shell 环境中仓库外部的 Pi 可执行文件和当前 Pi 配置模型，报告实际可执行文件、版本、模型、checkpoint token、尾部 token 和正式 `tokensBefore`；checkpoint 基线加快照后原始消息估算量必须等于正式 compaction 的 `tokensBefore`。

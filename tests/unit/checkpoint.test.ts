@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { VERSION, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { estimateVirtualCheckpointCapacity } from "../../src/checkpoint/capacity.js";
 import {
   findReadyCheckpointCandidates,
@@ -32,7 +32,7 @@ function makeBranch(): { branch: SessionEntry[]; data: ReturnType<typeof makeChe
   return { branch: [first, snapshot, checkpoint], data };
 }
 
-test("checkpoint schema accepts current v4, rejects v4 algorithm 2, and reads v3 roots", () => {
+test("checkpoint schema accepts current v4, rejects old v4 algorithms, and reads v3 roots", () => {
   const { branch, data } = makeBranch();
   const legacy = {
     ...data,
@@ -49,12 +49,13 @@ test("checkpoint schema accepts current v4, rejects v4 algorithm 2, and reads v3
     parentCheckpointId: data.checkpointId,
   };
   assert.deepEqual(parseCheckpointData(current)?.parentCheckpointId, data.checkpointId);
+  assert.equal(parseCheckpointData({ ...current, algorithmVersion: 3 }), undefined);
   assert.equal(parseCheckpointData({ ...current, algorithmVersion: 2 }), undefined);
   assert.equal(parseCheckpointData({ ...current, version: 2 }), undefined);
   assert.equal(parseCheckpointData({ ...current, parentCheckpointId: "" }), undefined);
   assert.equal(parseCheckpointData({ ...current, compaction: { ...current.compaction, summary: "" } }), undefined);
   assert.equal(parseCheckpointData({ ...current, estimatedTokensAfterAtSnapshot: Number.NaN }), undefined);
-  assert.ok(parseCheckpointData(current, { piVersion: "0.84.1" }));
+  assert.ok(parseCheckpointData(current, { piVersion: VERSION }));
   assert.ok(branch.length > 0);
 });
 

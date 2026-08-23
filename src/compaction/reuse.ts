@@ -1,5 +1,35 @@
-import type { CompactionResult } from "@earendil-works/pi-coding-agent";
-import type { CheckpointCandidate, CompactionPreparation } from "../types.js";
+import {
+  estimateTokens,
+  sessionEntryToContextMessages,
+  type CompactionResult,
+  type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
+import type {
+  CheckpointCandidate,
+  CheckpointData,
+  CompactionPreparation,
+} from "../types.js";
+
+/** 计算 checkpoint 快照原始上下文及其后续 session 消息所代表的 token 数。 */
+export function calculateOriginalTokensBefore(
+  checkpoint: CheckpointData,
+  branch: readonly SessionEntry[],
+): number | undefined {
+  const snapshotIndex = branch.findIndex(
+    (entry) => entry.id === checkpoint.snapshotLeafId,
+  );
+  if (snapshotIndex < 0) {
+    return undefined;
+  }
+
+  return branch
+    .slice(snapshotIndex + 1)
+    .flatMap((entry) => sessionEntryToContextMessages(entry))
+    .reduce(
+      (total, message) => total + estimateTokens(message),
+      checkpoint.compaction.tokensBefore,
+    );
+}
 
 function getFileList(details: Record<string, unknown> | undefined, key: "readFiles" | "modifiedFiles"): string[] {
   const value = details?.[key];

@@ -77,7 +77,10 @@ npm install
 pi -e ./src/index.ts
 npm run typecheck
 npm test
+npm run test:smoke:pi
 ```
+
+`npm run test:smoke:pi` 使用当前 shell 环境中安装的 Pi 和当前配置模型执行真实 provider 冒烟测试，可能产生调用费用。该命令拒绝仓库本地 Pi；特殊环境可通过 `PI_BIN` 指定外部 Pi 可执行文件。
 
 项目入口由 `package.json` 的 `pi.extensions` 指向 `src/index.ts`。扩展结构、生命周期、并发、持久化和测试约束见[代码规范](https://github.com/sunnyx11/pi-press/blob/main/docs/CODE_STYLE.md)。
 

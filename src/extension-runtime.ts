@@ -30,7 +30,10 @@ import {
   DEFAULT_CONFIG,
 } from "./config.js";
 import { Diagnostics } from "./diagnostics.js";
-import { buildCheckpointCompactionResult } from "./compaction/reuse.js";
+import {
+  buildCheckpointCompactionResult,
+  calculateOriginalTokensBefore,
+} from "./compaction/reuse.js";
 import {
   tryProjectCheckpointToVirtualContext,
   VirtualContextProjectionCache,
@@ -1045,16 +1048,32 @@ export class ExtensionRuntime {
     if (!this.isCurrentTask(task)) {
       return;
     }
-    const preparation = prepareCompactionFromBranch(
+    const nativePreparation = prepareCompactionFromBranch(
       task.branchEntries,
       createCheckpointPreparationSettings(task.config),
       task.parentCheckpoint,
     );
-    if (!preparation) {
+    if (!nativePreparation) {
       const message = "当前分支无法构造可用 preparation";
       this.diagnostics.count("task_skipped_no_preparation");
       this.diagnostics.record("task", message);
       return;
+    }
+    let preparation = nativePreparation;
+    if (task.parentCheckpoint) {
+      const tokensBefore = calculateOriginalTokensBefore(
+        task.parentCheckpoint,
+        task.branchEntries,
+      );
+      if (tokensBefore === undefined) {
+        this.diagnostics.count("task_skipped_original_tokens_unavailable");
+        this.diagnostics.record(
+          "checkpoint",
+          `checkpoint ${task.parentCheckpoint.checkpointId}：无法计算原始上下文 token 数`,
+        );
+        return;
+      }
+      preparation = { ...nativePreparation, tokensBefore };
     }
     task.firstKeptEntryId = preparation.firstKeptEntryId;
     if (!this.isCurrentTask(task)) {
@@ -1355,10 +1374,20 @@ export class ExtensionRuntime {
       ) {
         continue;
       }
+      const tokensBefore = calculateOriginalTokensBefore(candidate.data, branch);
+      if (tokensBefore === undefined) {
+        this.diagnostics.count("checkpoint_rejected_original_tokens_unavailable");
+        this.diagnostics.record(
+          "checkpoint",
+          `checkpoint ${candidate.data.checkpointId}：无法计算原始上下文 token 数`,
+        );
+        continue;
+      }
+      const preparation = { ...event.preparation, tokensBefore };
       const capacity = estimateCheckpointCapacity(
         branch,
         candidate.data,
-        event.preparation,
+        preparation,
         model.contextWindow,
       );
       if (!capacity) {
@@ -1379,7 +1408,7 @@ export class ExtensionRuntime {
         this.notifyWarning(`checkpoint 容量不足，已回退 Pi 原生压缩：${message}。`);
         continue;
       }
-      const result = buildCheckpointCompactionResult(candidate, event.preparation);
+      const result = buildCheckpointCompactionResult(candidate, preparation);
       this.claimCheckpoint(candidate.data.checkpointId, event.signal);
       if (this.inFlightTask && this.inFlightTask.epochCompactionId === epochCompactionId) {
         this.discardTask(this.inFlightTask, "checkpoint_reused");
