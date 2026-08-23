@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-23
+
+### Fixed
+
+- 正式压缩和增量 checkpoint 的 `tokensBefore` 以 checkpoint 已摘要的原始历史为基线，并计入快照后的原始 session 消息，避免虚拟上下文 usage 低估正式压缩前的历史量。
+
 ## [0.3.1] - 2026-08-21
 
 ### Fixed
@@ -73,7 +79,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/sunnyx11/pi-press/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/sunnyx11/pi-press/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sunnyx11/pi-press/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/sunnyx11/pi-press/compare/v0.2.1...v0.2.2
