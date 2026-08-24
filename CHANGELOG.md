@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-08-24
+
+### Fixed
+
+- 长时间 agent 运行接近 Pi 正式压缩阈值时，`context` 会等待正在生成的兼容 checkpoint；没有兼容任务时启动紧急预压缩，避免请求在 checkpoint ready 前继续扩大原始上下文。
+- 请求前临界值按活动模型的 `contextWindow` 和 Pi 当前生效的 `compaction.reserveTokens` 计算；临界值之前继续发送 provider 请求，临界等待使用后台任务剩余的 `taskTimeoutMs`。
+
 ## [0.3.2] - 2026-08-23
 
 ### Fixed
@@ -79,7 +86,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/sunnyx11/pi-press/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/sunnyx11/pi-press/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/sunnyx11/pi-press/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sunnyx11/pi-press/compare/v0.2.2...v0.3.0
