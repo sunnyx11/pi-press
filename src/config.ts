@@ -177,6 +177,15 @@ export function loadPiCompactionKeepRecentTokens(
   return SettingsManager.create(cwd, agentDir, { projectTrusted }).getCompactionKeepRecentTokens();
 }
 
+/** 读取与 Pi 正式压缩一致的上下文预留 token 数。 */
+export function loadPiCompactionReserveTokens(
+  cwd: string,
+  projectTrusted: boolean,
+  agentDir = getAgentDir(),
+): number {
+  return SettingsManager.create(cwd, agentDir, { projectTrusted }).getCompactionReserveTokens();
+}
+
 /** 返回参与 snapshot key 的配置指纹。 */
 export function configFingerprint(config: PiPressConfig): string {
   return createHash("sha256").update(stableConfigText(config)).digest("hex");

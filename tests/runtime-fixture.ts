@@ -65,7 +65,10 @@ export function createScenario(
   writeFileSync(
     join(cwd, ".pi", "settings.json"),
     JSON.stringify({
-      compaction: { keepRecentTokens: DEFAULT_COMPACTION_SETTINGS.keepRecentTokens },
+      compaction: {
+        keepRecentTokens: DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+        reserveTokens: DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+      },
     }),
   );
 

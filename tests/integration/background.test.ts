@@ -149,6 +149,7 @@ test("context applies a ready checkpoint and settled formalization runs after th
     assert.ok(contextResult?.messages);
     assert.equal(contextResult.messages[0]?.role, "compactionSummary");
     assert.equal(scenario.runtime.getDiagnostics().counters.virtual_applied, 1);
+    assert.equal(scenario.runtime.getDiagnostics().counters.critical_wait_started ?? 0, 0);
 
     scenario.runtime.onTurnEnd(ctx);
     await new Promise((resolve) => setTimeout(resolve, 20));

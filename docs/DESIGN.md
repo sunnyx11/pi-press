@@ -7,7 +7,7 @@
 核心目标：
 
 - 上下文使用量达到约 80% 时，在后台提前生成一份预压缩结果。
-- 后台任务执行期间，当前 agent 继续运行，不中止当前操作。
+- 后台任务执行期间，当前 agent 在临界等待区之前继续运行；进入临界等待区后，下一次 provider 请求等待兼容任务完成。
 - 预压缩结果持久化到当前 session 的 JSONL 文件。
 - checkpoint ready 后，在每次 provider 请求前通过 `context` 事件生成“预压缩摘要 + 当前未压缩尾部”的虚拟压缩上下文，避免同一 agent 运行中的连续工具调用使请求超过上下文窗口。
 - 虚拟压缩只替换当次请求的消息副本，不修改 Pi 的 session entry 或 `agent.state.messages`。
@@ -89,12 +89,14 @@ pi.appendEntry() 追加 pi-press custom checkpoint
         v
 每次 provider 请求前触发 context
         |
-        +-- checkpoint 未 ready 或校验失败 --> 保持原消息
+        +-- checkpoint ready --> 返回虚拟 compaction summary + 当前保留尾部
         |
-        `-- checkpoint ready --> 返回虚拟 compaction summary + 当前保留尾部
+        +-- checkpoint 未 ready 且低于临界值 --> 保持原消息
+        |
+        `-- checkpoint 未 ready 且达到临界值 --> 等待兼容任务或启动紧急预压缩
                                       |
                                       v
-                              provider 只接收虚拟压缩上下文
+                              provider 接收 context 处理后的请求上下文
                                       |
                                       v
                         后续 assistant/toolResult 仍写入原始 session
@@ -129,7 +131,7 @@ pi.appendEntry() 追加 pi-press custom checkpoint
 
 checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只在 `context` 返回值中使用其摘要；最终生效的 `type: "compaction"` entry 仍由 Pi 写入。Pi 原生压缩优先；如果原生检查没有写入正式 entry，Pi-press 才在 `agent_settled` 后调用 `ctx.compact()`。正式压缩完成后，session 恢复、分支和 TUI 继续使用 Pi 的实现。
 
-如果后台 checkpoint 未完成、已失效或当前虚拟上下文超过安全容量，`context` 返回原消息并记录诊断；如果正式 compaction 时 checkpoint 不可复用，`session_before_compact` 返回空结果，由 Pi 使用原生摘要流程。
+后台 checkpoint 未完成时，`context` 在临界值之前返回原消息；达到临界值后等待兼容任务或启动紧急预压缩。任务失败、任务超时、checkpoint 已失效或当前虚拟上下文超过安全容量时，`context` 返回原消息并记录诊断。如果正式 compaction 时 checkpoint 不可复用，`session_before_compact` 返回空结果，由 Pi 使用原生摘要流程。
 
 ## 触发规则
 
@@ -141,7 +143,7 @@ checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只
 - 默认软阈值为活动模型上下文窗口的 80%。该值是最早启动点，不是复用 checkpoint 的充分条件。
 - 达到阈值但当前分支无法构造可用 preparation 时，记录诊断并静默跳过；后续 `turn_end` 可以再次尝试。
 - checkpoint 只有在 `pi.appendEntry()` 成功返回后才能显示预压缩成功；生成失败、超时或追加失败显示 CLI error，生成阶段容量不足显示 CLI warning。
-- Pi-press 通过 `precomputeMode: "off" | "threshold" | "threshold-and-manual"` 明确控制是否生成和消费检查点，默认值为 `"threshold"`。该开关独立于 Pi 的 auto-compaction 开关；正式化边界只通过 Pi 公开 `SettingsManager` 获取 `compaction.keepRecentTokens`。
+- Pi-press 通过 `precomputeMode: "off" | "threshold" | "threshold-and-manual"` 明确控制是否生成和消费检查点，默认值为 `"threshold"`。该开关独立于 Pi 的 auto-compaction 开关；Pi compaction 的保留量通过公开 `SettingsManager` 获取。
 - 同一 session、同一正式 compaction epoch 和同一 snapshot key 同时只运行一个后台任务。
 - snapshot key 由 session ID、正式 compaction epoch、`snapshotSourceLeafId`、Pi 版本、preparation 算法版本、摘要格式版本和 preparation 配置 fingerprint 组成，只用于后台去重。生成模型和 thinking level 只写入 provenance，不参与该键。
 - 后台任务不会调用 `ctx.compact()`，避免中止当前 agent 操作。
@@ -157,7 +159,8 @@ checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只
 - 虚拟上下文由一个 `role: "compactionSummary"` 消息和 `firstKeptEntryId` 开始的当前 context-visible 消息组成，使用 Pi 的公开 entry-to-message 语义构造。
 - 新增 assistant 消息、工具结果、steering 消息和 follow-up 消息在下一次 `context` 事件中进入当前尾部，不修改 checkpoint 摘要。
 - 虚拟转换不得修改 `event.messages`、`agent.state.messages` 或 SessionManager 返回的数据；必须返回新数组和新建的摘要消息。
-- 虚拟上下文预计大小超过 `softThresholdPercent` 时可以继续使用已有虚拟上下文，但必须请求下一代 checkpoint；超过 hard limit 时不得将该候选标记为已应用，应在 `hookWaitTimeoutMs` 内等待已有的兼容刷新任务，仍无可用候选时返回事件原消息并记录诊断。
+- 虚拟上下文预计大小超过 `softThresholdPercent` 时可以继续使用已有虚拟上下文，但必须请求下一代 checkpoint；超过 hard limit 时不得将该候选标记为已应用。
+- 每次 `context` 事件按当前模型和 Pi `compaction.reserveTokens` 计算临界值：`max(0, contextWindow - reserveTokens - max(4096, ceil(contextWindow * 0.02)))`。`ctx.getContextUsage().tokens` 达到该值且没有 ready checkpoint 时，处理器等待兼容任务至其剩余 `taskTimeoutMs`；没有兼容任务时启动一次跳过软阈值检查的紧急预压缩并按相同期限等待。任务失败或超时后返回事件原消息。低于临界值但虚拟候选超过 hard limit 时，处理器按 `hookWaitTimeoutMs` 等待已有刷新任务。
 - `context` 与其他扩展按注册顺序串行执行。Pi-press 必须证明当前事件消息与 SessionManager 派生的边界能够无歧义对应；无法保留其他扩展的上下文变换时返回事件原消息，禁止静默丢弃其他扩展注入的消息。
 - checkpoint 首次成功用于请求时记录 checkpoint ID、session ID 和 epoch。后续每次成功应用更新使用状态；更新一代 checkpoint 无需先用于 `context`，`agent_settled` 正式化仍可选择该 epoch 最新有效 checkpoint。
 - 正式 compaction entry 出现、session 或分支变化、checkpoint 失效以及 `precomputeMode: "off"` 时立即停止应用旧虚拟状态。
@@ -190,13 +193,13 @@ Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项�
 | `softThresholdPercent` | `80` | 首次预压缩与后续增量刷新的上下文百分比 |
 | `summaryReserveTokens` | `16384` | 传给 preparation 的摘要输出预算 |
 | `taskTimeoutMs` | `300000` | 单次后台任务总超时 |
-| `hookWaitTimeoutMs` | `1000` | 虚拟上下文超过 hard limit 时等待兼容刷新任务的最长时间 |
+| `hookWaitTimeoutMs` | `1000` | 正式压缩 hook 与临界值之前的 hard-limit 场景等待兼容任务的最长时间；临界 `context` 等待使用任务自身的剩余 `taskTimeoutMs` |
 
-checkpoint preparation 固定使用 `keepRecentTokens: 10000`，用于在 checkpoint 中保存约 10000 token 的原始近期消息。正式化 preparation 使用 Pi `SettingsManager.getCompactionKeepRecentTokens()` 返回的当前生效值；该管理器合并全局与受信任项目的 `settings.json`，字段缺失时返回 Pi 默认值，当前默认值为 `20000`。后台摘要请求固定允许一次瞬时错误重试。同一正式 compaction epoch 可连续刷新 checkpoint，每一代继承 parent 摘要并只处理新增历史。
+checkpoint preparation 固定使用 `keepRecentTokens: 10000`，用于在 checkpoint 中保存约 10000 token 的原始近期消息。正式化 preparation 使用 Pi `SettingsManager.getCompactionKeepRecentTokens()` 返回的当前生效值；请求前临界值使用 `SettingsManager.getCompactionReserveTokens()` 返回的当前生效值。该管理器合并全局与受信任项目的 `settings.json`，字段缺失时返回 Pi 默认值。后台摘要请求固定允许一次瞬时错误重试。同一正式 compaction epoch 可连续刷新 checkpoint，每一代继承 parent 摘要并只处理新增历史。
 
-压缩后 token 校验预留 `max(4096, ceil(contextWindow * 0.02))` 的容量余量。预计上下文达到 `softThresholdPercent` 时启动下一代任务，超过 hard limit 的 checkpoint 不用于 provider 请求或正式复用。实现必须校验百分比、token 和超时字段的范围；`taskTimeoutMs` 与 `hookWaitTimeoutMs` 必须是 `1..2147483647` 范围内的整数，无效字段使用默认值并记录诊断。旧版 `targetPostCompactionPercent` 字段只记录一次警告并忽略，不参与 fingerprint。
+容量校验与请求前临界等待均预留 `max(4096, ceil(contextWindow * 0.02))` 的容量余量。预计上下文达到 `softThresholdPercent` 时启动下一代任务，超过 hard limit 的 checkpoint 不用于 provider 请求或正式复用。临界等待值随每次事件的活动模型 `contextWindow` 和 Pi `compaction.reserveTokens` 计算，不属于 Pi-press 配置。实现必须校验百分比、token 和超时字段的范围；`taskTimeoutMs` 与 `hookWaitTimeoutMs` 必须是 `1..2147483647` 范围内的整数，无效字段使用默认值并记录诊断。旧版 `targetPostCompactionPercent` 字段只记录一次警告并忽略，不参与 fingerprint。
 
-正式化保留量属于 Pi settings，不属于 Pi-press 配置，也不参与配置 fingerprint。Pi-press 不自行解析 Pi settings 文件。配置 fingerprint 参与 snapshot key，防止同一内容在不同 checkpoint 生成配置下错误去重。已生成 checkpoint 不因模型、thinking level 或预算配置变化自动失效；虚拟应用和正式消费时均按当前模型重新校验容量。`precomputeMode` 为 `"off"` 时中止 in-flight 任务、取消正式化调度、清除 deferred、pending 和虚拟状态，并停止消费 ready checkpoint；已经交给 Pi 的正式 compaction 由宿主继续完成。
+Pi compaction 的保留量属于 Pi settings，不属于 Pi-press 配置，也不参与配置 fingerprint。Pi-press 通过公开 `SettingsManager` 读取生效值，不自行解析 Pi settings 文件。配置 fingerprint 参与 snapshot key，防止同一内容在不同 checkpoint 生成配置下错误去重。已生成 checkpoint 不因模型、thinking level 或预算配置变化自动失效；虚拟应用和正式消费时均按当前模型重新校验容量。`precomputeMode` 为 `"off"` 时中止 in-flight 任务、取消正式化调度、清除 deferred、pending 和虚拟状态，并停止消费 ready checkpoint；已经交给 Pi 的正式 compaction 由宿主继续完成。
 
 ## 预压缩检查点 JSONL 契约
 
@@ -331,9 +334,11 @@ softLimit = floor(contextWindow * softThresholdPercent / 100)
 
 消息转换后 token 减少时不从快照估算中扣减；任一消息无法估算时返回 `event.messages`。
 
-9. `estimatedVirtualTokens <= hardLimit` 时应用候选；达到 `softLimit` 时在后续 `turn_end` 请求下一代 checkpoint。超过 hard limit 时先在 `hookWaitTimeoutMs` 内等待已经存在的兼容刷新任务；仍无可用候选时返回事件原消息并记录诊断，禁止丢弃尚未进入摘要的尾部消息。
-10. 返回新数组后记录本次实际使用的 checkpoint ID、session、epoch 和事件时的 branch leaf。后续请求重复执行全部校验，不能仅依赖内存标记。
-11. handler 内部错误不得向 agent-core 抛出；记录诊断并返回 `event.messages`。该后备处理保持消息语义，但在没有可用 checkpoint 时不能保证 provider 请求低于上下文窗口。
+9. `estimatedVirtualTokens <= hardLimit` 时应用候选；达到 `softLimit` 时在后续 `turn_end` 请求下一代 checkpoint。
+10. 没有候选成功应用，且 `ctx.getContextUsage().tokens` 达到 `max(0, contextWindow - Pi reserveTokens - safetyMargin)` 时，等待已经存在的兼容任务至其剩余 `taskTimeoutMs`；没有兼容任务时为当前分支启动紧急预压缩并等待。等待结束后重新扫描一次 ready checkpoint。任务失败、任务超时或仍无可用候选时返回事件原消息。
+11. 低于临界值且候选超过 hard limit 时，在 `hookWaitTimeoutMs` 内等待已经存在的兼容刷新任务；仍无可用候选时返回事件原消息并记录诊断，禁止丢弃尚未进入摘要的尾部消息。
+12. 返回新数组后记录本次实际使用的 checkpoint ID、session、epoch 和事件时的 branch leaf。后续请求重复执行全部校验，不能仅依赖内存标记。
+13. handler 内部错误不得向 agent-core 抛出；记录诊断并返回 `event.messages`。该后备处理保持消息语义，但在没有可用 checkpoint 时不能保证 provider 请求低于上下文窗口。
 
 虚拟压缩后的 provider usage 只描述虚拟摘要和当前尾部。`ctx.getContextUsage()` 以及 Pi 的 threshold 检查可能因此保持在正式阈值以下，这正是 `agent_settled` 后主动正式化的必要原因。
 

@@ -13,7 +13,10 @@ import {
   type SessionCompactEvent,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { estimateCheckpointCapacity } from "./checkpoint/capacity.js";
+import {
+  calculateCriticalWaitTokens,
+  estimateCheckpointCapacity,
+} from "./checkpoint/capacity.js";
 import {
   findReadyCheckpointCandidates,
   getEpochCompactionId,
@@ -25,6 +28,7 @@ import { isJsonObject, isUsage, parseCheckpointData } from "./checkpoint/schema.
 import {
   loadConfig,
   loadPiCompactionKeepRecentTokens,
+  loadPiCompactionReserveTokens,
   createSnapshotKey,
   configFingerprint,
   DEFAULT_CONFIG,
@@ -352,6 +356,19 @@ export class ExtensionRuntime {
       return { messages: projection.messages };
     }
 
+    if (allowWait && this.isCriticalWaitRequired(ctx)) {
+      let task = this.findCompatibleTask(ctx);
+      if (!task) {
+        task = this.startBackgroundTaskIfEligible(ctx, true);
+        if (task) {
+          this.diagnostics.count("critical_task_started");
+        }
+      }
+      if (task) {
+        return this.waitForCriticalCheckpoint(event, ctx, task);
+      }
+    }
+
     if (hardLimitExceeded && allowWait && this.currentConfig.hookWaitTimeoutMs > 0) {
       const task = this.findCompatibleTask(ctx);
       if (task) {
@@ -368,6 +385,60 @@ export class ExtensionRuntime {
     }
     this.diagnostics.count("virtual_skipped");
     return { messages: event.messages };
+  }
+
+  private isCriticalWaitRequired(ctx: ExtensionContext): boolean {
+    const usage = ctx.getContextUsage();
+    const model = asModel(ctx.model);
+    if (
+      usage?.tokens == null ||
+      !Number.isFinite(usage.tokens) ||
+      !model ||
+      !Number.isFinite(model.contextWindow) ||
+      model.contextWindow <= 0
+    ) {
+      return false;
+    }
+    const criticalWaitTokens = calculateCriticalWaitTokens(
+      model.contextWindow,
+      loadPiCompactionReserveTokens(ctx.cwd, ctx.isProjectTrusted()),
+    );
+    return criticalWaitTokens !== undefined && usage.tokens >= criticalWaitTokens;
+  }
+
+  private async waitForCriticalCheckpoint(
+    event: ContextEvent,
+    ctx: ExtensionContext,
+    task: BackgroundTask,
+  ): Promise<Pick<ContextEvent, "messages">> {
+    const timeoutMs = this.remainingTaskTime(task);
+    if (timeoutMs <= 0) {
+      this.diagnostics.count("critical_wait_timed_out");
+      this.diagnostics.count("virtual_skipped");
+      return { messages: event.messages };
+    }
+
+    this.diagnostics.count("critical_wait_started");
+    const waitOutcome = await this.waitForTask(
+      task,
+      timeoutMs,
+      new AbortController().signal,
+    );
+    if (
+      waitOutcome !== "finished" ||
+      task.runEpoch !== this.runEpoch ||
+      task.sessionId !== this.currentSessionId
+    ) {
+      if (waitOutcome === "timeout") {
+        this.diagnostics.count("critical_wait_timed_out");
+        this.diagnostics.record("capacity", "临界上下文等待预压缩任务超时。");
+      }
+      this.diagnostics.count("virtual_skipped");
+      return { messages: event.messages };
+    }
+
+    this.diagnostics.count("critical_waited");
+    return await this.applyVirtualContext(event, ctx, false);
   }
 
   private async waitForVirtualRefresh(
@@ -507,6 +578,14 @@ export class ExtensionRuntime {
     if (config.precomputeMode === "off") {
       return;
     }
+    this.startBackgroundTaskIfEligible(ctx, false);
+  }
+
+  private startBackgroundTaskIfEligible(
+    ctx: ExtensionContext,
+    bypassThreshold: boolean,
+  ): BackgroundTask | undefined {
+    const config = this.currentConfig;
     const usage = ctx.getContextUsage();
     const usageKnown = Boolean(
       usage &&
@@ -518,7 +597,7 @@ export class ExtensionRuntime {
     const model = asModel(ctx.model);
     if (!model || !Number.isFinite(model.contextWindow) || model.contextWindow <= 0) {
       this.diagnostics.count("threshold_skipped_unknown_model");
-      return;
+      return undefined;
     }
 
     const branchEntries = ctx.sessionManager.getBranch();
@@ -527,7 +606,7 @@ export class ExtensionRuntime {
     const snapshotSourceLeafId = getSnapshotSourceLeafId(branchEntries);
     if (!snapshotLeafId || !snapshotSourceLeafId) {
       this.diagnostics.count("threshold_skipped_empty_branch");
-      return;
+      return undefined;
     }
     const epochCompactionId = getEpochCompactionId(branchEntries);
     const candidates = findReadyCheckpointCandidates(
@@ -548,13 +627,13 @@ export class ExtensionRuntime {
       virtualCandidate &&
       (virtualRefreshRequested || this.shouldRefresh(virtualCandidate, branchEntries, model, config)),
     );
-    if (!virtualRefreshNeeded) {
+    if (!bypassThreshold && !virtualRefreshNeeded) {
       if (!usageKnown) {
         this.diagnostics.count("threshold_skipped_unknown_usage");
-        return;
+        return undefined;
       }
       if (usage!.percent! < config.softThresholdPercent) {
-        return;
+        return undefined;
       }
     }
 
@@ -565,7 +644,7 @@ export class ExtensionRuntime {
       config,
     );
     if (this.inFlightTask || sharedRuntimeState.activeBackgroundOperation) {
-      return;
+      return undefined;
     }
 
     const existingCandidate = candidates[0];
@@ -579,15 +658,15 @@ export class ExtensionRuntime {
       !existingRefreshRequested &&
       !this.shouldRefresh(existingCandidate, branchEntries, model, config)
     ) {
-      return;
+      return undefined;
     }
 
     const attempts = this.attemptsBySnapshotKey.get(snapshotKey) ?? 0;
     if (attempts > MAX_BACKGROUND_RETRIES) {
-      return;
+      return undefined;
     }
     this.attemptsBySnapshotKey.set(snapshotKey, attempts + 1);
-    this.startBackgroundTask({
+    const task = this.startBackgroundTask({
       sessionId,
       snapshotLeafId,
       snapshotSourceLeafId,
@@ -600,11 +679,13 @@ export class ExtensionRuntime {
       ...(existingCandidate === undefined ? {} : { parentCheckpoint: existingCandidate.data }),
     });
     if (
+      task &&
       existingCandidate &&
       this.virtualApplication?.checkpointId === existingCandidate.data.checkpointId
     ) {
       this.virtualApplication.refreshRequested = false;
     }
+    return task;
   }
 
   async beforeCompact(
@@ -990,9 +1071,9 @@ export class ExtensionRuntime {
 
   private startBackgroundTask(
     input: Omit<BackgroundTask, "runEpoch" | "controller" | "startedAt" | "discarded">
-  ): void {
+  ): BackgroundTask | undefined {
     if (sharedRuntimeState.activeBackgroundOperation) {
-      return;
+      return undefined;
     }
     const task: BackgroundTask = {
       ...input,
@@ -1022,6 +1103,7 @@ export class ExtensionRuntime {
         this.finishTask(task);
       },
     );
+    return task;
   }
 
   private async runBackgroundTask(

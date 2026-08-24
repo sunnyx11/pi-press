@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { VERSION, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { estimateVirtualCheckpointCapacity } from "../../src/checkpoint/capacity.js";
+import {
+  calculateCriticalWaitTokens,
+  estimateVirtualCheckpointCapacity,
+} from "../../src/checkpoint/capacity.js";
 import {
   findReadyCheckpointCandidates,
   getConsumedCheckpointIds,
@@ -97,6 +100,14 @@ test("virtual checkpoint refresh starts exactly at the soft threshold", () => {
   assert.ok(capacity);
   assert.equal(capacity.estimatedTokens, capacity.refreshLimit);
   assert.equal(capacity.needsRefresh, true);
+});
+
+test("critical wait threshold follows the Pi reserve and context safety margin", () => {
+  assert.equal(calculateCriticalWaitTokens(200_000, 50_000), 145_904);
+  assert.equal(calculateCriticalWaitTokens(1_000_000, 100_000), 880_000);
+  assert.equal(calculateCriticalWaitTokens(4_000, 5_000), 0);
+  assert.equal(calculateCriticalWaitTokens(0, 1_000), undefined);
+  assert.equal(calculateCriticalWaitTokens(100_000, -1), undefined);
 });
 
 test("selection validates every checkpoint parent against the current branch", () => {

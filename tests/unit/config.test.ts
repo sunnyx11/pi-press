@@ -13,6 +13,7 @@ import {
   createSnapshotKey,
   loadConfig,
   loadPiCompactionKeepRecentTokens,
+  loadPiCompactionReserveTokens,
   normalizeConfig,
 } from "../../src/config.js";
 
@@ -129,19 +130,26 @@ test("formalization retention comes from Pi settings with Pi defaults", () => {
       loadPiCompactionKeepRecentTokens(projectDir, true, agentDir),
       DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
     );
+    assert.equal(
+      loadPiCompactionReserveTokens(projectDir, true, agentDir),
+      DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+    );
 
     writeFileSync(
       join(agentDir, "settings.json"),
-      JSON.stringify({ compaction: { keepRecentTokens: 25_000 } }),
+      JSON.stringify({ compaction: { keepRecentTokens: 25_000, reserveTokens: 40_000 } }),
     );
     assert.equal(loadPiCompactionKeepRecentTokens(projectDir, true, agentDir), 25_000);
+    assert.equal(loadPiCompactionReserveTokens(projectDir, true, agentDir), 40_000);
 
     writeFileSync(
       join(projectDir, ".pi", "settings.json"),
-      JSON.stringify({ compaction: { keepRecentTokens: 30_000 } }),
+      JSON.stringify({ compaction: { keepRecentTokens: 30_000, reserveTokens: 50_000 } }),
     );
     assert.equal(loadPiCompactionKeepRecentTokens(projectDir, true, agentDir), 30_000);
     assert.equal(loadPiCompactionKeepRecentTokens(projectDir, false, agentDir), 25_000);
+    assert.equal(loadPiCompactionReserveTokens(projectDir, true, agentDir), 50_000);
+    assert.equal(loadPiCompactionReserveTokens(projectDir, false, agentDir), 40_000);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

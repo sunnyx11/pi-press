@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext, SessionCompactEvent } from "@earendil-works/pi-coding-agent";
@@ -253,6 +254,217 @@ test("overflow falls back to Pi after the refresh task reaches its remaining tim
   } finally {
     scenario.runtime.onSessionShutdown();
     await new Promise((resolve) => setTimeout(resolve, 160));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("critical context waits for an in-flight precompaction task", async () => {
+  let resolveStarted!: () => void;
+  let resolveResponse!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const responseGate = new Promise<void>((resolve) => {
+    resolveResponse = resolve;
+  });
+  const response: ResponseFactory = async () => {
+    resolveStarted();
+    await responseGate;
+    return fauxAssistantMessage("critical checkpoint summary");
+  };
+  const scenario = createScenario(
+    { softThresholdPercent: 60, taskTimeoutMs: 500 },
+    response,
+  );
+  writeFileSync(
+    join(scenario.cwd, ".pi", "settings.json"),
+    JSON.stringify({ compaction: { keepRecentTokens: 1, reserveTokens: 30_000 } }),
+  );
+  const criticalCtx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: 70_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 70,
+    }),
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(criticalCtx);
+    await started;
+
+    let settled = false;
+    const contextPromise = Promise.resolve(scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, criticalCtx)).then((result) => {
+      settled = true;
+      return result;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(settled, false);
+    resolveResponse();
+    const result = await contextPromise;
+    assert.equal(result.messages[0]?.role, "compactionSummary");
+    assert.equal(
+      (result.messages[0] as { summary?: string }).summary,
+      "critical checkpoint summary",
+    );
+    assert.equal(scenario.runtime.getDiagnostics().counters.critical_waited, 1);
+  } finally {
+    resolveResponse();
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("context below the critical threshold does not wait for an in-flight task", async () => {
+  let resolveStarted!: () => void;
+  let resolveResponse!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const responseGate = new Promise<void>((resolve) => {
+    resolveResponse = resolve;
+  });
+  const response: ResponseFactory = async () => {
+    resolveStarted();
+    await responseGate;
+    return fauxAssistantMessage("background checkpoint summary");
+  };
+  const scenario = createScenario(
+    { softThresholdPercent: 60, taskTimeoutMs: 500 },
+    response,
+  );
+  const belowCriticalCtx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: 70_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 70,
+    }),
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(belowCriticalCtx);
+    await started;
+    const sourceMessages = scenario.manager.buildSessionContext().messages;
+
+    const result = await scenario.runtime.onContext({
+      type: "context",
+      messages: sourceMessages,
+    }, belowCriticalCtx);
+
+    assert.equal(result.messages, sourceMessages);
+    assert.equal(scenario.runtime.getDiagnostics().counters.critical_wait_started ?? 0, 0);
+  } finally {
+    resolveResponse();
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("critical context falls back when the task reaches its own timeout", async () => {
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const scenario = createScenario(
+    { softThresholdPercent: 80, taskTimeoutMs: 20 },
+    delayedResponse(120, resolveStarted),
+  );
+  const criticalCtx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: 80_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 80,
+    }),
+  } as ExtensionContext;
+
+  try {
+    scenario.runtime.onTurnEnd(criticalCtx);
+    await started;
+    const sourceMessages = scenario.manager.buildSessionContext().messages;
+
+    const result = await scenario.runtime.onContext({
+      type: "context",
+      messages: sourceMessages,
+    }, criticalCtx);
+
+    assert.equal(result.messages, sourceMessages);
+    assert.equal(scenario.appended.length, 0);
+    await waitFor(() => Boolean(scenario.runtime.getDiagnostics().counters.task_timed_out));
+    assert.equal(scenario.runtime.getDiagnostics().counters.task_timed_out, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("critical context starts emergency precompaction when no task exists", async () => {
+  let resolveStarted!: () => void;
+  let resolveResponse!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const responseGate = new Promise<void>((resolve) => {
+    resolveResponse = resolve;
+  });
+  const response: ResponseFactory = async () => {
+    resolveStarted();
+    await responseGate;
+    return fauxAssistantMessage("emergency checkpoint summary");
+  };
+  const scenario = createScenario(
+    { softThresholdPercent: 90, taskTimeoutMs: 500 },
+    response,
+  );
+  const criticalCtx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: 80_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 80,
+    }),
+  } as ExtensionContext;
+
+  try {
+    let settled = false;
+    const contextPromise = Promise.resolve(scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, criticalCtx)).then((result) => {
+      settled = true;
+      return result;
+    });
+    const taskStarted = await Promise.race([
+      started.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 30)),
+    ]);
+    assert.equal(taskStarted, true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(settled, false);
+    assert.equal(scenario.faux.state.callCount, 1);
+    assert.equal(scenario.runtime.getDiagnostics().counters.critical_task_started, 1);
+
+    resolveResponse();
+    const result = await contextPromise;
+    assert.equal(result.messages[0]?.role, "compactionSummary");
+    assert.equal(
+      (result.messages[0] as { summary?: string }).summary,
+      "emergency checkpoint summary",
+    );
+    assert.equal(scenario.runtime.getDiagnostics().counters.critical_waited, 1);
+  } finally {
+    resolveResponse();
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     rmSync(scenario.cwd, { recursive: true, force: true });
   }
 });

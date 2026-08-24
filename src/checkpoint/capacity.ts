@@ -44,6 +44,31 @@ export type VirtualCheckpointCapacityEstimate = {
   needsRefresh: boolean;
 };
 
+/** 计算上下文容量检查共用的安全余量。 */
+export function calculateContextSafetyMargin(contextWindow: number): number | undefined {
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
+    return undefined;
+  }
+  return Math.max(4_096, Math.ceil(contextWindow * 0.02));
+}
+
+/** 计算请求前等待预压缩任务的 token 临界值。 */
+export function calculateCriticalWaitTokens(
+  contextWindow: number,
+  piCompactionReserveTokens: number,
+): number | undefined {
+  const safetyMargin = calculateContextSafetyMargin(contextWindow);
+  if (
+    safetyMargin === undefined ||
+    !Number.isFinite(piCompactionReserveTokens) ||
+    piCompactionReserveTokens < 0
+  ) {
+    return undefined;
+  }
+  const piCompactionThreshold = contextWindow - piCompactionReserveTokens;
+  return Math.max(0, piCompactionThreshold - safetyMargin);
+}
+
 export function estimateVirtualCheckpointCapacity(
   data: CheckpointData,
   additionalMessages: readonly AgentMessage[],
@@ -73,7 +98,10 @@ export function estimateVirtualCheckpointCapacity(
     data.estimatedTokensAfterAtSnapshot +
     sumMessageTokens(additionalMessages) +
     additionalTokens;
-  const safetyMargin = Math.max(4096, Math.ceil(contextWindow * 0.02));
+  const safetyMargin = calculateContextSafetyMargin(contextWindow);
+  if (safetyMargin === undefined) {
+    return undefined;
+  }
   const hardLimit = contextWindow - summaryReserveTokens - safetyMargin;
   const refreshLimit = Math.floor((contextWindow * softThresholdPercent) / 100);
   return {
@@ -117,7 +145,10 @@ export function estimateCheckpointCapacity(
   const keptMessagesEstimatedTokens = sumMessageTokens(keptMessages);
   const estimatedTokensAfter =
     fixedOverhead + summaryEstimatedTokens + keptMessagesEstimatedTokens;
-  const safetyMargin = Math.max(4096, Math.ceil(contextWindow * 0.02));
+  const safetyMargin = calculateContextSafetyMargin(contextWindow);
+  if (safetyMargin === undefined) {
+    return undefined;
+  }
   const hardLimit = contextWindow - preparation.settings.reserveTokens - safetyMargin;
 
   return {
