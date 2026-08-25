@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-08-25
+
+### Changed
+
+- 最低兼容 Pi coding-agent 版本为 0.84.3，以使用扩展压缩失败事件；运行旧版 Pi 的环境需要先升级 Pi。
+
+### Fixed
+
+- Pi 报告扩展压缩失败或取消时释放 checkpoint claim，使同一 checkpoint 可以用于后续虚拟上下文或压缩请求。
+- 虚拟 checkpoint 连续两次正式化失败后，当前压缩周期停止虚拟投影和后台生成，后续请求恢复原始上下文并由 Pi 完成正式压缩。
+
 ## [0.3.3] - 2026-08-24
 
 ### Fixed
@@ -86,7 +97,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/sunnyx11/pi-press/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/sunnyx11/pi-press/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/sunnyx11/pi-press/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/sunnyx11/pi-press/compare/v0.3.0...v0.3.1
