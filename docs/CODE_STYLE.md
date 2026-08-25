@@ -483,7 +483,7 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 | 达到阈值但 checkpoint preparation 不可用 | 记录诊断并静默跳过；后续 `turn_end` 可以再次尝试。 |
 | 正式化 preparation 不可用 | 保存当前 checkpoint、session、epoch 和叶节点为 deferred，记录 `formalization_deferred`，不调用 `ctx.compact()`，不显示 warning。 |
 | `Nothing to compact (session too small)` | 精确匹配完整错误消息并恢复为 deferred；不增加 `formalization_failed` 或普通失败次数，不显示 warning。 |
-| 其他正式化错误 | 清除 pending，增加当前 session 和 epoch 的失败次数并显示 warning；最多累计两次失败。 |
+| 其他正式化错误 | 清除 pending，增加当前 session 和 epoch 的失败次数并显示 warning；最多累计两次失败。达到上限时中止当前后台任务，清除虚拟状态和投影缓存，并停止该 epoch 的虚拟投影与 checkpoint 生成；后续请求使用原始上下文并由 Pi 处理正式压缩。 |
 | 生成阶段容量预测超过 hard limit 或无法计算 | 记录容量诊断，通过 CLI warning 显示容量数值或不可用状态，丢弃本次摘要 usage，不追加 checkpoint；正式 compaction 继续使用 Pi 原生实现。 |
 | 消费阶段容量预测超过 hard limit 或无法计算 | 记录容量诊断，通过 CLI warning 显示 checkpoint ID、容量数值和 Pi 原生处理状态。 |
 | provider、公开 API、结果或 checkpoint 追加失败 | 记录不含认证信息和完整响应的失败原因，通过 CLI error 通知显示，清除任务状态并回退 Pi 原生 compaction。 |
@@ -557,7 +557,7 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 - `context` 返回的虚拟摘要和当前尾部只影响当次 provider 请求；
 - `agent_settled` 的无 parent preparation 预检查、同叶 deferred 去重、新叶重检和 `Nothing to compact (session too small)` 分类；
 - native compaction、tree 切换、session shutdown 和 `precomputeMode: "off"` 清除 deferred 状态；
-- 正式化普通错误最多累计两次失败，延期不产生 warning 或失败计数；
+- 正式化普通错误最多累计两次失败；第一次失败保留虚拟状态并允许重试，第二次失败使当前 epoch 的虚拟投影和 checkpoint 生成停用；延期不产生 warning 或失败计数；
 - `agent_settled` 正式化成功后，Pi 写入的 entry、session 重建和 resume 结果必须通过公开 SDK 集成测试验证；
 - preparation 与 Pi 公开事件产生的 preparation 在 `firstKeptEntryId`、消息集合、split turn、`previousSummary`、file operations、settings 和 `tokensBefore` 上一致；
 - user、assistant、bash execution、custom message、branch summary、Pi-press custom entry 和 context-invisible metadata 的边界；

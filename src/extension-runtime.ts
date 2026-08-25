@@ -285,6 +285,9 @@ export class ExtensionRuntime {
     const branch = ctx.sessionManager.getBranch();
     const sessionId = ctx.sessionManager.getSessionId();
     const epochCompactionId = getEpochCompactionId(branch);
+    if (this.isFormalizationExhausted(sessionId, epochCompactionId)) {
+      return { messages: event.messages };
+    }
     const candidates = findReadyCheckpointCandidates(
       branch,
       sessionId,
@@ -516,8 +519,7 @@ export class ExtensionRuntime {
       return;
     }
 
-    const epochKey = this.formalizationEpochKey(sessionId, epochCompactionId);
-    if ((this.formalizationAttemptsByEpoch.get(epochKey) ?? 0) >= MAX_FORMALIZATION_ATTEMPTS) {
+    if (this.isFormalizationExhausted(sessionId, epochCompactionId)) {
       return;
     }
     const scheduledLeafId = ctx.sessionManager.getLeafId();
@@ -615,6 +617,9 @@ export class ExtensionRuntime {
       return undefined;
     }
     const epochCompactionId = getEpochCompactionId(branchEntries);
+    if (this.isFormalizationExhausted(sessionId, epochCompactionId)) {
+      return undefined;
+    }
     const candidates = findReadyCheckpointCandidates(
       branchEntries,
       sessionId,
@@ -801,6 +806,14 @@ export class ExtensionRuntime {
     return `${sessionId}:${epochCompactionId ?? "null"}`;
   }
 
+  private isFormalizationExhausted(
+    sessionId: string,
+    epochCompactionId: string | null,
+  ): boolean {
+    const epochKey = this.formalizationEpochKey(sessionId, epochCompactionId);
+    return (this.formalizationAttemptsByEpoch.get(epochKey) ?? 0) >= MAX_FORMALIZATION_ATTEMPTS;
+  }
+
   private async runFormalization(schedule: FormalizationSchedule): Promise<void> {
     if (this.formalizationSchedule !== schedule) {
       return;
@@ -944,6 +957,20 @@ export class ExtensionRuntime {
     this.formalizationAttemptsByEpoch.set(epochKey, failureCount);
     this.diagnostics.count("formalization_failed");
     this.diagnostics.record("lifecycle", `正式化失败：${describeError(error)}`);
+    if (failureCount >= MAX_FORMALIZATION_ATTEMPTS) {
+      if (this.inFlightTask) {
+        this.discardTask(this.inFlightTask, "formalization_exhausted");
+      }
+      this.clearVirtualState();
+      this.virtualContextCache.clear();
+      this.diagnostics.count("formalization_exhausted");
+      this.diagnostics.record(
+        "lifecycle",
+        "正式化失败次数达到上限，当前压缩周期已停止虚拟压缩。",
+      );
+      this.notifyWarning("虚拟压缩正式化连续失败，后续请求交由 Pi 原生处理。");
+      return;
+    }
     this.notifyWarning("虚拟压缩正式化失败，后续 settled 状态最多再试一次。");
   }
 

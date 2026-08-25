@@ -428,7 +428,7 @@ Pi 随后追加正式 `compaction` entry。恢复后的上下文为：
 8. Pi 发出 `session_before_compact(reason: "manual")` 后，`beforeCompact()` 通过当前 pending 状态、session、epoch 和 checkpoint ID 识别内部请求，并按正式复用规则返回最新 checkpoint。事件本身没有 request ID；checkpoint 已失效时返回空结果，让 Pi 生成原生摘要。
 9. Pi 调用 SessionManager 追加正式 `type: "compaction"` entry，随后通过 `buildSessionContext()` 重建 `agent.state.messages` 并发出 `session_compact`。扩展不得调用 `pi.appendEntry()` 或自行写 JSONL 模拟这一步。
 10. `session_compact` 是成功状态的权威事件；它清除 virtual、deferred、pending、claim 和旧 epoch 后台任务。`onComplete` 只负责补充诊断和通知，必须允许在 `session_compact` 之后执行。
-11. `onError` 只将消息精确等于 `Nothing to compact (session too small)` 的错误恢复为 deferred。该结果不增加 `formalization_failed`、不增加失败次数，也不显示 Pi-press warning。其他错误清除 pending、增加失败次数并显示 warning；同一 Runtime 实例、session 和 epoch 最多累计两次失败。session、分支、epoch、checkpoint 变化或功能关闭时清除 deferred。
+11. `onError` 只将消息精确等于 `Nothing to compact (session too small)` 的错误恢复为 deferred。该结果不增加 `formalization_failed`、不增加失败次数，也不显示 Pi-press warning。其他错误清除 pending、增加失败次数并显示 warning；同一 Runtime 实例、session 和 epoch 最多累计两次失败。失败次数达到上限时中止当前后台任务，清除 virtual、deferred、正式化调度和虚拟投影缓存，并停止该 epoch 的虚拟投影与 checkpoint 生成；后续请求使用原始上下文，Pi 自动或手动 compaction 仍可消费持久化 checkpoint。session、分支、正式 compaction epoch 或功能状态变化时清除对应内存状态。
 
 正式 entry 写入成功后，后续请求使用 Pi 重建的原生上下文：
 
@@ -564,12 +564,12 @@ Promise
 - 虚拟投影缓存只复用已验证的分支前缀。分支仅追加时增量扩展，截断、切换、正式 compaction 或 entry 身份不一致时完整重建。
 - `agent_settled` handler 不同步调用 `ctx.compact()`；延迟回调在调用前比较 `runEpoch`、session、epoch、checkpoint、pending 状态和 `ctx.isIdle()`，并确认当前分支继承调度时 leaf，禁止要求当前 leaf 完全相等。
 - Pi 原生 `session_compact` 可能先于正式化回调发生；epoch 变化后回调必须静默退出。
-- `ctx.compact()` 发起后通过 `pendingFormalization` 阻止重复调用。`session_compact` 清理成功状态；`onError` 只在 request ID 仍匹配时处理结果。`formalizationAttemptsByEpoch` 记录普通失败次数，deferred 和 `Nothing to compact (session too small)` 不计入该值。
+- `ctx.compact()` 发起后通过 `pendingFormalization` 阻止重复调用。`session_compact` 清理成功状态；`onError` 只在 request ID 仍匹配时处理结果。`formalizationAttemptsByEpoch` 记录普通失败次数，deferred 和 `Nothing to compact (session too small)` 不计入该值；失败次数达到上限的 epoch 不再生成或应用虚拟 checkpoint。
 - 每个异步阶段完成后先比较捕获的 `runEpoch` 和当前任务身份；任一不一致时停止，且不得读取失效的 session-bound 对象、追加 entry 或发起 compaction。
 - `session_before_tree`、`session_shutdown` 和 `session_compact` 递增 `runEpoch` 并中止当前任务；`session_tree` 只恢复新分支状态。
 - 任何超时、取消或主动废弃操作都必须先清除任务身份，再发送 abort。即使 provider 忽略取消，旧 Promise 也不能通过追加前检查。
 - `session_before_compact` 领取 checkpoint 后保存 checkpoint ID 与事件 signal；signal 取消、正式消费、`session_compact_failed(fromExtension: true)` 或新的 compaction attempt 使用不同 signal 时释放领取。
-- 成功生成 ready checkpoint 后，同一 snapshot key 不再发起请求；明确失败时按 retry/cooldown 配置决定是否重试。新的 snapshot 达到同一 `softThresholdPercent` 后可继续生成下一代 checkpoint，不设 epoch 次数限制。
+- 成功生成 ready checkpoint 后，同一 snapshot key 不再发起请求；明确失败时按 retry/cooldown 配置决定是否重试。未达到正式化失败上限的 epoch 中，新的 snapshot 达到同一 `softThresholdPercent` 后可继续生成下一代 checkpoint，不设生成次数限制。
 - 所有状态检查和完整 checkpoint schema 校验发生在 `pi.appendEntry()` 前；检查通过后立即同步追加 custom entry。
 - 正式 compaction epoch 只由当前分支最新正式 compaction entry ID 表示，不维护额外整数 generation。
 
@@ -647,7 +647,7 @@ Promise
 - 默认 `precomputeMode: "threshold"` 下，内部 manual 请求凭 `pendingFormalization` 复用指定 checkpoint；使用者 `/compact` 仍需 `"threshold-and-manual"`。
 - `agent_settled` 等待兼容后台任务后，以 Pi 当前 `compaction.keepRecentTokens` 对当前分支执行无 parent preparation 预检查；最新候选无需先经过下一次 `context`。
 - preparation 不可用时进入 deferred，同一叶节点不重复检查；新叶节点重新检查，可用后调用一次 `ctx.compact()`。
-- `Nothing to compact (session too small)` 进入 deferred，不产生 warning、`formalization_failed` 或失败次数；其他正式化错误最多累计两次失败。
+- `Nothing to compact (session too small)` 进入 deferred，不产生 warning、`formalization_failed` 或失败次数；其他正式化错误最多累计两次失败，达到上限后当前 epoch 使用原始上下文且不再生成 checkpoint。
 - `session_before_compact` 拒绝内部候选时，Pi 原生摘要仍能完成正式 compaction；overflow 或 `willRetry: true` 只复用更新候选，等待超时或没有更新候选时保持 Pi 原生处理。
 - 扩展结果的压缩失败或取消通过 `session_compact_failed(fromExtension: true)` 释放 checkpoint claim，Pi 原生压缩失败不释放该 claim。
 - `session_compact`、`session_compact_failed`、`onComplete` 和 `onError` 的不同回调顺序均不会重复发起或错误清除其他 request 的状态。
@@ -675,7 +675,7 @@ Promise
 - 分支切换、session shutdown 和 reload 使过期正式化回调失效，旧回调不得调用 `ctx.compact()`；
 - 正式化 preparation 不可用、同叶重复 settled、新叶重检，以及 `Nothing to compact (session too small)` 的延期分类；
 - native compaction、分支切换、session shutdown 和 `precomputeMode: "off"` 清除 deferred 状态；
-- 正式化普通错误保留有效虚拟状态，同一 Runtime 实例、session 和 epoch 最多累计两次失败；
+- 正式化普通错误保留有效虚拟状态并允许一次重试；第二次失败中止当前后台任务并清除 virtual、deferred、正式化调度和投影缓存，同一 Runtime 实例、session 和 epoch 的后续 `context` 与 `turn_end` 使用 Pi 原生处理。
 - consumed usage 进入正式 compaction 一次，discarded usage 只进入 Pi-press 诊断统计。
 
 ## 验收标准
@@ -695,7 +695,7 @@ Promise
 13. 虚拟容量未超过 hard limit 时正常应用；达到 soft limit 时调度下一代；超过 hard limit 且无及时完成的新 checkpoint 时记录保护能力不足。
 14. 虚拟请求的 provider usage 即使使 Pi 原生 threshold 保持未满足，已实际应用的 checkpoint 仍会在 `agent_settled` 后进入正式化。
 15. `turn_end` 和 `agent_end` 不调用 `ctx.compact()`；`agent_settled` 只安排延迟回调。回调等待兼容后台任务，选择最新 checkpoint，通过 Pi `SettingsManager` 获取当前 `compaction.keepRecentTokens`，以该值对当前分支执行无 parent preparation 预检查，并在 `ctx.isIdle()`、session、epoch 和分支祖先校验通过后发起一次调用；preparation 不可用时按当前叶节点延期。
-16. deferred 在同一叶节点静默跳过，新叶节点重新检查；`Nothing to compact (session too small)` 不产生 warning、`formalization_failed` 或失败次数，其他错误在同一 session 和 epoch 最多累计两次失败。
+16. deferred 在同一叶节点静默跳过，新叶节点重新检查；`Nothing to compact (session too small)` 不产生 warning、`formalization_failed` 或失败次数。其他错误在同一 session 和 epoch 最多累计两次失败；达到上限后停止该 epoch 的虚拟投影和 checkpoint 生成，后续请求使用原始上下文。
 17. 默认 `precomputeMode: "threshold"` 下，内部 `reason: "manual"` 事件通过 `pendingFormalization` 精确匹配并复用指定 checkpoint；使用者 `/compact` 只有在 `"threshold-and-manual"` 且无自定义指令时复用。
 18. 内部 checkpoint 在正式化时失效或超过 hard limit 时，Pi 原生摘要继续完成正式 compaction；overflow 和 `willRetry: true` 只复用比失败请求更新的 checkpoint，等待失败时保持 Pi 原生压缩和自动重试。
 19. 正式 `compaction` entry 只由 Pi 写入，包含摘要、边界、checkpoint 快照原始量与后续原始 session 消息估算量之和、usage、原生文件 details 和 `details.piPress`；Pi 随后重建 `agent.state.messages`。
@@ -706,7 +706,7 @@ Promise
 24. 正式消费前模拟的 `estimatedTokensAfter` 满足 hard limit 和容量余量；`firstKeptEntryId` 可以是 Pi 允许的 metadata 边界。
 25. 正式 compaction ID 是唯一持久化 epoch；旧 epoch 的后台结果、虚拟状态和延迟正式化回调都无法追加、应用或消费。
 26. 同一 snapshot 不并发生成重复摘要；同 epoch 可按 soft threshold 连续生成至少三代增量 checkpoint；多个 Runtime 实例及 reload 后重新导入的模块实例共享进程级后台活动占用；同一 session/epoch 最多存在一个 pending 正式化请求。
-27. `session_compact`、`session_compact_failed`、`onComplete`、`onError`、session shutdown 和分支事件以任意有效顺序到达时，状态清理保持幂等；扩展结果的压缩失败释放 claim，Pi 原生压缩失败保留 claim，内部正式化失败后同一 Runtime 实例、session 和 epoch 最多重试一次。
+27. `session_compact`、`session_compact_failed`、`onComplete`、`onError`、session shutdown 和分支事件以任意有效顺序到达时，状态清理保持幂等；扩展结果的压缩失败释放 claim，Pi 原生压缩失败保留 claim。内部正式化失败后同一 Runtime 实例、session 和 epoch 最多重试一次；第二次失败使后续虚拟投影和 checkpoint 生成停用，直到正式 compaction 或生命周期切换清除该 epoch 状态。
 28. Pi-press 区分 virtual、consumed 和 discarded 统计；正式 compaction usage 不重复计费，未消费费用单独记录，成功、回退和保护能力不足均提供对应诊断。
 29. `npm run typecheck` 和 `npm test` 通过，并包含上述版本适配、provider、checkpoint、虚拟上下文、正式化、并发、生命周期和原生后备处理测试。
 30. `npm run test:smoke:pi` 使用当前 shell 环境中仓库外部的 Pi 可执行文件和当前 Pi 配置模型，报告实际可执行文件、版本、模型、checkpoint token、尾部 token 和正式 `tokensBefore`；checkpoint 基线加快照后原始消息估算量必须等于正式 compaction 的 `tokensBefore`。

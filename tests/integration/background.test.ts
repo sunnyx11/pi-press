@@ -328,7 +328,7 @@ test("native compaction cancels delayed formalization", async () => {
   }
 });
 
-test("formalization failure allows one retry and then stops", async () => {
+test("formalization failure disables virtual precompaction for the current epoch after one retry", async () => {
   const scenario = createScenario({ summaryReserveTokens: 1 });
   let compactCalls = 0;
   const ctx = {
@@ -343,7 +343,7 @@ test("formalization failure allows one retry and then stops", async () => {
   try {
     scenario.runtime.onTurnEnd(ctx);
     await waitFor(() => scenario.appended.length === 1);
-    scenario.runtime.onContext({
+    await scenario.runtime.onContext({
       type: "context",
       messages: scenario.manager.buildSessionContext().messages,
     }, ctx);
@@ -352,12 +352,30 @@ test("formalization failure allows one retry and then stops", async () => {
     await waitFor(() => compactCalls === 1);
     scenario.runtime.onAgentSettled(ctx);
     await waitFor(() => compactCalls === 2);
-    scenario.runtime.onAgentSettled(ctx);
+
+    scenario.manager.appendMessage(makeUserMessage("new request after formalization failures"));
+    const originalMessages = scenario.manager.buildSessionContext().messages;
+    const contextResult = await scenario.runtime.onContext({
+      type: "context",
+      messages: originalMessages,
+    }, ctx);
+    scenario.runtime.onTurnEnd(ctx);
     await new Promise((resolve) => setTimeout(resolve, 20));
 
+    assert.deepEqual(contextResult.messages, originalMessages);
     assert.equal(compactCalls, 2);
+    assert.equal(scenario.faux.state.callCount, 1);
+    assert.equal(scenario.appended.length, 1);
     assert.equal(scenario.runtime.getDiagnostics().counters.formalization_failed, 2);
     assert.equal(scenario.runtime.getDiagnostics().counters.formalization_started, 2);
+    assert.equal(scenario.runtime.getDiagnostics().counters.formalization_exhausted, 1);
+
+    const thresholdResult = await scenario.runtime.beforeCompact(
+      makeCompactEvent(scenario, new AbortController().signal),
+      ctx,
+    );
+    assert.ok(thresholdResult?.compaction);
+    assert.equal(scenario.faux.state.callCount, 1);
   } finally {
     scenario.runtime.onSessionShutdown();
     await new Promise((resolve) => setTimeout(resolve, 0));
