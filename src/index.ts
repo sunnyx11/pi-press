@@ -11,6 +11,7 @@ export default function registerPiPress(pi: ExtensionAPI): void {
   pi.on("agent_settled", (_event, ctx) => runtime.onAgentSettled(ctx));
   pi.on("session_before_compact", (event, ctx) => runtime.beforeCompact(event, ctx));
   pi.on("session_compact", (event, ctx) => runtime.onSessionCompact(event, ctx));
+  pi.on("session_compact_failed", (event) => runtime.onSessionCompactFailed(event));
   pi.on("session_before_tree", () => runtime.onSessionBeforeTree());
   pi.on("session_tree", (_event, ctx) => runtime.onSessionTree(ctx));
   pi.on("session_shutdown", () => runtime.onSessionShutdown());

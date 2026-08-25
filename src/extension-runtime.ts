@@ -572,6 +572,12 @@ export class ExtensionRuntime {
     }
   }
 
+  onSessionCompactFailed(event: Readonly<{ fromExtension: boolean }>): void {
+    if (event.fromExtension) {
+      this.releaseCheckpointClaim();
+    }
+  }
+
   onTurnEnd(ctx: ExtensionContext): void {
     this.bindContext(ctx);
     const config = this.loadCurrentConfig(ctx);

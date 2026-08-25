@@ -24,7 +24,7 @@ Pi-press 自行实现并维护以下内容：
 
 实现按接口稳定性分为三层：
 
-1. 首选 Pi 扩展契约：`context`、`turn_end`、`agent_settled`、`session_before_compact`、`session_compact`、`session_shutdown`、`session_before_tree`、`session_tree`、`pi.appendEntry()`、`ctx.getContextUsage()`、`ctx.isIdle()`、`ctx.compact()`、`ctx.sessionManager` 和 `ctx.modelRegistry`。
+1. 首选 Pi 扩展契约：`context`、`turn_end`、`agent_settled`、`session_before_compact`、`session_compact`、`session_compact_failed`、`session_shutdown`、`session_before_tree`、`session_tree`、`pi.appendEntry()`、`ctx.getContextUsage()`、`ctx.isIdle()`、`ctx.compact()`、`ctx.sessionManager` 和 `ctx.modelRegistry`。
 2. 公开包根入口：`VERSION`、`compact`、`findCutPoint`、`estimateTokens`、`calculateContextTokens`、`getLastAssistantUsage`、`buildSessionContext`、`sessionEntryToContextMessages` 和相关公开类型。
 3. Pi-press 版本适配模块：构造 `Parameters<typeof compact>[0]` 所表示的 preparation，补足 `prepareCompaction()` 未从包根入口导出的能力。
 
@@ -51,7 +51,7 @@ Pi-press 自行实现并维护以下内容：
 
 ## 兼容范围
 
-- npm 发布包将 `@earendil-works/pi-agent-core`、`@earendil-works/pi-ai` 和 `@earendil-works/pi-coding-agent` 声明为 `peerDependencies: "*"`，由 Pi 宿主提供运行时核心包；开发依赖使用 `>=0.84.1`，当前最低兼容版本仍为 `0.84.1`。
+- npm 发布包将 `@earendil-works/pi-agent-core`、`@earendil-works/pi-ai` 和 `@earendil-works/pi-coding-agent` 声明为 `peerDependencies: "*"`，由 Pi 宿主提供运行时核心包；开发依赖使用 `>=0.84.3`，当前最低兼容版本为 `0.84.3`。
 - 当前包根 `VERSION` 写入 checkpoint provenance，并用于拒绝复用其他 Pi 版本生成的 checkpoint。版本升级后会生成新的 checkpoint。
 - 公开 API、provider、超时、结果校验或 checkpoint 追加失败时，通过 CLI error 通知显示错误；虚拟转换返回事件原消息，正式 hook 返回空结果并由 Pi 原生流程继续处理。preparation 不可用时只记录诊断并静默跳过；生成或消费阶段容量不满足目标、hook 等待超时时，通过 CLI warning 通知显示跳过原因和原生后备处理状态。
 - 所有运行时导入必须来自包根入口，禁止通过 `dist/core/...` 引用深层模块。
@@ -179,7 +179,8 @@ checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只
 - ready checkpoint 按祖先兼容关系选择，不要求 snapshot key 与当前叶子相同；内部正式化请求必须额外匹配记录的 checkpoint ID、session 和 epoch。
 - 如果兼容后台任务仍在生成，hook 可以在配置时间内等待；超时后中止任务并回退 Pi 原生摘要。
 - checkpoint 不可复用时返回空结果，`ctx.compact()` 仍由 Pi 原生摘要完成正式压缩。正式 entry 成功写入后，`session_compact` 清除虚拟状态和 pending 状态。
-- `onError` 清除 pending 状态并保留仍有效的虚拟 checkpoint；同一 Runtime 实例、session 和 epoch 的下一次 `agent_settled` 最多再尝试一次。
+- 扩展结果产生的正式压缩失败或取消时，`session_compact_failed(fromExtension: true)` 释放 checkpoint claim，使同一 checkpoint 可用于后续虚拟上下文或压缩请求；Pi 原生压缩失败不释放扩展 claim。
+- `onError` 清除内部正式化的 pending 状态并保留仍有效的虚拟 checkpoint；同一 Runtime 实例、session 和 epoch 的下一次 `agent_settled` 最多再尝试一次。
 
 ## 配置契约
 
@@ -509,6 +510,7 @@ custom checkpoint 和 metrics entry 会成为 session tree 中的新 leaf，但�
 - `session_tree`：按新分支恢复状态；不重复递增已经由 `session_before_tree` 更新的 `runEpoch`。
 - `session_shutdown`：递增 `runEpoch`，中止任务，清除正式化调度、deferred、pending 和 session-bound 引用；处理器不等待后台 provider Promise，后台闭包不得再访问失效的 `pi` 或 `ctx`。已经交给 Pi 的 compaction 结果以宿主最终事件为准。
 - `session_compact`：记录消费，清除 virtual、deferred、pending 和调度状态，递增 `runEpoch`，中止旧 epoch 任务并以新正式 compaction ID 开始下一轮。
+- `session_compact_failed`：仅当 `fromExtension` 为真时释放当前 checkpoint claim，不改变 epoch、virtual、deferred 或 pending；内部正式化状态由对应 `onError` 回调处理。
 - `model_select` 和 `thinking_level_select`：不注册专用处理器；后续任务和 `context` 从新的事件上下文读取当前模型，不改变内容 snapshot key，也不废弃已持久化 ready checkpoint。
 
 ## 运行时状态与并发
@@ -566,7 +568,7 @@ Promise
 - 每个异步阶段完成后先比较捕获的 `runEpoch` 和当前任务身份；任一不一致时停止，且不得读取失效的 session-bound 对象、追加 entry 或发起 compaction。
 - `session_before_tree`、`session_shutdown` 和 `session_compact` 递增 `runEpoch` 并中止当前任务；`session_tree` 只恢复新分支状态。
 - 任何超时、取消或主动废弃操作都必须先清除任务身份，再发送 abort。即使 provider 忽略取消，旧 Promise 也不能通过追加前检查。
-- `session_before_compact` 领取 checkpoint 后保存 checkpoint ID 与事件 signal；signal 取消、正式消费或新的 compaction attempt 使用不同 signal 时释放领取。
+- `session_before_compact` 领取 checkpoint 后保存 checkpoint ID 与事件 signal；signal 取消、正式消费、`session_compact_failed(fromExtension: true)` 或新的 compaction attempt 使用不同 signal 时释放领取。
 - 成功生成 ready checkpoint 后，同一 snapshot key 不再发起请求；明确失败时按 retry/cooldown 配置决定是否重试。新的 snapshot 达到同一 `softThresholdPercent` 后可继续生成下一代 checkpoint，不设 epoch 次数限制。
 - 所有状态检查和完整 checkpoint schema 校验发生在 `pi.appendEntry()` 前；检查通过后立即同步追加 custom entry。
 - 正式 compaction epoch 只由当前分支最新正式 compaction entry ID 表示，不维护额外整数 generation。
@@ -592,7 +594,7 @@ Promise
 
 ### 发布包接口与版本适配
 
-测试以当前安装的 `@earendil-works/pi-coding-agent` 发布包为对象，最低依赖版本为 `0.84.1`：
+测试以当前安装的 `@earendil-works/pi-coding-agent` 发布包为对象，最低依赖版本为 `0.84.3`：
 
 - 生产代码只从包根入口导入，构建测试阻止 `dist/core/...` 深层导入；
 - 不通过 `VERSION` 做全局启用门控；当前版本会写入 checkpoint，版本不兼容产生的运行时错误通过 CLI 通知显示，并回退 Pi 原生 compaction；
@@ -647,7 +649,8 @@ Promise
 - preparation 不可用时进入 deferred，同一叶节点不重复检查；新叶节点重新检查，可用后调用一次 `ctx.compact()`。
 - `Nothing to compact (session too small)` 进入 deferred，不产生 warning、`formalization_failed` 或失败次数；其他正式化错误最多累计两次失败。
 - `session_before_compact` 拒绝内部候选时，Pi 原生摘要仍能完成正式 compaction；overflow 或 `willRetry: true` 只复用更新候选，等待超时或没有更新候选时保持 Pi 原生处理。
-- `session_compact`、`onComplete` 和 `onError` 的不同回调顺序均不会重复发起或错误清除其他 request 的状态。
+- 扩展结果的压缩失败或取消通过 `session_compact_failed(fromExtension: true)` 释放 checkpoint claim，Pi 原生压缩失败不释放该 claim。
+- `session_compact`、`session_compact_failed`、`onComplete` 和 `onError` 的不同回调顺序均不会重复发起或错误清除其他 request 的状态。
 - 正式 entry 写入后，当前 agent state 与重新 resume 的 session 都只包含正式摘要和保留尾部；旧虚拟 checkpoint 因 epoch 不匹配而停止应用。
 
 ### 并发和生命周期
@@ -703,7 +706,7 @@ Promise
 24. 正式消费前模拟的 `estimatedTokensAfter` 满足 hard limit 和容量余量；`firstKeptEntryId` 可以是 Pi 允许的 metadata 边界。
 25. 正式 compaction ID 是唯一持久化 epoch；旧 epoch 的后台结果、虚拟状态和延迟正式化回调都无法追加、应用或消费。
 26. 同一 snapshot 不并发生成重复摘要；同 epoch 可按 soft threshold 连续生成至少三代增量 checkpoint；多个 Runtime 实例及 reload 后重新导入的模块实例共享进程级后台活动占用；同一 session/epoch 最多存在一个 pending 正式化请求。
-27. `session_compact`、`onComplete`、`onError`、session shutdown 和分支事件以任意有效顺序到达时，状态清理保持幂等；正式化失败后，同一 Runtime 实例、session 和 epoch 最多重试一次。
+27. `session_compact`、`session_compact_failed`、`onComplete`、`onError`、session shutdown 和分支事件以任意有效顺序到达时，状态清理保持幂等；扩展结果的压缩失败释放 claim，Pi 原生压缩失败保留 claim，内部正式化失败后同一 Runtime 实例、session 和 epoch 最多重试一次。
 28. Pi-press 区分 virtual、consumed 和 discarded 统计；正式 compaction usage 不重复计费，未消费费用单独记录，成功、回退和保护能力不足均提供对应诊断。
 29. `npm run typecheck` 和 `npm test` 通过，并包含上述版本适配、provider、checkpoint、虚拟上下文、正式化、并发、生命周期和原生后备处理测试。
 30. `npm run test:smoke:pi` 使用当前 shell 环境中仓库外部的 Pi 可执行文件和当前 Pi 配置模型，报告实际可执行文件、版本、模型、checkpoint token、尾部 token 和正式 `tokensBefore`；checkpoint 基线加快照后原始消息估算量必须等于正式 compaction 的 `tokensBefore`。

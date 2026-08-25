@@ -12,7 +12,7 @@
 
 规范中的“必须”表示禁止偏离；“应”表示默认要求，偏离时需要在代码或设计文档中说明；“可”表示按实现需要选择。
 
-当前项目依赖 `@earendil-works/pi-coding-agent >=0.84.1`，Node.js 版本以实际安装的发行包要求为准。设计文档是 `pi-press` 的行为契约，本文件负责把该契约转换为代码组织和实现规则。
+当前项目依赖 `@earendil-works/pi-coding-agent >=0.84.3`，Node.js 版本以实际安装的发行包要求为准。设计文档是 `pi-press` 的行为契约，本文件负责把该契约转换为代码组织和实现规则。
 
 npm 发布包中的 Pi 核心包必须声明为 `peerDependencies: "*"`，由 Pi 宿主提供；本地类型检查和测试使用 `devDependencies` 中的最低兼容版本，禁止把 Pi 核心包作为普通运行时依赖随扩展重复安装。
 
@@ -51,6 +51,10 @@ export default function registerPiPress(pi: ExtensionAPI): void {
 
   pi.on("session_compact", (event, ctx) => {
     runtime.onCompact(event, ctx);
+  });
+
+  pi.on("session_compact_failed", (event) => {
+    runtime.onCompactFailed(event);
   });
 
   pi.on("session_shutdown", () => {
@@ -196,7 +200,7 @@ import {
 }
 ```
 
-实现仓库应启用严格类型检查，并使用 ESM。类型依赖应与实际安装的 Pi 包版本兼容，当前最低版本为 `0.84.1`。
+实现仓库应启用严格类型检查，并使用 ESM。类型依赖应与实际安装的 Pi 包版本兼容，当前最低版本为 `0.84.3`。
 
 ### 命名
 
@@ -228,6 +232,7 @@ import {
 | `agent_settled` | 等待兼容后台任务，选择最新 checkpoint，以同步保留量预检查当前分支；不可用时保存 deferred，可用时延迟调用 `ctx.compact()`。 |
 | `session_before_compact` | 校验 reason、signal、分支、epoch、checkpoint 和容量；可返回兼容 `CompactionResult`，否则返回 `undefined` 让 Pi 使用原生实现。 |
 | `session_compact` | 记录正式 entry 对 checkpoint 的消费，递增运行 epoch，取消旧 epoch 任务并清除 virtual、deferred 和 pending 状态。 |
+| `session_compact_failed` | `fromExtension` 为真时释放当前 checkpoint claim；内部正式化的 pending、失败计数和通知继续由对应 `onError` 回调处理。 |
 | `session_before_tree` | 递增运行 epoch，取消当前任务并清除当前分支的 virtual、deferred 和 pending 状态；不读取将要失效的旧 session 对象。 |
 | `session_tree` | 读取新分支并恢复内存状态；不重复执行已经由 `session_before_tree` 完成的 epoch 递增。 |
 | `session_shutdown` | 递增运行 epoch，先清除任务身份再发送 abort，清除 virtual、deferred、pending 和 session 资源；不等待后台认证或 provider Promise。 |
@@ -532,7 +537,7 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 
 ### 测试边界
 
-测试必须使用实际安装的 `@earendil-works/pi-coding-agent` 发布包和包根公开接口，最低依赖版本为 `0.84.1`。测试禁止导入 `dist/core/...`、内部 `prepareCompaction()` 或手工 session JSONL 解析器。
+测试必须使用实际安装的 `@earendil-works/pi-coding-agent` 发布包和包根公开接口，最低依赖版本为 `0.84.3`。测试禁止导入 `dist/core/...`、内部 `prepareCompaction()` 或手工 session JSONL 解析器。
 
 ### 单元测试
 
@@ -599,7 +604,7 @@ npm run test:smoke:pi
 
 1. 阅读新版本的扩展和 compaction 文档；
 2. 对照包根导出表和类型定义检查公开 API；
-3. 更新 `>=0.84.1` 依赖范围和 lockfile 中的根依赖声明；
+3. 更新 `>=0.84.3` 依赖范围和 lockfile 中的根依赖声明；
 4. 比较 Pi preparation、session entry、provider auth 和事件返回值的变化；
 5. 更新版本适配模块、checkpoint 兼容性校验和差异测试；
 6. 在兼容性测试通过前保留 CLI 失败通知和 Pi 原生回退。

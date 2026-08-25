@@ -83,6 +83,52 @@ test("checkpoint claim stays exclusive within one attempt and recovers for a new
   assert.equal(runtime.getDiagnostics().counters.task_started ?? 0, 0);
 });
 
+test("failed extension compaction releases checkpoint claim", async () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-runtime-failed-compaction");
+  const firstId = manager.appendMessage(makeUserMessage("old history"));
+  const snapshotId = manager.appendMessage(makeUserMessage("recent work"));
+  manager.appendCustomEntry(
+    "pi-press.precompaction",
+    makeCheckpointData(manager.getSessionId(), snapshotId, firstId, {
+      checkpointId: "checkpoint-failed-compaction",
+    }),
+  );
+
+  const model = makeModel();
+  const ctx = {
+    cwd: "/tmp/pi-press-runtime-failed-compaction",
+    sessionManager: manager,
+    model,
+    modelRegistry: {},
+    thinkingLevel: "medium",
+  } as unknown as ExtensionContext;
+  const runtime = new ExtensionRuntime({ appendEntry: () => undefined });
+  runtime.onSessionStart(ctx);
+  const event = {
+    type: "session_before_compact",
+    preparation: makePreparation(firstId, 100),
+    branchEntries: manager.getBranch(),
+    reason: "threshold",
+    willRetry: false,
+    signal: new AbortController().signal,
+  } satisfies SessionBeforeCompactEvent;
+
+  assert.ok(await runtime.beforeCompact(event, ctx));
+  const failedEvent = {
+    type: "session_compact_failed",
+    reason: "threshold",
+    errorMessage: "test compaction failure",
+    aborted: false,
+    willRetry: false,
+    fromExtension: false,
+  };
+  runtime.onSessionCompactFailed(failedEvent);
+  assert.equal(await runtime.beforeCompact(event, ctx), undefined);
+
+  runtime.onSessionCompactFailed({ ...failedEvent, fromExtension: true });
+  assert.ok(await runtime.beforeCompact(event, ctx));
+});
+
 test("formal reuse reports checkpoint history plus the original session tail", async () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime-original-tokens");
   const firstId = manager.appendMessage(makeUserMessage("old history"));
