@@ -228,7 +228,7 @@ import {
 | --- | --- |
 | `session_start` | 通过 `ctx.sessionManager.getEntries()`、`getBranch()` 恢复 checkpoint、正式 compaction epoch、消费状态和当前分支。 |
 | `turn_end` | 读取 `ctx.getContextUsage()`，判断软阈值或已应用虚拟 checkpoint 的尾部容量，获取快照并调度后台任务。处理器必须在后台摘要完成前返回；Pi 0.84.4 及更高版本可随后在同一 agent 的下一次 assistant 请求前执行原生阈值压缩。 |
-| `context` | 每次 provider 请求前重新校验 ready checkpoint，构造虚拟 `compactionSummary` 和当前未压缩尾部；映射不明确时返回原消息。 |
+| `context` | 每次 provider 请求前重新校验 ready checkpoint，构造虚拟 `compactionSummary` 和当前未压缩尾部；允许 Pi 自动重试保留于 session、但从实时状态删除、后接另一条 assistant 响应且不承担压缩边界定位的失败 assistant 消息缺失，其他映射不明确时返回原消息。 |
 | `agent_settled` | 等待兼容后台任务，选择最新 checkpoint，以同步保留量预检查当前分支；不可用时保存 deferred，可用时延迟调用 `ctx.compact()`。 |
 | `session_before_compact` | 校验 reason、signal、分支、epoch、checkpoint 和容量；可返回兼容 `CompactionResult`，否则返回 `undefined` 让 Pi 使用原生实现。 |
 | `session_compact` | 记录正式 entry 对 checkpoint 的消费，递增运行 epoch，取消旧 epoch 任务并清除 virtual、deferred 和 pending 状态。 |
@@ -570,6 +570,7 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 - session 重启、tree 切换、返回旧分支和正式 compaction 后状态正确恢复；
 - 同一 snapshot 去重、epoch 变化失效、同 epoch 至少三代增量刷新和旧 Promise 追加保护；
 - 虚拟投影缓存的追加扩展、截断重建、分支切换和正式 compaction 失效；
+- Pi 自动重试失败 assistant 在 session 中存在、实时消息中缺失且后接另一条 assistant 响应时仍可投影，最终错误、普通消息缺失和压缩边界歧义时保持原消息；
 - manual、customInstructions、overflow、`willRetry` 和 `precomputeMode` 三种取值的复用或 Pi 原生处理规则。
 
 ### 命令

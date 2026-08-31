@@ -43,6 +43,20 @@ export function makeAssistantMessage(text: string, usage = makeUsage()): Message
   };
 }
 
+export function makeAssistantErrorMessage(errorMessage: string): Message {
+  return {
+    role: "assistant",
+    content: [],
+    api: "openai-responses",
+    provider: "test",
+    model: "model-id",
+    usage: makeUsage(0),
+    stopReason: "error",
+    errorMessage,
+    timestamp: Date.now(),
+  };
+}
+
 export function makeModel(contextWindow = 100_000): Model<Api> {
   return {
     id: "model-id",

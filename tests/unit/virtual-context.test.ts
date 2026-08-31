@@ -6,7 +6,13 @@ import {
   projectCheckpointToVirtualContext,
   VirtualContextProjectionCache,
 } from "../../src/compaction/virtual-context.js";
-import { makeCheckpointData, makeUsage, makeUserMessage } from "./fixtures.js";
+import {
+  makeAssistantErrorMessage,
+  makeAssistantMessage,
+  makeCheckpointData,
+  makeUsage,
+  makeUserMessage,
+} from "./fixtures.js";
 
 test("virtual context replaces the summarized prefix and preserves the current tail", () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context");
@@ -50,6 +56,142 @@ test("virtual context replaces the summarized prefix and preserves the current t
   assert.deepEqual(eventMessages, originalMessages);
   assert.notEqual(result.messages, eventMessages);
   assert.equal(oldId.length > 0, true);
+});
+
+test("virtual context tolerates an auto-retried error missing before the kept boundary", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-retried-prefix");
+  manager.appendMessage({ ...makeUserMessage("old history"), timestamp: 1_000 });
+  manager.appendMessage({ ...makeAssistantErrorMessage("terminated"), timestamp: 2_000 });
+  const keptId = manager.appendMessage({ ...makeAssistantMessage("retried response"), timestamp: 3_000 });
+  const snapshotId = manager.appendMessage({ ...makeUserMessage("snapshot message"), timestamp: 4_000 });
+
+  const eventMessages = manager.buildSessionContext().messages.filter(
+    (message) => message.role !== "assistant" || message.stopReason !== "error",
+  );
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "virtual-checkpoint-retried-prefix",
+    estimatedTokensAfterAtSnapshot: 100,
+    compaction: {
+      summary: "compressed history",
+      firstKeptEntryId: keptId,
+      tokensBefore: 1_000,
+    },
+  });
+
+  const result = projectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages,
+    checkpoint: data,
+    contextWindow: 100_000,
+    summaryReserveTokens: 1,
+    softThresholdPercent: 50,
+    cache: new VirtualContextProjectionCache(),
+  });
+
+  assert.ok(result);
+  assert.equal(result.messages[0]?.role, "compactionSummary");
+  assert.deepEqual(
+    result.messages.slice(1).map((message) => message.role === "assistant"
+      ? message.content
+      : message.role === "user"
+        ? message.content
+        : message.role),
+    [
+      [{ type: "text", text: "retried response" }],
+      "snapshot message",
+    ],
+  );
+});
+
+test("virtual context tolerates an auto-retried error missing from the current tail", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-retried-tail");
+  manager.appendMessage({ ...makeUserMessage("old history"), timestamp: 1_000 });
+  const keptId = manager.appendMessage({ ...makeUserMessage("kept message"), timestamp: 2_000 });
+  const snapshotId = manager.appendMessage({ ...makeUserMessage("snapshot message"), timestamp: 3_000 });
+  manager.appendMessage({ ...makeAssistantErrorMessage("Connection error."), timestamp: 4_000 });
+  manager.appendMessage({ ...makeAssistantMessage("retried response"), timestamp: 5_000 });
+
+  const eventMessages = manager.buildSessionContext().messages.filter(
+    (message) => message.role !== "assistant" || message.stopReason !== "error",
+  );
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "virtual-checkpoint-retried-tail",
+    estimatedTokensAfterAtSnapshot: 100,
+    compaction: {
+      summary: "compressed history",
+      firstKeptEntryId: keptId,
+      tokensBefore: 1_000,
+    },
+  });
+
+  const result = projectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages,
+    checkpoint: data,
+    contextWindow: 100_000,
+    summaryReserveTokens: 1,
+    softThresholdPercent: 50,
+  });
+
+  assert.ok(result);
+  assert.equal(result.messages.some(
+    (message) => message.role === "assistant" && message.stopReason === "error",
+  ), false);
+  assert.equal(result.messages.at(-1)?.role, "assistant");
+});
+
+test("virtual context refuses a missing assistant error without an adjacent retry response", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-missing-final-error");
+  manager.appendMessage({ ...makeUserMessage("old history"), timestamp: 1_000 });
+  const keptId = manager.appendMessage({ ...makeUserMessage("kept message"), timestamp: 2_000 });
+  const snapshotId = manager.appendMessage({ ...makeUserMessage("snapshot message"), timestamp: 3_000 });
+  manager.appendMessage({ ...makeAssistantErrorMessage("final error"), timestamp: 4_000 });
+  manager.appendMessage({ ...makeUserMessage("new request"), timestamp: 5_000 });
+
+  const eventMessages = manager.buildSessionContext().messages.filter(
+    (message) => message.role !== "assistant" || message.stopReason !== "error",
+  );
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "virtual-checkpoint-missing-final-error",
+    estimatedTokensAfterAtSnapshot: 100,
+  });
+
+  const result = projectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages,
+    checkpoint: data,
+    contextWindow: 100_000,
+    summaryReserveTokens: 1,
+    softThresholdPercent: 50,
+    cache: new VirtualContextProjectionCache(),
+  });
+
+  assert.equal(result, undefined);
+});
+
+test("virtual context refuses a missing ordinary session message", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-missing-ordinary");
+  manager.appendMessage({ ...makeUserMessage("old history"), timestamp: 1_000 });
+  const keptId = manager.appendMessage({ ...makeUserMessage("kept message"), timestamp: 2_000 });
+  const snapshotId = manager.appendMessage({ ...makeUserMessage("snapshot message"), timestamp: 3_000 });
+
+  const eventMessages = manager.buildSessionContext().messages.slice(1);
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "virtual-checkpoint-missing-ordinary",
+    estimatedTokensAfterAtSnapshot: 100,
+  });
+
+  const result = projectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages,
+    checkpoint: data,
+    contextWindow: 100_000,
+    summaryReserveTokens: 1,
+    softThresholdPercent: 50,
+    cache: new VirtualContextProjectionCache(),
+  });
+
+  assert.equal(result, undefined);
 });
 
 test("virtual context preserves a transformed message identified by stable metadata", () => {

@@ -79,13 +79,36 @@ function messageIdentityKey(message: AgentMessage): string | undefined {
   }
 }
 
+function canBeMissingFromLiveContext(
+  sourceMessages: readonly SourceMessage[],
+  sourceIndex: number,
+): boolean {
+  const message = sourceMessages[sourceIndex]!.message;
+  // Pi 自动重试保留失败 entry，删除实时消息，并紧接着产生下一条 assistant 响应。
+  return (
+    message.role === "assistant" &&
+    message.stopReason === "error" &&
+    sourceMessages[sourceIndex + 1]?.message.role === "assistant"
+  );
+}
+
 function findEarliestMatches(
+  sourceMessages: readonly SourceMessage[],
   sourceKeys: readonly string[],
   eventKeys: readonly (string | undefined)[],
-): number[] | undefined {
-  const matches: number[] = [];
+): Array<number | undefined> | undefined {
+  const matches: Array<number | undefined> = [];
+  const eventKeySet = new Set(eventKeys);
   let eventIndex = 0;
-  for (const sourceKey of sourceKeys) {
+  for (let sourceIndex = 0; sourceIndex < sourceKeys.length; sourceIndex += 1) {
+    const sourceKey = sourceKeys[sourceIndex]!;
+    if (
+      !eventKeySet.has(sourceKey) &&
+      canBeMissingFromLiveContext(sourceMessages, sourceIndex)
+    ) {
+      matches.push(undefined);
+      continue;
+    }
     while (eventIndex < eventKeys.length && eventKeys[eventIndex] !== sourceKey) {
       eventIndex += 1;
     }
@@ -99,13 +122,22 @@ function findEarliestMatches(
 }
 
 function findLatestMatches(
+  sourceMessages: readonly SourceMessage[],
   sourceKeys: readonly string[],
   eventKeys: readonly (string | undefined)[],
-): number[] | undefined {
-  const matches = new Array<number>(sourceKeys.length);
+): Array<number | undefined> | undefined {
+  const matches = new Array<number | undefined>(sourceKeys.length);
+  const eventKeySet = new Set(eventKeys);
   let eventIndex = eventKeys.length - 1;
   for (let sourceIndex = sourceKeys.length - 1; sourceIndex >= 0; sourceIndex -= 1) {
-    const sourceKey = sourceKeys[sourceIndex];
+    const sourceKey = sourceKeys[sourceIndex]!;
+    if (
+      !eventKeySet.has(sourceKey) &&
+      canBeMissingFromLiveContext(sourceMessages, sourceIndex)
+    ) {
+      matches[sourceIndex] = undefined;
+      continue;
+    }
     while (eventIndex >= 0 && eventKeys[eventIndex] !== sourceKey) {
       eventIndex -= 1;
     }
@@ -379,8 +411,8 @@ export function tryProjectCheckpointToVirtualContext(
       : firstKeptSourceIndex;
   }
   const eventKeys = eventMessages.map(messageIdentityKey);
-  const earliestMatches = findEarliestMatches(sourceKeys, eventKeys);
-  const latestMatches = findLatestMatches(sourceKeys, eventKeys);
+  const earliestMatches = findEarliestMatches(sourceMessages, sourceKeys, eventKeys);
+  const latestMatches = findLatestMatches(sourceMessages, sourceKeys, eventKeys);
   if (
     !earliestMatches ||
     !latestMatches ||
@@ -389,13 +421,25 @@ export function tryProjectCheckpointToVirtualContext(
     return { status: "unavailable" };
   }
 
+  let lastMatchedEventIndex: number | undefined;
+  for (const match of earliestMatches) {
+    if (match !== undefined) {
+      lastMatchedEventIndex = match;
+    }
+  }
   const boundaryEventIndex = boundarySourceIndex >= sourceMessages.length
-    ? (earliestMatches.length === 0 ? 0 : earliestMatches[earliestMatches.length - 1]! + 1)
-    : earliestMatches[boundarySourceIndex]!;
+    ? (lastMatchedEventIndex ?? -1) + 1
+    : earliestMatches[boundarySourceIndex];
+  if (boundaryEventIndex === undefined) {
+    return { status: "unavailable" };
+  }
 
   const matchedSourceByEvent = new Map<number, number>();
   for (let sourceIndex = 0; sourceIndex < earliestMatches.length; sourceIndex += 1) {
-    matchedSourceByEvent.set(earliestMatches[sourceIndex]!, sourceIndex);
+    const eventIndex = earliestMatches[sourceIndex];
+    if (eventIndex !== undefined) {
+      matchedSourceByEvent.set(eventIndex, sourceIndex);
+    }
   }
   const summaryMessage = checkpointToCompactionSummaryMessage(checkpoint);
   if (!summaryMessage) {
@@ -423,7 +467,11 @@ export function tryProjectCheckpointToVirtualContext(
     if (source.branchIndex > snapshotIndex) {
       break;
     }
-    const eventMessage = eventMessages[earliestMatches[sourceIndex]!];
+    const eventIndex = earliestMatches[sourceIndex];
+    if (eventIndex === undefined) {
+      continue;
+    }
+    const eventMessage = eventMessages[eventIndex];
     if (!eventMessage) {
       return { status: "unavailable" };
     }
@@ -436,11 +484,12 @@ export function tryProjectCheckpointToVirtualContext(
 
   let lastPreSnapshotEventIndex = -1;
   for (let sourceIndex = 0; sourceIndex < sourceMessages.length; sourceIndex += 1) {
-    if (sourceMessages[sourceIndex]!.branchIndex <= snapshotIndex) {
-      lastPreSnapshotEventIndex = Math.max(
-        lastPreSnapshotEventIndex,
-        earliestMatches[sourceIndex]!,
-      );
+    const eventIndex = earliestMatches[sourceIndex];
+    if (
+      sourceMessages[sourceIndex]!.branchIndex <= snapshotIndex &&
+      eventIndex !== undefined
+    ) {
+      lastPreSnapshotEventIndex = Math.max(lastPreSnapshotEventIndex, eventIndex);
     }
   }
   const tailStart = lastPreSnapshotEventIndex + 1;

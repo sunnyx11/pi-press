@@ -173,7 +173,7 @@ checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只
 - 虚拟转换不得修改 `event.messages`、`agent.state.messages` 或 SessionManager 返回的数据；必须返回新数组和新建的摘要消息。
 - 虚拟上下文预计大小超过 `softThresholdPercent` 时可以继续使用已有虚拟上下文，但必须请求下一代 checkpoint；超过 hard limit 时不得将该候选标记为已应用。
 - 每次 `context` 事件按当前模型和 Pi `compaction.reserveTokens` 计算临界值：`max(0, contextWindow - reserveTokens - max(4096, ceil(contextWindow * 0.02)))`。`ctx.getContextUsage().tokens` 达到该值且没有 ready checkpoint 时，处理器等待兼容任务至其剩余 `taskTimeoutMs`；没有兼容任务时启动一次跳过软阈值检查的紧急预压缩并按相同期限等待。任务失败或超时后返回事件原消息。低于临界值但虚拟候选超过 hard limit 时，处理器按 `hookWaitTimeoutMs` 等待已有刷新任务。
-- `context` 与其他扩展按注册顺序串行执行。Pi-press 必须证明当前事件消息与 SessionManager 派生的边界能够无歧义对应；无法保留其他扩展的上下文变换时返回事件原消息，禁止静默丢弃其他扩展注入的消息。
+- `context` 与其他扩展按注册顺序串行执行。Pi-press 必须证明当前事件消息与 SessionManager 派生的压缩边界能够无歧义对应。Pi 自动重试从 `agent.state.messages` 删除但保留于 session 的 `role: "assistant"`、`stopReason: "error"` 消息，在 SessionManager 派生消息中紧邻后续 assistant 响应且不影响压缩边界定位时可以缺失；其他 SessionManager 派生消息必须按稳定身份和原顺序唯一匹配。无法满足这些条件时返回事件原消息，禁止静默丢弃其他扩展注入或变换的消息。
 - checkpoint 首次成功用于请求时记录 checkpoint ID、session ID 和 epoch。后续每次成功应用更新使用状态；更新一代 checkpoint 无需先用于 `context`，`agent_settled` 正式化仍可选择该 epoch 最新有效 checkpoint。
 - 正式 compaction entry 出现、session 或分支变化、checkpoint 失效以及 `precomputeMode: "off"` 时立即停止应用旧虚拟状态。
 
