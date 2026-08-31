@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-31
+
+### Added
+
+- 结构化运行事件默认持久化到独立 SQLite 数据库，支持保留天数和容量限制；数据库故障时保留内存诊断，且不影响 session 或压缩状态。
+- 新增 `/pi-press-diagnostics` 命令，可按当前或指定 session 查询最近事件并输出 JSON；诊断存储方式、保留天数和容量上限可通过配置调整。
+
+### Fixed
+
+- Pi 自动重试移除已持久化的失败 assistant 响应时，允许虚拟上下文在重试响应相邻且压缩边界明确的情况下继续应用；其他消息缺失仍返回原始上下文。
+
 ## [0.3.4] - 2026-08-25
 
 ### Changed
@@ -97,7 +108,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sunnyx11/pi-press/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/sunnyx11/pi-press/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/sunnyx11/pi-press/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/sunnyx11/pi-press/compare/v0.3.1...v0.3.2
