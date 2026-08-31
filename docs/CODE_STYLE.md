@@ -14,7 +14,7 @@
 
 当前项目依赖 `@earendil-works/pi-coding-agent >=0.84.3`，Node.js 版本以实际安装的发行包要求为准。设计文档是 `pi-press` 的行为契约，本文件负责把该契约转换为代码组织和实现规则。
 
-npm 发布包中的 Pi 核心包必须声明为 `peerDependencies: "*"`，由 Pi 宿主提供；本地类型检查和测试使用 `devDependencies` 中的最低兼容版本，禁止把 Pi 核心包作为普通运行时依赖随扩展重复安装。
+npm 发布包中的 Pi 核心包必须声明为 `peerDependencies: "*"`，由 Pi 宿主提供；`devDependencies` 保留最低兼容范围 `>=0.84.3`，本地类型检查和测试使用 `package-lock.json` 固定的 Pi 0.84.4，禁止把 Pi 核心包作为普通运行时依赖随扩展重复安装。
 
 ## 核心原则
 
@@ -227,7 +227,7 @@ import {
 | 事件 | 处理要求 |
 | --- | --- |
 | `session_start` | 通过 `ctx.sessionManager.getEntries()`、`getBranch()` 恢复 checkpoint、正式 compaction epoch、消费状态和当前分支。 |
-| `turn_end` | 读取 `ctx.getContextUsage()`，判断软阈值或已应用虚拟 checkpoint 的尾部容量，获取快照并调度后台任务。处理器必须在后台摘要完成前返回。 |
+| `turn_end` | 读取 `ctx.getContextUsage()`，判断软阈值或已应用虚拟 checkpoint 的尾部容量，获取快照并调度后台任务。处理器必须在后台摘要完成前返回；Pi 0.84.4 及更高版本可随后在同一 agent 的下一次 assistant 请求前执行原生阈值压缩。 |
 | `context` | 每次 provider 请求前重新校验 ready checkpoint，构造虚拟 `compactionSummary` 和当前未压缩尾部；映射不明确时返回原消息。 |
 | `agent_settled` | 等待兼容后台任务，选择最新 checkpoint，以同步保留量预检查当前分支；不可用时保存 deferred，可用时延迟调用 `ctx.compact()`。 |
 | `session_before_compact` | 校验 reason、signal、分支、epoch、checkpoint 和容量；可返回兼容 `CompactionResult`，否则返回 `undefined` 让 Pi 使用原生实现。 |
@@ -239,7 +239,7 @@ import {
 | `model_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取模型 provenance，不废弃已有 ready checkpoint，也不改变 snapshot key。 |
 | `thinking_level_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取 thinking level，不承担 checkpoint 失效和消费判断。 |
 
-`turn_end` 不调用 `ctx.compact()`，因为当前 agent loop 仍可能继续采样。`agent_end` 之后仍可能发生自动重试、原生压缩或排队消息续跑；只有 `agent_settled` 后，且虚拟 checkpoint 已实际用于请求、上下文仍有效并且 `ctx.isIdle()` 为真时，才允许等待兼容后台任务并安排正式化。正式化通过 Pi `SettingsManager` 获取当前 `compaction.keepRecentTokens`，以该值对当前分支构造无 parent preparation；不可用时保存 deferred 并按叶节点等待后续检查，可用时设置 pending 并调用 `ctx.compact()`。正式 `compaction` entry 由 Pi 写入。overflow 或 `willRetry: true` 只复用比失败请求更新的 checkpoint；等待失败时返回 `undefined`，保留 Pi 原生压缩和自动重试。带 `customInstructions` 的请求使用 Pi 原生 compaction。
+`turn_end` 不调用 `ctx.compact()`，因为当前 agent loop 仍可能继续采样。Pi 0.84.4 及更高版本在 `turn_end` 后可于下一次 assistant 请求前执行原生阈值压缩；Pi 0.84.3 在 `agent_end` 后执行原生压缩检查。`agent_end` 之后仍可能发生自动重试、最终压缩检查或排队消息续跑。只有 `agent_settled` 后，且虚拟 checkpoint 已实际用于请求、上下文仍有效并且 `ctx.isIdle()` 为真时，才允许等待兼容后台任务并安排正式化。正式化通过 Pi `SettingsManager` 获取当前 `compaction.keepRecentTokens`，以该值对当前分支构造无 parent preparation；不可用时保存 deferred 并按叶节点等待后续检查，可用时设置 pending 并调用 `ctx.compact()`。正式 `compaction` entry 由 Pi 写入。overflow 或 `willRetry: true` 只复用比失败请求更新的 checkpoint；等待失败时返回 `undefined`，保留 Pi 原生压缩和自动重试。带 `customInstructions` 的请求使用 Pi 原生 compaction。
 
 `session_before_compact` 的 handler 只在 checkpoint 完整满足项目设计时返回：
 
@@ -537,7 +537,7 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 
 ### 测试边界
 
-测试必须使用实际安装的 `@earendil-works/pi-coding-agent` 发布包和包根公开接口，最低依赖版本为 `0.84.3`。测试禁止导入 `dist/core/...`、内部 `prepareCompaction()` 或手工 session JSONL 解析器。
+测试必须使用实际安装的 `@earendil-works/pi-coding-agent` 发布包和包根公开接口。最低兼容版本为 `0.84.3`，默认安装版本由 `package-lock.json` 固定为 `0.84.4`。仅属于 0.84.4 及更高版本的宿主时序测试在 0.84.3 环境明确跳过。测试禁止导入 `dist/core/...`、内部 `prepareCompaction()` 或手工 session JSONL 解析器。
 
 ### 单元测试
 
@@ -555,6 +555,7 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 使用公开 SDK、模拟 provider 和固定 session fixture 覆盖：
 
 - `context` 返回的虚拟摘要和当前尾部只影响当次 provider 请求；
+- Pi 0.84.4 在同一 agent 的工具结果后、下一次 assistant 请求前触发 threshold compaction 时，ready checkpoint 被复用，正式摘要和该工具结果尾部进入下一次 provider 请求；
 - `agent_settled` 的无 parent preparation 预检查、同叶 deferred 去重、新叶重检和 `Nothing to compact (session too small)` 分类；
 - native compaction、tree 切换、session shutdown 和 `precomputeMode: "off"` 清除 deferred 状态；
 - 正式化普通错误最多累计两次失败；第一次失败保留虚拟状态并允许重试，第二次失败使当前 epoch 的虚拟投影和 checkpoint 生成停用；延期不产生 warning 或失败计数；
@@ -604,7 +605,7 @@ npm run test:smoke:pi
 
 1. 阅读新版本的扩展和 compaction 文档；
 2. 对照包根导出表和类型定义检查公开 API；
-3. 更新 `>=0.84.3` 依赖范围和 lockfile 中的根依赖声明；
+3. 确认最低兼容范围；最低版本提高时更新 `>=0.84.3` 依赖范围，将 lockfile 的实际解析版本固定为目标验证版本；
 4. 比较 Pi preparation、session entry、provider auth 和事件返回值的变化；
 5. 更新版本适配模块、checkpoint 兼容性校验和差异测试；
 6. 在兼容性测试通过前保留 CLI 失败通知和 Pi 原生回退。

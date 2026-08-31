@@ -2,13 +2,19 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxProvider, type Context } from "@earendil-works/pi-ai";
+import {
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall,
+  type Context,
+} from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
   SettingsManager,
+  VERSION,
   type ExtensionAPI,
   type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -20,6 +26,11 @@ import { DEFAULT_CONFIG } from "../../src/config.js";
 import registerPiPress from "../../src/index.js";
 import { waitFor } from "../runtime-fixture.js";
 import { makeCheckpointData, makeUsage, makeUserMessage } from "../unit/fixtures.js";
+
+const [piMajor = 0, piMinor = 0, piPatch = 0] = VERSION.split(".").map(Number);
+const supportsSameRunToolCompaction =
+  piMajor > 0 || piMinor > 84 || (piMinor === 84 && piPatch >= 4);
+const sameRunToolCompactionTest = supportsSameRunToolCompaction ? test : test.skip;
 
 test("public agent session applies virtual context and formalizes it after settlement", async () => {
   const cwd = mkdtempSync(join("/tmp", "pi-press-agent-loop-"));
@@ -201,6 +212,158 @@ test("public agent session applies virtual context and formalizes it after settl
             "piPress" in entry.details &&
             (entry.details as { piPress?: { checkpointId?: string } }).piPress?.checkpointId ===
               "agent-loop-checkpoint",
+        ),
+        true,
+      );
+    } finally {
+      session.dispose();
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+sameRunToolCompactionTest("Pi 0.84.4 compacts after a tool result before the next assistant request", async () => {
+  const cwd = mkdtempSync(join("/tmp", "pi-press-agent-tool-loop-"));
+  const agentDir = join(cwd, "agent");
+  mkdirSync(join(cwd, ".pi"), { recursive: true });
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(join(cwd, "tail.txt"), "tool tail marker\n");
+  writeFileSync(
+    join(cwd, ".pi", "pi-press.json"),
+    JSON.stringify({
+      precomputeMode: "threshold",
+      summaryReserveTokens: 1,
+    }),
+  );
+  writeFileSync(
+    join(cwd, ".pi", "settings.json"),
+    JSON.stringify({
+      compaction: {
+        enabled: true,
+        reserveTokens: 1,
+        keepRecentTokens: 100,
+      },
+    }),
+  );
+
+  const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+  manager.appendMessage(makeUserMessage("old history ".repeat(12_000)));
+  const keptId = manager.appendMessage(makeUserMessage("kept history"));
+  const snapshotId = manager.appendMessage(makeUserMessage("snapshot history"));
+  const checkpoint = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "tool-loop-checkpoint",
+    estimatedTokensAfterAtSnapshot: 100,
+    compaction: {
+      summary: "tool-loop virtual summary",
+      firstKeptEntryId: keptId,
+      tokensBefore: 36_000,
+    },
+  });
+  manager.appendCustomEntry("pi-press.precompaction", checkpoint);
+
+  const faux = fauxProvider({
+    api: "openai-responses",
+    provider: "test",
+    models: [{ id: "model-id", contextWindow: 20_000, maxTokens: 4_096 }],
+  });
+  const observedContexts: Context[] = [];
+  let compactionPresentBeforeSecondRequest = false;
+  faux.setResponses([
+    (context) => {
+      observedContexts.push(context);
+      return fauxAssistantMessage(
+        fauxToolCall("read", { path: "tail.txt" }, { id: "tail-read" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    (context) => {
+      observedContexts.push(context);
+      compactionPresentBeforeSecondRequest = manager.getBranch().some(
+        (entry) => entry.type === "compaction",
+      );
+      return fauxAssistantMessage("finished same run");
+    },
+  ]);
+
+  const modelRuntime = await ModelRuntime.create({
+    authPath: join(agentDir, "auth.json"),
+    modelsPath: null,
+    allowModelNetwork: false,
+  });
+  modelRuntime.registerNativeProvider(faux.provider);
+  const settingsManager = SettingsManager.create(cwd, agentDir);
+  let firstProviderRequest = true;
+  const inflateFirstProviderRequest = (pi: ExtensionAPI): void => {
+    pi.on("context", (event) => {
+      if (!firstProviderRequest) {
+        return;
+      }
+      firstProviderRequest = false;
+      return {
+        messages: [
+          ...event.messages,
+          makeUserMessage("transient provider overhead ".repeat(5_000)),
+        ],
+      };
+    });
+  };
+  const resourceLoader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    settingsManager,
+    extensionFactories: [registerPiPress, inflateFirstProviderRequest],
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+  });
+  await resourceLoader.reload();
+
+  try {
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir,
+      modelRuntime,
+      settingsManager,
+      resourceLoader,
+      sessionManager: manager,
+      model: faux.getModel(),
+      thinkingLevel: "off",
+      tools: ["read"],
+    });
+
+    try {
+      await session.prompt("continue current task ".repeat(100));
+
+      assert.equal(observedContexts.length, 2);
+      assert.equal(compactionPresentBeforeSecondRequest, true);
+      const secondRequestMessages = observedContexts[1]?.messages ?? [];
+      assert.equal(secondRequestMessages[0]?.role, "user");
+      const summaryContent = secondRequestMessages[0]?.content;
+      assert.ok(Array.isArray(summaryContent));
+      assert.match(
+        summaryContent[0]?.type === "text" ? summaryContent[0].text : "",
+        /tool-loop virtual summary/,
+      );
+      assert.equal(session.state.messages[0]?.role, "compactionSummary");
+      assert.equal(
+        secondRequestMessages.some(
+          (message) => message.role === "toolResult" &&
+            message.content.some(
+              (block) => block.type === "text" && block.text.includes("tool tail marker"),
+            ),
+        ),
+        true,
+      );
+      assert.equal(
+        manager.getBranch().some(
+          (entry) => entry.type === "compaction" &&
+            entry.details &&
+            typeof entry.details === "object" &&
+            "piPress" in entry.details &&
+            (entry.details as { piPress?: { checkpointId?: string } }).piPress?.checkpointId ===
+              "tool-loop-checkpoint",
         ),
         true,
       );

@@ -51,7 +51,7 @@ Pi-press 自行实现并维护以下内容：
 
 ## 兼容范围
 
-- npm 发布包将 `@earendil-works/pi-agent-core`、`@earendil-works/pi-ai` 和 `@earendil-works/pi-coding-agent` 声明为 `peerDependencies: "*"`，由 Pi 宿主提供运行时核心包；开发依赖使用 `>=0.84.3`，当前最低兼容版本为 `0.84.3`。
+- npm 发布包将 `@earendil-works/pi-agent-core`、`@earendil-works/pi-ai` 和 `@earendil-works/pi-coding-agent` 声明为 `peerDependencies: "*"`，由 Pi 宿主提供运行时核心包；开发依赖范围为 `>=0.84.3`，最低兼容版本为 `0.84.3`，`package-lock.json` 固定的当前集成验证版本为 `0.84.4`。
 - 当前包根 `VERSION` 写入 checkpoint provenance，并用于拒绝复用其他 Pi 版本生成的 checkpoint。版本升级后会生成新的 checkpoint。
 - 公开 API、provider、超时、结果校验或 checkpoint 追加失败时，通过 CLI error 通知显示错误；虚拟转换返回事件原消息，正式 hook 返回空结果并由 Pi 原生流程继续处理。preparation 不可用时只记录诊断并静默跳过；生成或消费阶段容量不满足目标、hook 等待超时时，通过 CLI warning 通知显示跳过原因和原生后备处理状态。
 - 所有运行时导入必须来自包根入口，禁止通过 `dist/core/...` 引用深层模块。
@@ -102,7 +102,19 @@ pi.appendEntry() 追加 pi-press custom checkpoint
                         后续 assistant/toolResult 仍写入原始 session
                                       |
                                       v
-                agent_end 后由 Pi 先执行自动重试和原生压缩检查
+       Pi 0.84.4+ 在 turn_end 后、下一次 assistant 请求前检查原生压缩
+                                      |
+                  +-------------------+-------------------+
+                  |                                       |
+          Pi 已写入正式 compaction                 Pi 未写入正式 compaction
+                  |                                       |
+                  v                                       v
+        session_compact 清除虚拟状态             下一次 context 保持虚拟压缩
+                  |                                       |
+                  +-------------------+-------------------+
+                                      |
+                                      v
+                  agent_end 后由 Pi 执行自动重试和原生压缩检查
                                       |
                   +-------------------+-------------------+
                   |                                       |
@@ -129,7 +141,7 @@ pi.appendEntry() 追加 pi-press custom checkpoint
 
 虚拟压缩不修改 `agent.state.messages`，也不追加正式 session entry。Pi 的内部 transcript 和 JSONL 在当前 agent 运行期间仍保留原始消息；只有发送给 provider 的消息副本发生变化。provider 返回的 usage 因而反映虚拟压缩后的请求大小，不能据此保证 Pi 原生阈值一定生成正式 compaction。
 
-checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只在 `context` 返回值中使用其摘要；最终生效的 `type: "compaction"` entry 仍由 Pi 写入。Pi 原生压缩优先；如果原生检查没有写入正式 entry，Pi-press 才在 `agent_settled` 后调用 `ctx.compact()`。正式压缩完成后，session 恢复、分支和 TUI 继续使用 Pi 的实现。
+checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只在 `context` 返回值中使用其摘要；最终生效的 `type: "compaction"` entry 仍由 Pi 写入。Pi 原生压缩优先；Pi 0.84.4 及更高版本可在同一 agent 的 `turn_end` 之后、下一次 assistant 请求之前写入正式 entry，并在 `agent_end` 后处理自动重试和最终压缩检查；Pi 0.84.3 在 `agent_end` 后执行原生压缩检查。原生检查均未写入正式 entry 时，Pi-press 才在 `agent_settled` 后调用 `ctx.compact()`。正式压缩完成后，session 恢复、分支和 TUI 继续使用 Pi 的实现。
 
 后台 checkpoint 未完成时，`context` 在临界值之前返回原消息；达到临界值后等待兼容任务或启动紧急预压缩。任务失败、任务超时、checkpoint 已失效或当前虚拟上下文超过安全容量时，`context` 返回原消息并记录诊断。如果正式 compaction 时 checkpoint 不可复用，`session_before_compact` 返回空结果，由 Pi 使用原生摘要流程。
 
@@ -167,7 +179,7 @@ checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只
 
 ### 正式 compaction
 
-- Pi 在 `agent_end` 后执行自动重试和原生 compaction 检查，原生正式压缩始终优先。
+- Pi 0.84.4 及更高版本在同一 agent 的 `turn_end` 之后、下一次 assistant 请求之前执行原生阈值检查，并在 `agent_end` 后处理自动重试和最终 compaction 检查；Pi 0.84.3 在 `agent_end` 后执行原生 compaction 检查。原生正式压缩始终优先。
 - 扩展不得在 `turn_end` 调用 `ctx.compact()`；此时 agent loop 仍可能继续采样，调用会中止当前操作。
 - 扩展不得在 `agent_end` 调用 `ctx.compact()`；该事件之后仍可能发生自动重试、原生压缩或排队消息续跑。
 - 只有 `agent_settled` 表示本轮 session 级运行已经结束。存在已实际应用的虚拟 checkpoint、尚无同 epoch 正式 compaction、没有 pending 正式化请求且 `ctx.isIdle()` 为真时，扩展才调度 `ctx.compact()`。
@@ -503,8 +515,8 @@ custom checkpoint 和 metrics entry 会成为 session tree 中的新 leaf，但�
 
 - `session_start`：通过 `ctx.sessionManager.getEntries()` 和 `getBranch()` 恢复当前分支 checkpoint、正式 compaction epoch 与消费记录；内存中不恢复“已经应用”标记，首次 `context` 必须重新校验后再记录。
 - `context`：从当前事件消息和分支构造虚拟上下文；正式 compaction epoch 变化时清除旧虚拟状态。
-- `turn_end`：检查软阈值、调度或刷新 checkpoint；不调用 `ctx.compact()`。
-- `agent_end`：不发起正式压缩，等待 Pi 完成自动重试、自动 compaction 和排队消息处理。
+- `turn_end`：检查软阈值、调度或刷新 checkpoint；不调用 `ctx.compact()`。处理器返回后，Pi 0.84.4 及更高版本可在同一 agent 的下一次 assistant 请求前执行原生阈值压缩。
+- `agent_end`：不发起正式压缩；Pi 0.84.3 在该事件后执行原生 compaction 检查，Pi 0.84.4 及更高版本执行最终检查；所有兼容版本还可处理自动重试和排队消息。
 - `agent_settled`：在虚拟 checkpoint 已实际使用且 `ctx.isIdle()` 为真时，安排一次延迟的正式化检查。
 - `session_before_tree`：递增内存 `runEpoch`，中止当前任务，取消正式化调度并清除虚拟、deferred 和 pending 状态，确保旧分支闭包不能追加 entry 或发起 compaction。
 - `session_tree`：按新分支恢复状态；不重复递增已经由 `session_before_tree` 更新的 `runEpoch`。
@@ -594,7 +606,7 @@ Promise
 
 ### 发布包接口与版本适配
 
-测试以当前安装的 `@earendil-works/pi-coding-agent` 发布包为对象，最低依赖版本为 `0.84.3`：
+测试以 `package-lock.json` 固定的 `@earendil-works/pi-coding-agent 0.84.4` 发布包为默认对象，最低兼容版本为 `0.84.3`：
 
 - 生产代码只从包根入口导入，构建测试阻止 `dist/core/...` 深层导入；
 - 不通过 `VERSION` 做全局启用门控；当前版本会写入 checkpoint，版本不兼容产生的运行时错误通过 CLI 通知显示，并回退 Pi 原生 compaction；
@@ -635,6 +647,7 @@ Promise
 - 每次 provider 请求前都会执行 `context` handler；checkpoint 未 ready、失效或发生异常时返回事件原消息。
 - ready checkpoint 生成一个 `compactionSummary`，并准确保留 `firstKeptEntryId` 开始的 context-visible 消息。
 - 首次虚拟请求、连续多次工具调用和后续请求均使用同一摘要并追加最新尾部；assistant/toolResult 顺序和 tool call ID 配对保持有效。
+- Pi 0.84.4 在同一 agent 的工具结果后、下一次 assistant 请求前触发 threshold compaction 时复用 ready checkpoint，第二次 provider 请求使用正式摘要并保留该工具结果尾部；0.84.3 环境跳过该宿主时序专项测试。
 - 并行工具批次的所有结果都在下一次 provider 请求中出现，不在单个 `tool_execution_end` 时提前构造上下文。
 - `event.messages`、agent 内部 transcript、SessionManager entry 和 checkpoint 数据均未被虚拟转换修改。
 - 虚拟 provider usage 小于完整 transcript usage 时，Pi 原生 threshold 可能不执行；该情况仍会进入 `agent_settled` 正式化。
@@ -693,7 +706,7 @@ Promise
 11. 并行工具批次完成后的下一次请求包含整批 tool result，工具调用和结果顺序满足 Pi 原生约束。
 12. 其他扩展修改 `context` 时保持 handler 顺序；无法无歧义映射保留边界或 handler 内部失败时返回事件原消息，不丢弃其他扩展内容。
 13. 虚拟容量未超过 hard limit 时正常应用；达到 soft limit 时调度下一代；超过 hard limit 且无及时完成的新 checkpoint 时记录保护能力不足。
-14. 虚拟请求的 provider usage 即使使 Pi 原生 threshold 保持未满足，已实际应用的 checkpoint 仍会在 `agent_settled` 后进入正式化。
+14. Pi 在同一 agent 的工具结果后、下一次 assistant 请求前触发原生 threshold 时复用 ready checkpoint，正式摘要和工具结果尾部进入下一次 provider 请求；虚拟请求的 provider usage 未触发原生 threshold 时，已实际应用的 checkpoint 在 `agent_settled` 后进入正式化。
 15. `turn_end` 和 `agent_end` 不调用 `ctx.compact()`；`agent_settled` 只安排延迟回调。回调等待兼容后台任务，选择最新 checkpoint，通过 Pi `SettingsManager` 获取当前 `compaction.keepRecentTokens`，以该值对当前分支执行无 parent preparation 预检查，并在 `ctx.isIdle()`、session、epoch 和分支祖先校验通过后发起一次调用；preparation 不可用时按当前叶节点延期。
 16. deferred 在同一叶节点静默跳过，新叶节点重新检查；`Nothing to compact (session too small)` 不产生 warning、`formalization_failed` 或失败次数。其他错误在同一 session 和 epoch 最多累计两次失败；达到上限后停止该 epoch 的虚拟投影和 checkpoint 生成，后续请求使用原始上下文。
 17. 默认 `precomputeMode: "threshold"` 下，内部 `reason: "manual"` 事件通过 `pendingFormalization` 精确匹配并复用指定 checkpoint；使用者 `/compact` 只有在 `"threshold-and-manual"` 且无自定义指令时复用。
