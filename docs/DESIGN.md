@@ -13,6 +13,7 @@
 - 虚拟压缩只替换当次请求的消息副本，不修改 Pi 的 session entry 或 `agent.state.messages`。
 - Pi 原生自动压缩尚未产生正式 entry 时，在 `agent_settled` 后等待兼容后台任务完成，再通过 `ctx.compact()` 发起一次宿主管理的正式压缩，并复用同 epoch 最新 checkpoint。
 - 正式 `compaction` entry、agent 上下文重建、恢复、分支和 TUI 行为继续使用 Pi 的实现。
+- 运行事件和 Runtime 标量状态保存到独立 SQLite 诊断库，用于跨重启排查，不参与压缩状态恢复或 checkpoint 选择。
 
 Pi-press 自行实现并维护以下内容：
 
@@ -59,6 +60,7 @@ Pi-press 自行实现并维护以下内容：
 - `@earendil-works/pi-agent-core` harness 使用不同的 compaction 契约，不属于本设计的目标实现。
 - `ctx.compact()` 不返回 Promise，`session_before_compact` 也不提供调用方 request ID。扩展通过调用前设置的 `pendingFormalization`、当前 session、epoch 和 checkpoint ID 识别内部 manual 请求；request ID 只用于扩展自己的延迟回调和完成回调。其他扩展在同一空闲区间并发调用 manual compaction 时，公开 API 无法提供跨扩展原子互斥，最终以 Pi 发出的 `session_compact` 和最新 epoch 为准。
 - checkpoint 使用独立的协议版本。未知版本、损坏数据和无效 entry 引用必须被忽略，并回退到 Pi 原生 compaction。
+- 默认诊断存储使用 Node 内置 `node:sqlite`。Node 22 会显示 `ExperimentalWarning: SQLite is an experimental feature and might change at any time`，该警告属于当前运行时契约。
 - Pi 版本升级后必须重新执行版本适配模块的差异测试和扩展集成测试。
 
 ## 核心模型
@@ -173,7 +175,7 @@ checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只
 - 虚拟转换不得修改 `event.messages`、`agent.state.messages` 或 SessionManager 返回的数据；必须返回新数组和新建的摘要消息。
 - 虚拟上下文预计大小超过 `softThresholdPercent` 时可以继续使用已有虚拟上下文，但必须请求下一代 checkpoint；超过 hard limit 时不得将该候选标记为已应用。
 - 每次 `context` 事件按当前模型和 Pi `compaction.reserveTokens` 计算临界值：`max(0, contextWindow - reserveTokens - max(4096, ceil(contextWindow * 0.02)))`。`ctx.getContextUsage().tokens` 达到该值且没有 ready checkpoint 时，处理器等待兼容任务至其剩余 `taskTimeoutMs`；没有兼容任务时启动一次跳过软阈值检查的紧急预压缩并按相同期限等待。任务失败或超时后返回事件原消息。低于临界值但虚拟候选超过 hard limit 时，处理器按 `hookWaitTimeoutMs` 等待已有刷新任务。
-- `context` 与其他扩展按注册顺序串行执行。Pi-press 必须证明当前事件消息与 SessionManager 派生的压缩边界能够无歧义对应。Pi 自动重试从 `agent.state.messages` 删除但保留于 session 的 `role: "assistant"`、`stopReason: "error"` 消息，在 SessionManager 派生消息中紧邻后续 assistant 响应且不影响压缩边界定位时可以缺失；其他 SessionManager 派生消息必须按稳定身份和原顺序唯一匹配。无法满足这些条件时返回事件原消息，禁止静默丢弃其他扩展注入或变换的消息。
+- `context` 与其他扩展按注册顺序串行执行。Pi-press 必须证明当前事件消息与 SessionManager 派生的压缩边界能够无歧义对应。Pi 自动重试从 `agent.state.messages` 删除但保留于 session 的 `role: "assistant"`、`stopReason: "error"` 消息，在 SessionManager 派生消息中紧邻后续 assistant 响应且不影响压缩边界定位时可以缺失；其他 SessionManager 派生消息必须按稳定身份和原顺序唯一匹配。无法满足这些条件时返回事件原消息，记录 `message_mapping_unavailable` 等结构化原因码及源消息和事件消息数量，禁止静默丢弃其他扩展注入或变换的消息。
 - checkpoint 首次成功用于请求时记录 checkpoint ID、session ID 和 epoch。后续每次成功应用更新使用状态；更新一代 checkpoint 无需先用于 `context`，`agent_settled` 正式化仍可选择该 epoch 最新有效 checkpoint。
 - 正式 compaction entry 出现、session 或分支变化、checkpoint 失效以及 `precomputeMode: "off"` 时立即停止应用旧虚拟状态。
 
@@ -207,12 +209,15 @@ Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项�
 | `summaryReserveTokens` | `16384` | 传给 preparation 的摘要输出预算 |
 | `taskTimeoutMs` | `300000` | 单次后台任务总超时 |
 | `hookWaitTimeoutMs` | `1000` | 正式压缩 hook 与临界值之前的 hard-limit 场景等待兼容任务的最长时间；临界 `context` 等待使用任务自身的剩余 `taskTimeoutMs` |
+| `diagnosticsPersistence` | `"sqlite"` | `"sqlite"` 将结构化事件写入独立数据库；`"memory"` 只保留当前 Runtime 的内存诊断 |
+| `diagnosticsRetentionDays` | `30` | SQLite 事件保留天数，允许范围为 `1..3650` |
+| `diagnosticsMaxDatabaseMiB` | `64` | SQLite 数据库容量上限，允许范围为 `1..1024` MiB；超过上限时删除最早事件 |
 
 checkpoint preparation 固定使用 `keepRecentTokens: 10000`，用于在 checkpoint 中保存约 10000 token 的原始近期消息。正式化 preparation 使用 Pi `SettingsManager.getCompactionKeepRecentTokens()` 返回的当前生效值；请求前临界值使用 `SettingsManager.getCompactionReserveTokens()` 返回的当前生效值。该管理器合并全局与受信任项目的 `settings.json`，字段缺失时返回 Pi 默认值。后台摘要请求固定允许一次瞬时错误重试。同一正式 compaction epoch 可连续刷新 checkpoint，每一代继承 parent 摘要并只处理新增历史。
 
-容量校验与请求前临界等待均预留 `max(4096, ceil(contextWindow * 0.02))` 的容量余量。预计上下文达到 `softThresholdPercent` 时启动下一代任务，超过 hard limit 的 checkpoint 不用于 provider 请求或正式复用。临界等待值随每次事件的活动模型 `contextWindow` 和 Pi `compaction.reserveTokens` 计算，不属于 Pi-press 配置。实现必须校验百分比、token 和超时字段的范围；`taskTimeoutMs` 与 `hookWaitTimeoutMs` 必须是 `1..2147483647` 范围内的整数，无效字段使用默认值并记录诊断。旧版 `targetPostCompactionPercent` 字段只记录一次警告并忽略，不参与 fingerprint。
+容量校验与请求前临界等待均预留 `max(4096, ceil(contextWindow * 0.02))` 的容量余量。预计上下文达到 `softThresholdPercent` 时启动下一代任务，超过 hard limit 的 checkpoint 不用于 provider 请求或正式复用。临界等待值随每次事件的活动模型 `contextWindow` 和 Pi `compaction.reserveTokens` 计算，不属于 Pi-press 配置。实现必须校验百分比、token、超时和诊断存储字段的范围；`taskTimeoutMs` 与 `hookWaitTimeoutMs` 必须是 `1..2147483647` 范围内的整数，无效字段使用默认值并记录诊断。旧版 `targetPostCompactionPercent` 字段只记录一次警告并忽略，不参与 fingerprint。
 
-Pi compaction 的保留量属于 Pi settings，不属于 Pi-press 配置，也不参与配置 fingerprint。Pi-press 通过公开 `SettingsManager` 读取生效值，不自行解析 Pi settings 文件。配置 fingerprint 参与 snapshot key，防止同一内容在不同 checkpoint 生成配置下错误去重。已生成 checkpoint 不因模型、thinking level 或预算配置变化自动失效；虚拟应用和正式消费时均按当前模型重新校验容量。`precomputeMode` 为 `"off"` 时中止 in-flight 任务、取消正式化调度、清除 deferred、pending 和虚拟状态，并停止消费 ready checkpoint；已经交给 Pi 的正式 compaction 由宿主继续完成。
+Pi compaction 的保留量属于 Pi settings，不属于 Pi-press 配置，也不参与配置 fingerprint。诊断存储方式、保留天数和容量上限同样不参与 fingerprint，修改这些字段不会改变 checkpoint 内容身份。Pi-press 通过公开 `SettingsManager` 读取生效值，不自行解析 Pi settings 文件。配置 fingerprint 参与 snapshot key，防止同一内容在不同 checkpoint 生成配置下错误去重。已生成 checkpoint 不因模型、thinking level 或预算配置变化自动失效；虚拟应用和正式消费时均按当前模型重新校验容量。`precomputeMode` 为 `"off"` 时中止 in-flight 任务、取消正式化调度、清除 deferred、pending 和虚拟状态，并停止消费 ready checkpoint；已经交给 Pi 的正式 compaction 由宿主继续完成。
 
 ## 预压缩检查点 JSONL 契约
 
@@ -600,7 +605,11 @@ Promise
 - 后台请求期间的前台请求耗时与 provider 限流错误；
 - 每个 epoch 的刷新次数。
 
-诊断默认保存在内存中。需要跨重启统计时，按批次通过 `pi.appendEntry("pi-press.metrics", data)` 持久化聚合值；metrics custom entry 不进入 LLM 上下文。usage 从 checkpoint 转入正式 compaction 后，Pi-press 报告必须标记为 consumed，禁止与 Pi session stats 相加后声称为新的额外费用。
+结构化事件默认写入 `getAgentDir()/pi-press/diagnostics.sqlite3`。数据库只服务事后查询，不写入 session JSONL，不作为 checkpoint 有效性、候选顺序、正式化状态或 Runtime 恢复依据。每个事件包含时间、进程和 Runtime 标识、类别、事件名，以及可用的 session ID、正式 compaction epoch、branch leaf、checkpoint ID、原因码、结构化详情和 Runtime 标量状态。自由文本错误消息只保留在当前 Runtime 内存中，不写入 SQLite。状态包括当前后台任务、checkpoint claim、虚拟应用、正式化调度、pending、deferred、计数器集合大小和投影缓存统计，不包含用户消息、完整摘要、工具结果、认证信息或完整 provider 响应。
+
+数据库使用 WAL 和 25 ms busy timeout。打开数据库及每 100 次写入后删除早于 `diagnosticsRetentionDays` 的事件；数据库页容量超过 `diagnosticsMaxDatabaseMiB` 时删除最早事件并回收页面。建库、写入、查询、清理或关闭失败时，当前 Runtime 停用 SQLite 写入并继续保留内存计数和最近事件；诊断故障不得阻止虚拟压缩、checkpoint 生成或 Pi 正式 compaction。
+
+Pi 命令 `/pi-press-diagnostics [--session <id>] [--last <1-100>] [--json]` 查询诊断库。默认查询当前 session 最近 20 条事件；`--session` 查询指定 session；`--json` 通过 Pi 通知输出包含数据库路径、session ID 和事件数组的 JSON。usage 从 checkpoint 转入正式 compaction 后标记为 consumed，禁止与 Pi session stats 相加后声称为新的额外费用。
 
 ## 验证范围
 
@@ -633,7 +642,7 @@ Promise
 - `ctx.getContextUsage()` 无可用值时不启动任务；从低于阈值到跨越阈值时只启动一次；
 - checkpoint v4、兼容 v3 根节点、parent 链、未知版本、非有限数字、空 summary、无效 usage/details 和损坏 entry 引用均有验证；
 - 生成结果在 `pi.appendEntry()` 前通过完整 checkpoint parser，非法 provenance 不得持久化；
-- `pi.appendEntry()` 写入的 checkpoint 和 metrics custom entry 不进入 LLM 上下文；
+- `pi.appendEntry()` 写入的 checkpoint 不进入 LLM 上下文；诊断 SQLite 不产生 session entry；
 - ready checkpoint 返回兼容 `CompactionResult`，`tokensBefore` 等于 checkpoint 快照原始量加 `snapshotLeafId` 后 context-visible session 消息的估算量；
 - 正式 compaction details 同时保留 `readFiles`、`modifiedFiles` 和 `piPress`；
 - Pi 写入正式 compaction 后能够正确重建上下文，后续 Pi-press compaction 与原生回退均保留文件上下文；
@@ -721,5 +730,6 @@ Promise
 26. 同一 snapshot 不并发生成重复摘要；同 epoch 可按 soft threshold 连续生成至少三代增量 checkpoint；多个 Runtime 实例及 reload 后重新导入的模块实例共享进程级后台活动占用；同一 session/epoch 最多存在一个 pending 正式化请求。
 27. `session_compact`、`session_compact_failed`、`onComplete`、`onError`、session shutdown 和分支事件以任意有效顺序到达时，状态清理保持幂等；扩展结果的压缩失败释放 claim，Pi 原生压缩失败保留 claim。内部正式化失败后同一 Runtime 实例、session 和 epoch 最多重试一次；第二次失败使后续虚拟投影和 checkpoint 生成停用，直到正式 compaction 或生命周期切换清除该 epoch 状态。
 28. Pi-press 区分 virtual、consumed 和 discarded 统计；正式 compaction usage 不重复计费，未消费费用单独记录，成功、回退和保护能力不足均提供对应诊断。
-29. `npm run typecheck` 和 `npm test` 通过，并包含上述版本适配、provider、checkpoint、虚拟上下文、正式化、并发、生命周期和原生后备处理测试。
-30. `npm run test:smoke:pi` 使用当前 shell 环境中仓库外部的 Pi 可执行文件和当前 Pi 配置模型，报告实际可执行文件、版本、模型、checkpoint token、尾部 token 和正式 `tokensBefore`；checkpoint 基线加快照后原始消息估算量必须等于正式 compaction 的 `tokensBefore`。
+29. 默认 SQLite 诊断在重启后可按当前或指定 session 查询，30 天和 64 MiB 限制删除最早事件；数据库故障保留内存诊断且不改变压缩行为，查询命令支持最近事件和 JSON 输出。
+30. `npm run typecheck` 和 `npm test` 通过，并包含上述版本适配、provider、checkpoint、虚拟上下文、正式化、并发、生命周期、诊断存储和原生后备处理测试。
+31. `npm run test:smoke:pi` 使用当前 shell 环境中仓库外部的 Pi 可执行文件和当前 Pi 配置模型，报告实际可执行文件、版本、模型、checkpoint token、尾部 token 和正式 `tokensBefore`；checkpoint 基线加快照后原始消息估算量必须等于正式 compaction 的 `tokensBefore`。

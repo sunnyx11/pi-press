@@ -27,6 +27,9 @@ test("normalizeConfig returns design defaults and reports removed fields", () =>
   assert.deepEqual(result.config, DEFAULT_CONFIG);
   assert.equal(DEFAULT_CONFIG.softThresholdPercent, 80);
   assert.equal(DEFAULT_CONFIG.taskTimeoutMs, 300_000);
+  assert.equal(DEFAULT_CONFIG.diagnosticsPersistence, "sqlite");
+  assert.equal(DEFAULT_CONFIG.diagnosticsRetentionDays, 30);
+  assert.equal(DEFAULT_CONFIG.diagnosticsMaxDatabaseMiB, 64);
   assert.deepEqual(result.diagnostics, ["配置字段 targetPostCompactionPercent 已移除，当前值已忽略"]);
 });
 
@@ -159,8 +162,38 @@ test("config fingerprint and snapshot key are deterministic", () => {
   const first = configFingerprint(DEFAULT_CONFIG);
   const second = configFingerprint({ ...DEFAULT_CONFIG });
   assert.equal(first, second);
+  assert.equal(
+    configFingerprint({ ...DEFAULT_CONFIG, diagnosticsPersistence: "memory" }),
+    first,
+  );
+  assert.equal(
+    configFingerprint({ ...DEFAULT_CONFIG, diagnosticsRetentionDays: 90 }),
+    first,
+  );
   const snapshotKey = createSnapshotKey("session", null, "leaf", DEFAULT_CONFIG);
   assert.deepEqual(snapshotKey.split(":"), ["session", "null", "leaf", VERSION, "4", "1", first]);
+});
+
+test("normalizeConfig validates diagnostic persistence and retention fields", () => {
+  const valid = normalizeConfig({
+    diagnosticsPersistence: "memory",
+    diagnosticsRetentionDays: 90,
+    diagnosticsMaxDatabaseMiB: 256,
+  });
+  assert.equal(valid.config.diagnosticsPersistence, "memory");
+  assert.equal(valid.config.diagnosticsRetentionDays, 90);
+  assert.equal(valid.config.diagnosticsMaxDatabaseMiB, 256);
+  assert.deepEqual(valid.diagnostics, []);
+
+  const invalid = normalizeConfig({
+    diagnosticsPersistence: "file",
+    diagnosticsRetentionDays: 0,
+    diagnosticsMaxDatabaseMiB: 0,
+  });
+  assert.equal(invalid.config.diagnosticsPersistence, "sqlite");
+  assert.equal(invalid.config.diagnosticsRetentionDays, 30);
+  assert.equal(invalid.config.diagnosticsMaxDatabaseMiB, 64);
+  assert.equal(invalid.diagnostics.length, 3);
 });
 
 test("normalizeConfig rejects timeout values above the Node timer limit", () => {

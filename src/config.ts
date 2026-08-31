@@ -10,6 +10,7 @@ import {
 import {
   PREPARATION_ALGORITHM_VERSION,
   SUMMARY_FORMAT_VERSION,
+  type DiagnosticsPersistence,
   type PiPressConfig,
   type PrecomputeMode,
 } from "./types.js";
@@ -20,6 +21,9 @@ export const DEFAULT_CONFIG: PiPressConfig = {
   summaryReserveTokens: 16_384,
   taskTimeoutMs: 300_000,
   hookWaitTimeoutMs: 1_000,
+  diagnosticsPersistence: "sqlite",
+  diagnosticsRetentionDays: 30,
+  diagnosticsMaxDatabaseMiB: 64,
 };
 
 const CONFIG_FILE_NAME = "pi-press.json";
@@ -28,6 +32,17 @@ const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
 type ConfigKey = keyof PiPressConfig;
 
 const CONFIG_KEYS: readonly ConfigKey[] = [
+  "precomputeMode",
+  "softThresholdPercent",
+  "summaryReserveTokens",
+  "taskTimeoutMs",
+  "hookWaitTimeoutMs",
+  "diagnosticsPersistence",
+  "diagnosticsRetentionDays",
+  "diagnosticsMaxDatabaseMiB",
+];
+
+const CHECKPOINT_CONFIG_KEYS: readonly ConfigKey[] = [
   "precomputeMode",
   "softThresholdPercent",
   "summaryReserveTokens",
@@ -64,6 +79,14 @@ function isMode(value: unknown): value is PrecomputeMode {
   return value === "off" || value === "threshold" || value === "threshold-and-manual";
 }
 
+function isDiagnosticsPersistence(value: unknown): value is DiagnosticsPersistence {
+  return value === "sqlite" || value === "memory";
+}
+
+function isIntegerInRange(value: unknown, minimum: number, maximum: number): value is number {
+  return isIntegerAtLeast(value, minimum) && value <= maximum;
+}
+
 function isValidValue(key: ConfigKey, value: unknown): boolean {
   switch (key) {
     case "precomputeMode":
@@ -75,6 +98,12 @@ function isValidValue(key: ConfigKey, value: unknown): boolean {
     case "taskTimeoutMs":
     case "hookWaitTimeoutMs":
       return isTimerDuration(value);
+    case "diagnosticsPersistence":
+      return isDiagnosticsPersistence(value);
+    case "diagnosticsRetentionDays":
+      return isIntegerInRange(value, 1, 3_650);
+    case "diagnosticsMaxDatabaseMiB":
+      return isIntegerInRange(value, 1, 1_024);
   }
 }
 
@@ -166,7 +195,7 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 }
 
 function stableConfigText(config: PiPressConfig): string {
-  return JSON.stringify(CONFIG_KEYS.map((key) => [key, config[key]]));
+  return JSON.stringify(CHECKPOINT_CONFIG_KEYS.map((key) => [key, config[key]]));
 }
 
 export function loadPiCompactionKeepRecentTokens(

@@ -349,10 +349,26 @@ function makeUncachedSourceIndex(branch: readonly SessionEntry[]): CachedSourceI
   return { sourceMessages, sourceKeys: sourceKeys as string[] };
 }
 
+export type VirtualContextProjectionUnavailableReason =
+  | "invalid_projection_input"
+  | "source_index_unavailable"
+  | "checkpoint_boundary_unavailable"
+  | "message_mapping_unavailable"
+  | "boundary_message_unavailable"
+  | "summary_unavailable"
+  | "transformed_message_unavailable"
+  | "transformed_token_estimate_unavailable"
+  | "capacity_estimate_unavailable";
+
 export type VirtualContextProjectionAttempt =
   | { status: "projected"; projection: VirtualContextProjection }
-  | { status: "unavailable" }
-  | { status: "hard-limit" };
+  | {
+    status: "unavailable";
+    reason: VirtualContextProjectionUnavailableReason;
+    sourceMessageCount?: number;
+    eventMessageCount?: number;
+  }
+  | { status: "hard-limit"; estimatedTokens: number; hardLimit: number };
 
 /**
  * 将有效 checkpoint 投影为当前 provider 请求使用的虚拟上下文，并保留容量拒绝原因。
@@ -378,12 +394,12 @@ export function tryProjectCheckpointToVirtualContext(
     softThresholdPercent < 0 ||
     softThresholdPercent > 100
   ) {
-    return { status: "unavailable" };
+    return { status: "unavailable", reason: "invalid_projection_input" };
   }
 
   const sourceIndex = cache?.prepare(branch) ?? makeUncachedSourceIndex(branch);
   if (!sourceIndex) {
-    return { status: "unavailable" };
+    return { status: "unavailable", reason: "source_index_unavailable" };
   }
   const { sourceMessages, sourceKeys } = sourceIndex;
   let snapshotIndex: number;
@@ -391,7 +407,7 @@ export function tryProjectCheckpointToVirtualContext(
   if (cache) {
     const boundary = cache.getBoundary(branch, checkpoint);
     if (!boundary) {
-      return { status: "unavailable" };
+      return { status: "unavailable", reason: "checkpoint_boundary_unavailable" };
     }
     snapshotIndex = boundary.snapshotIndex;
     boundarySourceIndex = boundary.boundarySourceIndex;
@@ -401,7 +417,7 @@ export function tryProjectCheckpointToVirtualContext(
       (entry) => entry.id === checkpoint.compaction.firstKeptEntryId,
     );
     if (snapshotIndex < 0 || firstKeptIndex < 0 || firstKeptIndex > snapshotIndex) {
-      return { status: "unavailable" };
+      return { status: "unavailable", reason: "checkpoint_boundary_unavailable" };
     }
     const firstKeptSourceIndex = sourceMessages.findIndex(
       (source) => source.branchIndex >= firstKeptIndex,
@@ -418,7 +434,12 @@ export function tryProjectCheckpointToVirtualContext(
     !latestMatches ||
     earliestMatches.some((match, index) => match !== latestMatches[index])
   ) {
-    return { status: "unavailable" };
+    return {
+      status: "unavailable",
+      reason: "message_mapping_unavailable",
+      sourceMessageCount: sourceMessages.length,
+      eventMessageCount: eventMessages.length,
+    };
   }
 
   let lastMatchedEventIndex: number | undefined;
@@ -431,7 +452,7 @@ export function tryProjectCheckpointToVirtualContext(
     ? (lastMatchedEventIndex ?? -1) + 1
     : earliestMatches[boundarySourceIndex];
   if (boundaryEventIndex === undefined) {
-    return { status: "unavailable" };
+    return { status: "unavailable", reason: "boundary_message_unavailable" };
   }
 
   const matchedSourceByEvent = new Map<number, number>();
@@ -443,7 +464,7 @@ export function tryProjectCheckpointToVirtualContext(
   }
   const summaryMessage = checkpointToCompactionSummaryMessage(checkpoint);
   if (!summaryMessage) {
-    return { status: "unavailable" };
+    return { status: "unavailable", reason: "summary_unavailable" };
   }
 
   const messages: AgentMessage[] = [];
@@ -473,11 +494,11 @@ export function tryProjectCheckpointToVirtualContext(
     }
     const eventMessage = eventMessages[eventIndex];
     if (!eventMessage) {
-      return { status: "unavailable" };
+      return { status: "unavailable", reason: "transformed_message_unavailable" };
     }
     const tokenGrowth = estimateMessageTokenGrowth(source, eventMessage);
     if (tokenGrowth === undefined) {
-      return { status: "unavailable" };
+      return { status: "unavailable", reason: "transformed_token_estimate_unavailable" };
     }
     transformedTokenGrowth += tokenGrowth;
   }
@@ -508,10 +529,14 @@ export function tryProjectCheckpointToVirtualContext(
     transformedTokenGrowth,
   );
   if (!capacity) {
-    return { status: "unavailable" };
+    return { status: "unavailable", reason: "capacity_estimate_unavailable" };
   }
   if (capacity.estimatedTokens > capacity.hardLimit) {
-    return { status: "hard-limit" };
+    return {
+      status: "hard-limit",
+      estimatedTokens: capacity.estimatedTokens,
+      hardLimit: capacity.hardLimit,
+    };
   }
 
   return {

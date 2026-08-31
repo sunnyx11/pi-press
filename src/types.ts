@@ -17,6 +17,7 @@ export const SUMMARY_FORMAT_VERSION = 1 as const;
 export const CHECKPOINT_CUSTOM_TYPE = "pi-press.precompaction" as const;
 
 export type PrecomputeMode = "off" | "threshold" | "threshold-and-manual";
+export type DiagnosticsPersistence = "sqlite" | "memory";
 
 export interface PiPressConfig {
   precomputeMode: PrecomputeMode;
@@ -24,6 +25,9 @@ export interface PiPressConfig {
   summaryReserveTokens: number;
   taskTimeoutMs: number;
   hookWaitTimeoutMs: number;
+  diagnosticsPersistence: DiagnosticsPersistence;
+  diagnosticsRetentionDays: number;
+  diagnosticsMaxDatabaseMiB: number;
 }
 
 export type JsonPrimitive = string | number | boolean | null;

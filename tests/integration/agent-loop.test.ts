@@ -42,6 +42,7 @@ test("public agent session applies virtual context and formalizes it after settl
     JSON.stringify({
       precomputeMode: "threshold",
       summaryReserveTokens: 1,
+      diagnosticsPersistence: "memory",
     }),
   );
   writeFileSync(
@@ -234,6 +235,7 @@ sameRunToolCompactionTest("Pi 0.84.4 compacts after a tool result before the nex
     JSON.stringify({
       precomputeMode: "threshold",
       summaryReserveTokens: 1,
+      diagnosticsPersistence: "memory",
     }),
   );
   writeFileSync(

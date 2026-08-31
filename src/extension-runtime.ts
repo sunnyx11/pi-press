@@ -33,7 +33,13 @@ import {
   configFingerprint,
   DEFAULT_CONFIG,
 } from "./config.js";
-import { Diagnostics } from "./diagnostics.js";
+import {
+  Diagnostics,
+  type DiagnosticEvent,
+  type DiagnosticEventMetadata,
+  type DiagnosticEventQuery,
+  type DiagnosticStore,
+} from "./diagnostics.js";
 import {
   buildCheckpointCompactionResult,
   calculateOriginalTokensBefore,
@@ -58,6 +64,7 @@ import {
   type CheckpointData,
   type CompactionCapacityEstimate,
   type CompactionPreparation,
+  type JsonObject,
   type PiPressConfig,
 } from "./types.js";
 
@@ -141,6 +148,15 @@ type CheckpointAppendOutcome = "appended" | "skipped" | "failed";
 type NotificationType = "info" | "warning" | "error";
 type Notify = (message: string, type?: NotificationType) => void;
 
+export interface DiagnosticStoreConfiguration {
+  retentionDays: number;
+  maxDatabaseMiB: number;
+}
+
+export type DiagnosticStoreFactory = (
+  configuration: DiagnosticStoreConfiguration,
+) => DiagnosticStore;
+
 function asModel(model: unknown): Model<Api> | undefined {
   return model as Model<Api> | undefined;
 }
@@ -198,6 +214,7 @@ export class ExtensionRuntime {
   private currentSessionManager: SessionManager | undefined;
   private currentModelRegistry: ModelRegistry | undefined;
   private currentSessionId: string | undefined;
+  private currentEpochCompactionId: string | null | undefined;
   private currentNotify: Notify | undefined;
   private currentConfig: PiPressConfig = { ...DEFAULT_CONFIG };
   private runEpoch = 0;
@@ -214,31 +231,45 @@ export class ExtensionRuntime {
   private deferredFormalization: DeferredFormalization | undefined;
   private readonly virtualContextCache = new VirtualContextProjectionCache();
 
-  constructor(private readonly pi: Pick<ExtensionAPI, "appendEntry">, diagnostics = new Diagnostics()) {
+  constructor(
+    private readonly pi: Pick<ExtensionAPI, "appendEntry">,
+    diagnostics = new Diagnostics(),
+    private readonly diagnosticStoreFactory?: DiagnosticStoreFactory,
+  ) {
     this.diagnostics = diagnostics;
+    this.diagnostics.setContextProvider(() => this.captureDiagnosticContext());
   }
 
   getDiagnostics(): ReturnType<Diagnostics["snapshot"]> {
     return this.diagnostics.snapshot();
   }
 
+  queryDiagnosticEvents(options: DiagnosticEventQuery): DiagnosticEvent[] {
+    return this.diagnostics.queryEvents(options);
+  }
+
   onSessionStart(ctx: ExtensionContext): void {
     this.invalidate("session_start", true);
     this.bindContext(ctx);
     this.loadCurrentConfig(ctx);
+    this.diagnostics.count("session_started");
   }
 
   onSessionBeforeTree(): void {
+    this.diagnostics.count("session_before_tree");
     this.invalidate("session_before_tree", true);
   }
 
   onSessionTree(ctx: ExtensionContext): void {
     this.bindContext(ctx);
     this.loadCurrentConfig(ctx);
+    this.diagnostics.count("session_tree_loaded");
   }
 
   onSessionShutdown(): void {
+    this.diagnostics.count("session_shutdown");
     this.invalidate("session_shutdown", true);
+    this.diagnostics.close();
   }
 
   onContext(
@@ -317,9 +348,29 @@ export class ExtensionRuntime {
       });
       if (attempt.status === "hard-limit") {
         hardLimitExceeded = true;
+        this.diagnostics.count("virtual_projection_hard_limit", {
+          checkpointId: candidate.data.checkpointId,
+          reason: "hard_limit_exceeded",
+          details: {
+            estimatedTokens: attempt.estimatedTokens,
+            hardLimit: attempt.hardLimit,
+          },
+        });
         continue;
       }
       if (attempt.status === "unavailable") {
+        this.diagnostics.count("virtual_projection_unavailable", {
+          checkpointId: candidate.data.checkpointId,
+          reason: attempt.reason,
+          details: {
+            ...(attempt.sourceMessageCount === undefined
+              ? {}
+              : { sourceMessageCount: attempt.sourceMessageCount }),
+            ...(attempt.eventMessageCount === undefined
+              ? {}
+              : { eventMessageCount: attempt.eventMessageCount }),
+          },
+        });
         continue;
       }
       const projection = attempt.projection;
@@ -352,9 +403,23 @@ export class ExtensionRuntime {
         lastAppliedLeafId: leafId,
         refreshRequested,
       };
-      this.diagnostics.count("virtual_applied");
+      this.diagnostics.count("virtual_applied", {
+        checkpointId: candidate.data.checkpointId,
+        reason: "checkpoint_ready",
+        details: {
+          estimatedTokens: projection.estimatedTokens,
+          hardLimit: projection.hardLimit,
+          refreshLimit: projection.refreshLimit,
+          needsRefresh: projection.needsRefresh,
+          sourceMessageCount: event.messages.length,
+          projectedMessageCount: projection.messages.length,
+        },
+      });
       if (projection.needsRefresh) {
-        this.diagnostics.count("virtual_refresh_needed");
+        this.diagnostics.count("virtual_refresh_needed", {
+          checkpointId: candidate.data.checkpointId,
+          reason: "refresh_limit_reached",
+        });
       }
       return { messages: projection.messages };
     }
@@ -556,8 +621,9 @@ export class ExtensionRuntime {
   onSessionCompact(event: SessionCompactEvent, ctx: ExtensionContext): void {
     const checkpointId = getCheckpointIdFromDetails(event.compactionEntry.details);
     if (checkpointId) {
-      this.diagnostics.count("checkpoint_consumed");
-      this.diagnostics.recordUsage("consumed", event.compactionEntry.usage);
+      const metadata = { checkpointId, reason: "formal_compaction_completed" };
+      this.diagnostics.count("checkpoint_consumed", metadata);
+      this.diagnostics.recordUsage("consumed", event.compactionEntry.usage, metadata);
       if (this.checkpointClaim?.checkpointId === checkpointId) {
         this.releaseCheckpointClaim(checkpointId);
       }
@@ -576,6 +642,12 @@ export class ExtensionRuntime {
 
   onSessionCompactFailed(event: Readonly<{ fromExtension: boolean }>): void {
     if (event.fromExtension) {
+      this.diagnostics.count("session_compact_failed", {
+        ...(this.checkpointClaim === undefined
+          ? {}
+          : { checkpointId: this.checkpointClaim.checkpointId }),
+        reason: "extension_compaction_failed",
+      });
       this.releaseCheckpointClaim();
     }
   }
@@ -992,10 +1064,109 @@ export class ExtensionRuntime {
     this.deferredFormalization = undefined;
   }
 
+  private captureDiagnosticContext(): DiagnosticEventMetadata {
+    let branchLeafId: string | undefined;
+    try {
+      branchLeafId = this.currentSessionManager?.getLeafId() ?? undefined;
+    } catch {
+      // 分支读取失败时仍保留其余运行状态。
+    }
+    const task = this.inFlightTask;
+    const application = this.virtualApplication;
+    const schedule = this.formalizationSchedule;
+    const pending = this.pendingFormalization;
+    const deferred = this.deferredFormalization;
+    const claim = this.checkpointClaim;
+    const cache = this.virtualContextCache.stats();
+    const state: JsonObject = {
+      runEpoch: this.runEpoch,
+      hookInFlight: this.hookInFlight,
+      inFlightTask: task
+        ? {
+          sessionId: task.sessionId,
+          runEpoch: task.runEpoch,
+          snapshotLeafId: task.snapshotLeafId,
+          snapshotSourceLeafId: task.snapshotSourceLeafId,
+          epochCompactionId: task.epochCompactionId,
+          startedAt: task.startedAt,
+          discarded: task.discarded,
+          firstKeptEntryId: task.firstKeptEntryId ?? null,
+          parentCheckpointId: task.parentCheckpoint?.checkpointId ?? null,
+        }
+        : null,
+      checkpointClaim: claim ? { checkpointId: claim.checkpointId } : null,
+      virtualApplication: application
+        ? {
+          checkpointId: application.checkpointId,
+          sessionId: application.sessionId,
+          epochCompactionId: application.epochCompactionId,
+          lastAppliedLeafId: application.lastAppliedLeafId,
+          refreshRequested: application.refreshRequested,
+        }
+        : null,
+      formalizationSchedule: schedule
+        ? {
+          requestId: schedule.requestId,
+          runEpoch: schedule.runEpoch,
+          checkpointId: schedule.checkpointId,
+          sessionId: schedule.sessionId,
+          epochCompactionId: schedule.epochCompactionId,
+          scheduledLeafId: schedule.scheduledLeafId,
+        }
+        : null,
+      pendingFormalization: pending
+        ? {
+          requestId: pending.requestId,
+          runEpoch: pending.runEpoch,
+          checkpointId: pending.checkpointId,
+          sessionId: pending.sessionId,
+          epochCompactionId: pending.epochCompactionId,
+          scheduledLeafId: pending.scheduledLeafId,
+          attempt: pending.attempt,
+        }
+        : null,
+      deferredFormalization: deferred
+        ? {
+          checkpointId: deferred.checkpointId,
+          sessionId: deferred.sessionId,
+          epochCompactionId: deferred.epochCompactionId,
+          checkedLeafId: deferred.checkedLeafId,
+        }
+        : null,
+      attemptsBySnapshotKey: this.attemptsBySnapshotKey.size,
+      formalizationEpochs: this.formalizationAttemptsByEpoch.size,
+      virtualContextCache: {
+        rebuilds: cache.rebuilds,
+        incrementallyIndexedEntries: cache.incrementallyIndexedEntries,
+        branchEntries: cache.branchEntries,
+        sourceMessages: cache.sourceMessages,
+      },
+      config: {
+        precomputeMode: this.currentConfig.precomputeMode,
+        softThresholdPercent: this.currentConfig.softThresholdPercent,
+        diagnosticsPersistence: this.currentConfig.diagnosticsPersistence,
+      },
+    };
+    return {
+      ...(this.currentSessionId === undefined ? {} : { sessionId: this.currentSessionId }),
+      ...(this.currentEpochCompactionId === undefined
+        ? {}
+        : { epochCompactionId: this.currentEpochCompactionId }),
+      ...(branchLeafId === undefined ? {} : { branchLeafId }),
+      ...(application === undefined ? {} : { checkpointId: application.checkpointId }),
+      state,
+    };
+  }
+
   private bindContext(ctx: ExtensionContext): void {
     this.currentSessionManager = ctx.sessionManager;
     this.currentModelRegistry = ctx.modelRegistry;
     this.currentSessionId = ctx.sessionManager.getSessionId();
+    try {
+      this.currentEpochCompactionId = getEpochCompactionId(ctx.sessionManager.getBranch());
+    } catch {
+      this.currentEpochCompactionId = undefined;
+    }
     const ui = ctx.ui;
     this.currentNotify = ui && typeof ui.notify === "function" ? ui.notify.bind(ui) : undefined;
   }
@@ -1033,6 +1204,19 @@ export class ExtensionRuntime {
   private loadCurrentConfig(ctx: ExtensionContext): PiPressConfig {
     const result = loadConfig(ctx.cwd);
     this.currentConfig = result.config;
+    const storeFactory = this.diagnosticStoreFactory;
+    if (result.config.diagnosticsPersistence === "sqlite" && storeFactory) {
+      const configuration: DiagnosticStoreConfiguration = {
+        retentionDays: result.config.diagnosticsRetentionDays,
+        maxDatabaseMiB: result.config.diagnosticsMaxDatabaseMiB,
+      };
+      this.diagnostics.configurePersistence(
+        `sqlite:${configuration.retentionDays}:${configuration.maxDatabaseMiB}`,
+        () => storeFactory(configuration),
+      );
+    } else {
+      this.diagnostics.configurePersistence(undefined);
+    }
     for (const message of result.diagnostics) {
       const removedTargetPercent = message.includes("targetPostCompactionPercent");
       if (
@@ -1062,6 +1246,7 @@ export class ExtensionRuntime {
     const abortHandler = (): void => this.releaseCheckpointClaim(checkpointId);
     this.checkpointClaim = { checkpointId, signal, abortHandler };
     signal.addEventListener("abort", abortHandler, { once: true });
+    this.diagnostics.count("checkpoint_claimed", { checkpointId });
   }
 
   private releaseCheckpointClaim(checkpointId?: string): void {
@@ -1071,6 +1256,9 @@ export class ExtensionRuntime {
     }
     claim.signal.removeEventListener("abort", claim.abortHandler);
     this.checkpointClaim = undefined;
+    this.diagnostics.count("checkpoint_claim_released", {
+      checkpointId: claim.checkpointId,
+    });
   }
 
   private invalidate(reason: string, clearContext: boolean): void {
@@ -1087,6 +1275,7 @@ export class ExtensionRuntime {
       this.currentSessionManager = undefined;
       this.currentModelRegistry = undefined;
       this.currentSessionId = undefined;
+      this.currentEpochCompactionId = undefined;
       this.currentNotify = undefined;
     }
   }
@@ -1261,6 +1450,10 @@ export class ExtensionRuntime {
   private finishTask(task: BackgroundTask): void {
     if (this.inFlightTask === task) {
       this.inFlightTask = undefined;
+      this.diagnostics.count("task_finished", {
+        reason: task.discarded ? "discarded" : "completed",
+        details: { snapshotLeafId: task.snapshotLeafId },
+      });
     }
   }
 
@@ -1270,8 +1463,12 @@ export class ExtensionRuntime {
     }
     if (!task.discarded) {
       task.discarded = true;
-      this.diagnostics.count("task_discarded");
-      this.diagnostics.record("lifecycle", reason);
+      const metadata = {
+        reason,
+        details: { snapshotLeafId: task.snapshotLeafId },
+      };
+      this.diagnostics.count("task_discarded", metadata);
+      this.diagnostics.record("lifecycle", reason, metadata);
       task.controller.abort();
     }
   }
@@ -1402,6 +1599,16 @@ export class ExtensionRuntime {
 
     try {
       this.pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, checkpointData);
+      this.diagnostics.count("checkpoint_appended", {
+        checkpointId: checkpointData.checkpointId,
+        reason: "checkpoint_ready",
+        details: {
+          snapshotLeafId: checkpointData.snapshotLeafId,
+          snapshotSourceLeafId: checkpointData.snapshotSourceLeafId,
+          tokensBefore: checkpointData.compaction.tokensBefore,
+          estimatedTokensAfterAtSnapshot: checkpointData.estimatedTokensAfterAtSnapshot,
+        },
+      });
       return "appended";
     } catch (error: unknown) {
       this.diagnostics.count("checkpoint_append_failure");

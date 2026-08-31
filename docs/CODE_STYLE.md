@@ -20,7 +20,7 @@ npm 发布包中的 Pi 核心包必须声明为 `peerDependencies: "*"`，由 Pi
 
 1. **扩展契约优先**：通过 Pi 官方扩展 API 接入运行时，只依赖包根入口导出的公开类型、函数和事件。
 2. **原生语义优先**：摘要编排、正式 compaction entry、session tree、上下文恢复和 TUI 行为由 Pi 负责；`pi-press` 只实现预压缩调度、版本适配和 checkpoint 管理。
-3. **追加式状态**：扩展状态通过 `pi.appendEntry()` 追加 custom entry，原始 session entry 不被覆盖、删除或重写。
+3. **追加式 checkpoint 状态**：checkpoint 通过 `pi.appendEntry()` 追加 custom entry，原始 session entry 不被覆盖、删除或重写；独立诊断数据库不参与 session 状态恢复。
 4. **失效即回退**：schema、分支、容量、认证、并发或公开 API 条件无法满足时返回空结果，由 Pi 使用原生实现；运行时错误和正式 compaction 状态通过 CLI 通知报告。
 5. **边界可验证**：所有跨 API、session、provider、异步任务和持久化数据边界都必须有明确类型、校验和测试。
 6. **副作用集中管理**：纯计算放在无副作用模块中；文件、provider、session 和 UI 操作只出现在相应的适配层或生命周期处理器中。
@@ -77,7 +77,9 @@ src/
 ├── extension-runtime.ts             # session 级运行时和事件协调
 ├── config.ts                        # 配置读取、默认值和范围校验
 ├── types.ts                         # 公共内部类型和版本常量
-├── diagnostics.ts                   # 诊断与指标，不记录敏感信息
+├── diagnostics.ts                   # 内存诊断、结构化事件和故障降级
+├── diagnostics-sqlite.ts            # Node 内置 SQLite 存储和清理
+├── diagnostics-command.ts           # 查询命令参数与输出格式
 ├── checkpoint/
 │   ├── schema.ts                    # checkpoint v4 与兼容 v3 的运行时校验
 │   ├── store.ts                     # custom entry 读取、追加和恢复
@@ -210,7 +212,7 @@ import {
 - 布尔值使用 `is`、`has`、`can`、`should` 等前缀；
 - Pi 事件名、`customType`、provider API 名和协议字段保留官方拼写；
 - session entry ID、checkpoint ID 和 provider model ID 按不透明字符串处理，不从字符串格式推导业务含义；
-- 自定义 custom entry 类型统一使用 `pi-press.` 前缀，例如 `pi-press.precompaction` 和 `pi-press.metrics`。
+- 自定义 custom entry 类型统一使用 `pi-press.` 前缀，例如 `pi-press.precompaction`。
 
 代码注释统一使用规范简体中文。注释只说明边界、原因和不会从代码结构中自然显现的约束，不重复代码动作。
 
@@ -344,16 +346,15 @@ const sessionId = ctx.sessionManager.getSessionId();
 
 ### `pi.appendEntry()`
 
-扩展持久化只能使用：
+扩展写入 session entry 只能使用：
 
 ```ts
 pi.appendEntry("pi-press.precompaction", checkpointData);
-pi.appendEntry("pi-press.metrics", metricsData);
 ```
 
 custom entry 不进入 LLM 上下文，可以作为 session tree 的 metadata。entry 必须是可序列化数据，追加后不得原地更新。checkpoint 在 `pi.appendEntry()` 前必须通过统一的完整 parser，禁止只校验本次 provider 返回的局部字段。当前写入 v4；v3 只允许作为没有 parent 的兼容根节点。扩展不得手工追加正式 `type: "compaction"` entry；正式 entry 由 Pi 根据 `session_before_compact` 的返回值写入。
 
-消费状态从正式 compaction entry 的 `details.piPress.checkpointId` 推导，不新增 consumed entry。metrics entry 只用于扩展诊断，不能改变 checkpoint 的有效性和 session 上下文。
+消费状态从正式 compaction entry 的 `details.piPress.checkpointId` 推导，不新增 consumed entry。诊断数据库独立于 session entry，不能改变 checkpoint 的有效性和 session 上下文。
 
 ### `ctx` 与运行模式
 
@@ -469,11 +470,14 @@ hardLimit = contextWindow - reserveTokens - safetyMargin
 - `softThresholdPercent: 80`；
 - `summaryReserveTokens: 16384`；
 - `taskTimeoutMs: 300000`；
-- `hookWaitTimeoutMs: 1000`。
+- `hookWaitTimeoutMs: 1000`；
+- `diagnosticsPersistence: "sqlite"`；
+- `diagnosticsRetentionDays: 30`；
+- `diagnosticsMaxDatabaseMiB: 64`。
 
 checkpoint preparation 固定使用 `keepRecentTokens: 10000`，该值不属于 Pi-press 配置字段；正式化 preparation 使用 Pi `SettingsManager.getCompactionKeepRecentTokens()` 返回的当前生效值。`SettingsManager` 负责合并全局与受信任项目的 `settings.json`，字段缺失时返回 Pi 默认值，当前默认值为 `20000`；Pi-press 不得自行解析 Pi settings 文件。后台摘要请求固定允许一次瞬时错误重试。同一正式 compaction epoch 可按 `softThresholdPercent` 连续刷新，每代使用 parent summary 和 parent snapshot 后的新增历史。旧配置中的 `targetPostCompactionPercent` 记录一次警告并忽略。
 
-Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint。配置 fingerprint 必须参与 snapshot key。`precomputeMode` 为 `"off"` 时中止 in-flight 任务并清除 virtual、deferred、pending 和正式化调度。
+Pi settings 和诊断存储字段不属于 checkpoint 生成配置，也不参与配置 fingerprint。配置 fingerprint 必须参与 snapshot key。`diagnosticsRetentionDays` 允许 `1..3650`，`diagnosticsMaxDatabaseMiB` 允许 `1..1024`。`precomputeMode` 为 `"off"` 时中止 in-flight 任务并清除 virtual、deferred、pending 和正式化调度；诊断存储仍按自身配置工作。
 
 ### 错误分类
 
@@ -494,6 +498,7 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 | 事件 signal 取消、session shutdown 或分支切换 | 视为正常取消，释放任务状态，不产生未处理异常。 |
 | provider 瞬时错误 | 固定允许一次重试；每次重试仍需传递 signal。 |
 | `pi.appendEntry()` 失败 | 保留错误原因并清除任务身份，通过 CLI error 显示失败；只有 `pi.appendEntry()` 成功返回后才能显示 checkpoint ready。 |
+| 诊断数据库打开、写入、查询、清理或关闭失败 | 当前 Runtime 停用 SQLite，保留内存计数和最近事件；禁止中断 context、后台任务或正式 compaction。 |
 | 内部不变量破坏 | 在测试中让错误暴露；事件边界捕获后回退，并保留带 `cause` 的诊断。 |
 
 预期的 checkpoint 无效、provider 失败和取消不得用异常打断 Pi 的原生 compaction。需要抛出错误时使用标准 `Error`，保留 `cause`，并清除密钥、完整 provider 响应和敏感 session 内容。
@@ -515,11 +520,11 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 - `promptSnippet` 和 `promptGuidelines` 必须准确说明工具名称和使用条件；
 - 除非另有设计和集成测试，不覆盖 Pi 内置 `read`、`bash`、`edit`、`write`、`grep`、`find` 或 `ls` 工具。
 
-命令、快捷键和 UI 只在形成明确的使用场景后添加。命令处理器可以使用 session 控制 API；事件处理器不得调用可能造成死锁的 session replacement 操作。终端 UI 必须按 `ctx.mode` 和 `ctx.hasUI` 分支，不能假设扩展总是在交互式 TUI 中运行。
+命令、快捷键和 UI 只在形成明确的使用场景后添加。`/pi-press-diagnostics` 只读取结构化诊断，支持当前或指定 session、最近 `1..100` 条事件和 JSON 输出，不修改 session 或 Runtime 状态。命令处理器可以使用 session 控制 API；事件处理器不得调用可能造成死锁的 session replacement 操作。终端 UI 必须按 `ctx.mode` 和 `ctx.hasUI` 分支，不能假设扩展总是在交互式 TUI 中运行。
 
 ## 日志与诊断
 
-日志和 metrics 只记录诊断所需的最小信息：
+日志和结构化事件只记录诊断所需的最小信息：
 
 - 任务启动、成功、失败、取消、ready、消费和废弃次数；
 - 正式化调度、发起、延期、成功、失败和重复抑制次数；
@@ -529,9 +534,11 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 - 前台请求耗时、限流错误和后台耗时；
 - 每个 epoch 的刷新次数。
 
-禁止记录 API key、认证 header、完整摘要、完整工具结果、完整 session 内容和未经脱敏的用户输入。需要关联请求时使用 checkpoint ID、snapshot key 的脱敏摘要或计数值。
+禁止记录 API key、认证 header、完整摘要、完整工具结果、完整 session 内容、完整 provider 响应和未经脱敏的用户输入。需要关联请求时使用 checkpoint ID、snapshot key 的脱敏摘要或计数值。
 
-默认 metrics 保存在内存。跨重启保存聚合值时使用 `pi.appendEntry("pi-press.metrics", data)`，并确保 metrics entry 不进入 LLM 上下文。checkpoint usage 转入正式 compaction 后标记为 consumed，不能与 Pi session stats 重复相加。
+诊断事件默认写入 `getAgentDir()/pi-press/diagnostics.sqlite3`，使用 Node 内置 `node:sqlite`。事件必须包含稳定事件名，并按可用状态附加 session、epoch、branch leaf、checkpoint ID、结构化原因码、有限数值详情和 Runtime 标量快照。SQLite 只用于事后查询，不参与 checkpoint 选择、状态恢复或生命周期判定。Node 22 的 `ExperimentalWarning` 保持可见。
+
+存储层必须使用短 busy timeout，在打开时及每 100 次写入后执行时间和容量清理。超过保留天数或文件容量时删除最早事件；数据库故障必须停用当前 Runtime 的持久化并保留内存计数和最近事件。checkpoint usage 转入正式 compaction 后标记为 consumed，不能与 Pi session stats 重复相加。
 
 ## 测试规范
 
@@ -548,7 +555,8 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 - snapshot key、epoch 和祖先判断；
 - 容量公式、容量余量和 soft threshold；
 - task identity、runEpoch 和状态转换；
-- provider header 的覆盖、删除和环境变量传递。
+- provider header 的覆盖、删除和环境变量传递；
+- SQLite 跨重启查询、session 筛选、保留天数、容量上限、写入故障降级、命令参数和 JSON 输出。
 
 ### 集成测试
 
@@ -565,7 +573,7 @@ Pi settings 不属于 checkpoint 生成配置，也不参与配置 fingerprint�
 - tool result 不作为错误切分点；
 - 后台任务不阻塞 `turn_end`，认证失败、retry、超时、signal 和 provider 错误都能释放状态；
 - ready checkpoint 被复用时不发起第二次摘要请求；
-- checkpoint、metrics custom entry 不进入 LLM 上下文；
+- checkpoint custom entry 不进入 LLM 上下文，诊断 SQLite 不产生 session entry；
 - 正式 compaction entry 由 Pi 写入，保留原生 `readFiles`、`modifiedFiles` 和 `details.piPress`；
 - session 重启、tree 切换、返回旧分支和正式 compaction 后状态正确恢复；
 - 同一 snapshot 去重、epoch 变化失效、同 epoch 至少三代增量刷新和旧 Promise 追加保护；
@@ -597,6 +605,7 @@ npm run test:smoke:pi
 - [ ] checkpoint 在追加前和恢复时均通过完整 schema 校验，未手工读写 JSONL 或正式 compaction entry。
 - [ ] `session_before_compact` 仅在容量和契约全部满足时返回结果，其他情况返回 `undefined` 走原生实现；新 signal 可以释放旧 attempt 的 claim。
 - [ ] provider signal、headers、baseUrl、env 和认证失败处理经过测试；provenance 保存实际 endpoint 的脱敏副本，日志没有敏感信息。
+- [ ] SQLite 诊断不参与压缩状态，保留与容量清理、故障降级和查询命令经过测试，数据库中没有用户消息、完整摘要、工具结果或认证信息。
 - [ ] 已覆盖 split turn、metadata 边界、分支、重启、取消、超时、跨 Runtime 重复任务和旧 epoch。
 - [ ] `npm run typecheck`、`npm test` 与 `npm run test:smoke:pi` 通过，未验证项已记录；真实冒烟报告包含 Pi 可执行文件、版本、模型、checkpoint token、尾部 token 和正式 `tokensBefore`。
 

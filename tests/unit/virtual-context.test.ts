@@ -4,6 +4,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   projectCheckpointToVirtualContext,
+  tryProjectCheckpointToVirtualContext,
   VirtualContextProjectionCache,
 } from "../../src/compaction/virtual-context.js";
 import {
@@ -169,19 +170,20 @@ test("virtual context refuses a missing assistant error without an adjacent retr
   assert.equal(result, undefined);
 });
 
-test("virtual context refuses a missing ordinary session message", () => {
+test("virtual context reports a structured reason for a missing ordinary session message", () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-missing-ordinary");
   manager.appendMessage({ ...makeUserMessage("old history"), timestamp: 1_000 });
   const keptId = manager.appendMessage({ ...makeUserMessage("kept message"), timestamp: 2_000 });
   const snapshotId = manager.appendMessage({ ...makeUserMessage("snapshot message"), timestamp: 3_000 });
 
+  const sourceMessageCount = manager.buildSessionContext().messages.length;
   const eventMessages = manager.buildSessionContext().messages.slice(1);
   const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
     checkpointId: "virtual-checkpoint-missing-ordinary",
     estimatedTokensAfterAtSnapshot: 100,
   });
 
-  const result = projectCheckpointToVirtualContext({
+  const result = tryProjectCheckpointToVirtualContext({
     branch: manager.getBranch(),
     eventMessages,
     checkpoint: data,
@@ -191,7 +193,12 @@ test("virtual context refuses a missing ordinary session message", () => {
     cache: new VirtualContextProjectionCache(),
   });
 
-  assert.equal(result, undefined);
+  assert.deepEqual(result, {
+    status: "unavailable",
+    reason: "message_mapping_unavailable",
+    sourceMessageCount,
+    eventMessageCount: eventMessages.length,
+  });
 });
 
 test("virtual context preserves a transformed message identified by stable metadata", () => {
