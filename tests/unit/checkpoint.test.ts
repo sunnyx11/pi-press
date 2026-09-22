@@ -14,8 +14,6 @@ import {
 import { parseCheckpointData } from "../../src/checkpoint/schema.js";
 import {
   CHECKPOINT_VERSION,
-  LEGACY_CHECKPOINT_VERSION,
-  LEGACY_PREPARATION_ALGORITHM_VERSION,
   PREPARATION_ALGORITHM_VERSION,
 } from "../../src/types.js";
 import { makeCheckpointData, makeMessageEntry, makeUserMessage } from "./fixtures.js";
@@ -35,14 +33,12 @@ function makeBranch(): { branch: SessionEntry[]; data: ReturnType<typeof makeChe
   return { branch: [first, snapshot, checkpoint], data };
 }
 
-test("checkpoint schema accepts current v4, rejects old v4 algorithms, and reads v3 roots", () => {
+test("checkpoint schema accepts v4 algorithm 5 and rejects old algorithms", () => {
   const { branch, data } = makeBranch();
-  const legacy = {
-    ...data,
-    version: LEGACY_CHECKPOINT_VERSION,
-    algorithmVersion: LEGACY_PREPARATION_ALGORITHM_VERSION,
-  };
-  assert.deepEqual(parseCheckpointData(legacy)?.checkpointId, "checkpoint-1");
+  assert.equal(
+    parseCheckpointData({ ...data, version: 3, algorithmVersion: 1 }),
+    undefined,
+  );
 
   const current = {
     ...data,
@@ -52,6 +48,8 @@ test("checkpoint schema accepts current v4, rejects old v4 algorithms, and reads
     parentCheckpointId: data.checkpointId,
   };
   assert.deepEqual(parseCheckpointData(current)?.parentCheckpointId, data.checkpointId);
+  assert.equal(PREPARATION_ALGORITHM_VERSION, 5);
+  assert.equal(parseCheckpointData({ ...current, algorithmVersion: 4 }), undefined);
   assert.equal(parseCheckpointData({ ...current, algorithmVersion: 3 }), undefined);
   assert.equal(parseCheckpointData({ ...current, algorithmVersion: 2 }), undefined);
   assert.equal(parseCheckpointData({ ...current, version: 2 }), undefined);
@@ -91,6 +89,34 @@ test("selection requires current session, epoch and branch ancestry", () => {
   assert.equal(findReadyCheckpointCandidates(branch, "other", null, undefined).length, 0);
   assert.equal(findReadyCheckpointCandidates(branch, "session", "compaction-1", undefined).length, 0);
   assert.equal(findReadyCheckpointCandidates(branch, "session", null, data.checkpointId).length, 0);
+});
+
+test("selection rejects edits to snapshot history and allows edits to later tail entries", () => {
+  const { branch, data } = makeBranch();
+  const tail = makeMessageEntry("entry-4", "entry-3", makeUserMessage("tail work"));
+  const editSnapshot: SessionEntry = {
+    type: "context_edit",
+    id: "entry-5",
+    parentId: tail.id,
+    timestamp: "2026-01-01T00:00:05.000Z",
+    targetId: data.snapshotLeafId,
+    replacement: null,
+  };
+  assert.equal(
+    findReadyCheckpointCandidates([...branch, tail, editSnapshot], "session", null, undefined).length,
+    0,
+  );
+
+  const editTail: SessionEntry = {
+    ...editSnapshot,
+    targetId: tail.id,
+    replacement: { content: "edited tail" },
+  };
+  assert.deepEqual(
+    findReadyCheckpointCandidates([...branch, tail, editTail], "session", null, undefined)
+      .map((candidate) => candidate.data.checkpointId),
+    [data.checkpointId],
+  );
 });
 
 test("virtual checkpoint refresh starts exactly at the soft threshold", () => {

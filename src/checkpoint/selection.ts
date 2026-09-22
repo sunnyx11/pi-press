@@ -43,6 +43,28 @@ export function isBeforeOrSame(
   return firstIndex >= 0 && secondIndex >= 0 && firstIndex <= secondIndex;
 }
 
+/** 检查快照之后的上下文编辑是否改变了快照内模型上下文。 */
+export function isSnapshotProjectionCompatible(
+  branch: readonly SessionEntry[],
+  snapshotLeafId: string,
+): boolean {
+  const snapshotIndex = getEntryIndex(branch, snapshotLeafId);
+  if (snapshotIndex < 0) {
+    return false;
+  }
+  for (let index = snapshotIndex + 1; index < branch.length; index += 1) {
+    const entry = branch[index];
+    if (entry?.type !== "context_edit") {
+      continue;
+    }
+    const targetIndex = getEntryIndex(branch, entry.targetId);
+    if (targetIndex < 0 || targetIndex <= snapshotIndex) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function getConsumedCheckpointIds(branch: readonly SessionEntry[]): ReadonlySet<string> {
   const consumed = new Set<string>();
   for (const entry of branch) {
@@ -91,6 +113,7 @@ function isCompatibleCheckpoint(
       firstKeptIndex < 0 ||
       sourceIndex > snapshotIndex ||
       firstKeptIndex > snapshotIndex ||
+      !isSnapshotProjectionCompatible(branch, currentData.snapshotLeafId) ||
       currentCheckpointIndex <= snapshotIndex ||
       (childSnapshotIndex !== undefined && snapshotIndex >= childSnapshotIndex) ||
       (childFirstKeptIndex !== undefined && firstKeptIndex > childFirstKeptIndex)

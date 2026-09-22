@@ -1,12 +1,15 @@
 import {
-  buildContextEntries,
+  buildSessionProjection,
   calculateContextTokens,
   estimateTokens,
-  findCutPoint,
-  getLastAssistantUsage,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
+import type {
+  ProjectedSessionEntry,
+  SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 import type { Usage } from "@earendil-works/pi-ai";
 import type {
   CheckpointData,
@@ -15,7 +18,6 @@ import type {
   FileOperations,
   PiPressConfig,
 } from "../types.js";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { isRecord } from "../checkpoint/schema.js";
 
 // 预压缩保留固定近期内容，同时覆盖 snapshot 前的完整消息。
@@ -55,13 +57,6 @@ function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperation
   }
 }
 
-function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
-  if (entry.type === "compaction") {
-    return undefined;
-  }
-  return sessionEntryToContextMessages(entry)[0];
-}
-
 function isUsableUsage(value: unknown): value is Usage {
   if (!isRecord(value)) {
     return false;
@@ -73,19 +68,20 @@ function isUsableUsage(value: unknown): value is Usage {
 }
 
 function getMessageUsage(message: AgentMessage): Usage | undefined {
-  if (message.role !== "assistant") {
-    return undefined;
-  }
-  if (message.stopReason === "aborted" || message.stopReason === "error") {
+  if (
+    message.role !== "assistant" ||
+    message.stopReason === "aborted" ||
+    message.stopReason === "error"
+  ) {
     return undefined;
   }
   return isUsableUsage(message.usage) ? message.usage : undefined;
 }
 
-/** 按当前 Pi 公开估算函数重建当前上下文 token 数。 */
+/** 按当前 Pi 投影语义重建当前上下文 token 数。 */
 export function estimateContextTokensFromEntries(entries: readonly SessionEntry[]): number {
-  const activeEntries = buildContextEntries([...entries]);
-  const messages = activeEntries.flatMap((entry) => sessionEntryToContextMessages(entry));
+  const projection = buildSessionProjection([...entries]);
+  const messages = projection.messages;
   let lastUsageIndex = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (getMessageUsage(messages[index]!)) {
@@ -94,19 +90,46 @@ export function estimateContextTokensFromEntries(entries: readonly SessionEntry[
     }
   }
 
-  if (lastUsageIndex < 0) {
-    return estimateMessagesTokens(messages);
+  if (lastUsageIndex >= 0) {
+    let projectedMessageIndex = 0;
+    let usageEntryId: string | undefined;
+    for (const entry of projection.entries) {
+      const nextMessageIndex = projectedMessageIndex + entry.messages.length;
+      if (lastUsageIndex < nextMessageIndex) {
+        usageEntryId = entry.sourceEntry.id;
+        break;
+      }
+      projectedMessageIndex = nextMessageIndex;
+    }
+    const usageEntryIndex = usageEntryId
+      ? entries.findIndex((entry) => entry.id === usageEntryId)
+      : -1;
+    let latestInvalidatingEntryIndex = -1;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (entry?.type === "context_edit" || entry?.type === "compaction") {
+        latestInvalidatingEntryIndex = index;
+        break;
+      }
+    }
+    const usage = getMessageUsage(messages[lastUsageIndex]!);
+    if (usage && usageEntryIndex > latestInvalidatingEntryIndex) {
+      let trailingTokens = 0;
+      for (let index = lastUsageIndex + 1; index < messages.length; index += 1) {
+        trailingTokens += estimateTokens(messages[index]!);
+      }
+      return calculateContextTokens(usage) + trailingTokens;
+    }
   }
 
-  const usage = getLastAssistantUsage(activeEntries);
-  if (!usage) {
-    return estimateMessagesTokens(messages);
+  const currentSystem = getCurrentSystemMessage(messages);
+  let tokens = currentSystem ? estimateTokens(currentSystem) : 0;
+  for (const message of messages) {
+    if (message.role !== "system") {
+      tokens += estimateTokens(message);
+    }
   }
-  let trailingTokens = 0;
-  for (let index = lastUsageIndex + 1; index < messages.length; index += 1) {
-    trailingTokens += estimateTokens(messages[index]!);
-  }
-  return calculateContextTokens(usage) + trailingTokens;
+  return tokens;
 }
 
 export function estimateMessagesTokens(messages: readonly AgentMessage[]): number {
@@ -141,23 +164,123 @@ function addCheckpointFileOps(fileOps: FileOperations, checkpoint: CheckpointDat
   addFileList(fileOps.edited, details.modifiedFiles);
 }
 
-function collectMessages(
-  entries: readonly SessionEntry[],
+function getMessagesForCompaction(entry: ProjectedSessionEntry): AgentMessage[] {
+  if (entry.sourceEntry.type === "compaction") {
+    return [];
+  }
+  return entry.messages.filter((message) => message.role !== "system");
+}
+
+function isCutPointMessage(message: AgentMessage): boolean {
+  return message.role !== "system" && message.role !== "toolResult";
+}
+
+function isTurnStartMessage(message: AgentMessage): boolean {
+  return message.role !== "system" && message.role !== "assistant" && message.role !== "toolResult";
+}
+
+function isProjectedTurnStart(entry: ProjectedSessionEntry): boolean {
+  return entry.sourceEntry.type !== "compaction" && entry.messages.some(isTurnStartMessage);
+}
+
+function findProjectedTurnStartIndex(
+  entries: readonly ProjectedSessionEntry[],
+  entryIndex: number,
   startIndex: number,
-  endIndex: number,
-): AgentMessage[] {
-  const messages: AgentMessage[] = [];
-  for (let index = startIndex; index < endIndex; index += 1) {
-    const entry = entries[index];
-    if (!entry) {
-      continue;
-    }
-    const message = getMessageFromEntry(entry);
-    if (message) {
-      messages.push(message);
+): number {
+  for (let index = entryIndex; index >= startIndex; index -= 1) {
+    if (isProjectedTurnStart(entries[index]!)) {
+      return index;
     }
   }
-  return messages;
+  return -1;
+}
+
+function findProjectedCutPoint(
+  entries: readonly ProjectedSessionEntry[],
+  startIndex: number,
+  endIndex: number,
+  keepRecentTokens: number,
+): { firstKeptEntryIndex: number; turnStartIndex: number; isSplitTurn: boolean } {
+  const cutPoints: number[] = [];
+  for (let index = startIndex; index < endIndex; index += 1) {
+    const entry = entries[index]!;
+    if (entry.sourceEntry.type !== "compaction" && entry.messages.some(isCutPointMessage)) {
+      cutPoints.push(index);
+    }
+  }
+  if (cutPoints.length === 0) {
+    return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+  }
+
+  let accumulatedTokens = 0;
+  let exceededBudget = false;
+  let cutIndex = cutPoints[0]!;
+  for (let index = endIndex - 1; index >= startIndex; index -= 1) {
+    const messageTokens = entries[index]!.messages.reduce(
+      (sum, message) => sum + estimateTokens(message),
+      0,
+    );
+    if (messageTokens === 0) {
+      continue;
+    }
+    accumulatedTokens += messageTokens;
+    if (accumulatedTokens >= keepRecentTokens) {
+      exceededBudget = true;
+      cutIndex = cutPoints.find((candidate) => candidate >= index) ?? cutPoints.at(-1)!;
+      break;
+    }
+  }
+
+  const suffix = entries.slice(cutIndex + 1, endIndex);
+  const isIntrinsicallyVisible = (entry: ProjectedSessionEntry): boolean =>
+    entry.sourceEntry.type !== "context_edit" &&
+    sessionEntryToContextMessages(entry.sourceEntry).length > 0;
+  const isOmitted = (entry: ProjectedSessionEntry): boolean =>
+    isIntrinsicallyVisible(entry) && entry.messages.length === 0;
+  const omittedSuffixIds = new Set(
+    suffix.filter(isOmitted).map((entry) => entry.sourceEntry.id),
+  );
+  const hasExternalReplacement = suffix.some(
+    (entry) =>
+      entry.sourceEntry.type === "context_edit" &&
+      entry.sourceEntry.replacement !== null &&
+      !omittedSuffixIds.has(entry.sourceEntry.targetId),
+  );
+  const isRecoveryOmissionSuffix =
+    exceededBudget &&
+    !hasExternalReplacement &&
+    suffix.some(
+      (entry) =>
+        entry.sourceEntry.type === "message" &&
+        entry.sourceEntry.message.role === "assistant" &&
+        isOmitted(entry),
+    ) &&
+    suffix.every(
+      (entry) =>
+        entry.sourceEntry.type !== "compaction" &&
+        (!isIntrinsicallyVisible(entry) || isOmitted(entry)),
+    );
+  if (isRecoveryOmissionSuffix) {
+    cutIndex += 1;
+  }
+
+  while (cutIndex > startIndex) {
+    const previous = entries[cutIndex - 1]!;
+    if (previous.sourceEntry.type === "compaction" || previous.messages.length > 0) {
+      break;
+    }
+    cutIndex -= 1;
+  }
+  const startsTurn = isProjectedTurnStart(entries[cutIndex]!);
+  const turnStartIndex = startsTurn
+    ? -1
+    : findProjectedTurnStartIndex(entries, cutIndex, startIndex);
+  return {
+    firstKeptEntryIndex: cutIndex,
+    turnStartIndex,
+    isSplitTurn: !startsTurn && turnStartIndex !== -1,
+  };
 }
 
 /** 构造与当前 Pi 公开 compact API 兼容的压缩准备数据。 */
@@ -170,55 +293,60 @@ export function prepareCompactionFromBranch(
     return undefined;
   }
 
-  let previousCompactionIndex = -1;
-  for (let index = pathEntries.length - 1; index >= 0; index -= 1) {
-    if (pathEntries[index]?.type === "compaction") {
-      previousCompactionIndex = index;
-      break;
-    }
-  }
+  const projection = buildSessionProjection([...pathEntries]);
+  const projectedEntries = projection.entries;
+  const previousCompactionIndex = projectedEntries.findIndex(
+    (entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
+  );
 
   let previousSummary: string | undefined;
   let boundaryStart = 0;
   if (parentCheckpoint) {
     previousSummary = parentCheckpoint.compaction.summary;
-    boundaryStart = pathEntries.findIndex(
-      (entry) => entry.id === parentCheckpoint.compaction.firstKeptEntryId,
+    boundaryStart = projectedEntries.findIndex(
+      (entry) => entry.sourceEntry.id === parentCheckpoint.compaction.firstKeptEntryId,
     );
-    const parentSnapshotIndex = pathEntries.findIndex(
-      (entry) => entry.id === parentCheckpoint.snapshotLeafId,
+    const parentSnapshotIndex = projectedEntries.findIndex(
+      (entry) => entry.sourceEntry.id === parentCheckpoint.snapshotLeafId,
     );
     if (boundaryStart < 0 || parentSnapshotIndex < boundaryStart) {
       return undefined;
     }
   } else if (previousCompactionIndex >= 0) {
-    const previousCompaction = pathEntries[previousCompactionIndex];
+    const previousCompaction = projectedEntries[previousCompactionIndex]?.sourceEntry;
     if (!previousCompaction || previousCompaction.type !== "compaction") {
       return undefined;
     }
     previousSummary = previousCompaction.summary;
-    const firstKeptEntryIndex = pathEntries.findIndex(
-      (entry) => entry.id === previousCompaction.firstKeptEntryId,
-    );
-    boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : previousCompactionIndex + 1;
+    boundaryStart = previousCompactionIndex + 1;
   }
 
-  const boundaryEnd = pathEntries.length;
+  const boundaryEnd = projectedEntries.length;
   const tokensBefore = estimateContextTokensFromEntries(pathEntries);
-  const cutPoint = findCutPoint([...pathEntries], boundaryStart, boundaryEnd, settings.keepRecentTokens);
-  const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
+  const cutPoint = findProjectedCutPoint(
+    projectedEntries,
+    boundaryStart,
+    boundaryEnd,
+    settings.keepRecentTokens,
+  );
+  const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
   if (!firstKeptEntry?.id) {
     return undefined;
   }
 
-  const turnStartIndex = cutPoint.turnStartIndex ?? -1;
-  const historyEnd = cutPoint.isSplitTurn ? turnStartIndex : cutPoint.firstKeptEntryIndex;
-  if (historyEnd < boundaryStart || (cutPoint.isSplitTurn && turnStartIndex < 0)) {
+  const historyEnd = cutPoint.isSplitTurn
+    ? cutPoint.turnStartIndex
+    : cutPoint.firstKeptEntryIndex;
+  if (historyEnd < boundaryStart || (cutPoint.isSplitTurn && cutPoint.turnStartIndex < 0)) {
     return undefined;
   }
-  const messagesToSummarize = collectMessages(pathEntries, boundaryStart, historyEnd);
+  const messagesToSummarize = projectedEntries
+    .slice(boundaryStart, historyEnd)
+    .flatMap(getMessagesForCompaction);
   const turnPrefixMessages = cutPoint.isSplitTurn
-    ? collectMessages(pathEntries, turnStartIndex, cutPoint.firstKeptEntryIndex)
+    ? projectedEntries
+      .slice(cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
+      .flatMap(getMessagesForCompaction)
     : [];
   if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
     return undefined;
@@ -228,7 +356,7 @@ export function prepareCompactionFromBranch(
   if (parentCheckpoint) {
     addCheckpointFileOps(fileOps, parentCheckpoint);
   } else if (previousCompactionIndex >= 0) {
-    const previousCompaction = pathEntries[previousCompactionIndex];
+    const previousCompaction = projectedEntries[previousCompactionIndex]?.sourceEntry;
     if (previousCompaction) {
       addPreviousCompactionFileOps(fileOps, previousCompaction);
     }

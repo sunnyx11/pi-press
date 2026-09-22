@@ -121,20 +121,21 @@ test("loadConfig deduplicates a shared global and project file", () => {
   }
 });
 
-test("formalization retention comes from Pi settings with Pi defaults", () => {
+test("formalization retention comes from Pi settings, model overrides, and Pi defaults", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-press-pi-settings-"));
   const agentDir = join(root, "agent");
   const projectDir = join(root, "project");
+  const model = { provider: "test", id: "model-id" };
   mkdirSync(agentDir, { recursive: true });
   mkdirSync(join(projectDir, ".pi"), { recursive: true });
 
   try {
     assert.equal(
-      loadPiCompactionKeepRecentTokens(projectDir, true, agentDir),
+      loadPiCompactionKeepRecentTokens(projectDir, true, undefined, agentDir),
       DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
     );
     assert.equal(
-      loadPiCompactionReserveTokens(projectDir, true, agentDir),
+      loadPiCompactionReserveTokens(projectDir, true, undefined, agentDir),
       DEFAULT_COMPACTION_SETTINGS.reserveTokens,
     );
 
@@ -142,17 +143,27 @@ test("formalization retention comes from Pi settings with Pi defaults", () => {
       join(agentDir, "settings.json"),
       JSON.stringify({ compaction: { keepRecentTokens: 25_000, reserveTokens: 40_000 } }),
     );
-    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, true, agentDir), 25_000);
-    assert.equal(loadPiCompactionReserveTokens(projectDir, true, agentDir), 40_000);
+    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, true, undefined, agentDir), 25_000);
+    assert.equal(loadPiCompactionReserveTokens(projectDir, true, undefined, agentDir), 40_000);
 
     writeFileSync(
       join(projectDir, ".pi", "settings.json"),
-      JSON.stringify({ compaction: { keepRecentTokens: 30_000, reserveTokens: 50_000 } }),
+      JSON.stringify({
+        compaction: {
+          keepRecentTokens: 30_000,
+          reserveTokens: 50_000,
+          modelOverrides: {
+            "test/model-id": { keepRecentTokens: 4_000, reserveTokens: 32_000 },
+          },
+        },
+      }),
     );
-    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, true, agentDir), 30_000);
-    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, false, agentDir), 25_000);
-    assert.equal(loadPiCompactionReserveTokens(projectDir, true, agentDir), 50_000);
-    assert.equal(loadPiCompactionReserveTokens(projectDir, false, agentDir), 40_000);
+    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, true, undefined, agentDir), 30_000);
+    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, false, undefined, agentDir), 25_000);
+    assert.equal(loadPiCompactionReserveTokens(projectDir, true, undefined, agentDir), 50_000);
+    assert.equal(loadPiCompactionReserveTokens(projectDir, false, undefined, agentDir), 40_000);
+    assert.equal(loadPiCompactionKeepRecentTokens(projectDir, true, model, agentDir), 4_000);
+    assert.equal(loadPiCompactionReserveTokens(projectDir, true, model, agentDir), 32_000);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -171,7 +182,7 @@ test("config fingerprint and snapshot key are deterministic", () => {
     first,
   );
   const snapshotKey = createSnapshotKey("session", null, "leaf", DEFAULT_CONFIG);
-  assert.deepEqual(snapshotKey.split(":"), ["session", "null", "leaf", VERSION, "4", "1", first]);
+  assert.deepEqual(snapshotKey.split(":"), ["session", "null", "leaf", VERSION, "5", "1", first]);
 });
 
 test("normalizeConfig validates diagnostic persistence and retention fields", () => {

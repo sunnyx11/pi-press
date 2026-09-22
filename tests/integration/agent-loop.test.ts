@@ -176,8 +176,10 @@ test("public agent session applies virtual context and formalizes it after settl
 
       assert.equal(observedContexts.length, 2);
       const requestMessages = observedContexts[0]?.messages ?? [];
-      assert.equal(requestMessages[0]?.role, "user");
-      const firstText = requestMessages[0]?.content;
+      assert.equal(requestMessages[0]?.role, "system");
+      const firstConversationMessage = requestMessages.find((message) => message.role !== "system");
+      assert.equal(firstConversationMessage?.role, "user");
+      const firstText = firstConversationMessage?.content;
       assert.ok(Array.isArray(firstText));
       assert.match(firstText[0]?.type === "text" ? firstText[0].text : "", /virtual summary/);
       assert.equal(
@@ -199,12 +201,18 @@ test("public agent session applies virtual context and formalizes it after settl
         ),
         true,
       );
-      assert.equal(session.state.messages[0]?.role, "compactionSummary");
+      assert.equal(
+        session.state.messages.some((message) => message.role === "compactionSummary"),
+        true,
+      );
       const sessionFile = manager.getSessionFile();
       assert.ok(sessionFile);
       const reloaded = SessionManager.open(sessionFile);
       assert.equal(reloaded.getSessionId(), manager.getSessionId());
-      assert.equal(reloaded.buildSessionContext().messages[0]?.role, "compactionSummary");
+      assert.equal(
+        reloaded.buildSessionContext().messages.some((message) => message.role === "compactionSummary"),
+        true,
+      );
       assert.equal(
         reloaded.getBranch().some(
           (entry) => entry.type === "compaction" &&
@@ -224,7 +232,7 @@ test("public agent session applies virtual context and formalizes it after settl
   }
 });
 
-sameRunToolCompactionTest("Pi 0.84.4 compacts after a tool result before the next assistant request", async () => {
+sameRunToolCompactionTest("Pi 0.87.0 compacts after a tool result before the next assistant request", async () => {
   const cwd = mkdtempSync(join("/tmp", "pi-press-agent-tool-loop-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(join(cwd, ".pi"), { recursive: true });
@@ -341,14 +349,19 @@ sameRunToolCompactionTest("Pi 0.84.4 compacts after a tool result before the nex
       assert.equal(observedContexts.length, 2);
       assert.equal(compactionPresentBeforeSecondRequest, true);
       const secondRequestMessages = observedContexts[1]?.messages ?? [];
-      assert.equal(secondRequestMessages[0]?.role, "user");
-      const summaryContent = secondRequestMessages[0]?.content;
+      assert.equal(secondRequestMessages[0]?.role, "system");
+      const summaryMessage = secondRequestMessages.find((message) => message.role !== "system");
+      assert.equal(summaryMessage?.role, "user");
+      const summaryContent = summaryMessage?.content;
       assert.ok(Array.isArray(summaryContent));
       assert.match(
         summaryContent[0]?.type === "text" ? summaryContent[0].text : "",
         /tool-loop virtual summary/,
       );
-      assert.equal(session.state.messages[0]?.role, "compactionSummary");
+      assert.equal(
+        session.state.messages.some((message) => message.role === "compactionSummary"),
+        true,
+      );
       assert.equal(
         secondRequestMessages.some(
           (message) => message.role === "toolResult" &&
@@ -394,7 +407,7 @@ test("preparation adapter matches Pi public compaction event for split turns and
   );
 
   const manager = SessionManager.create(cwd, join(cwd, "sessions"));
-  manager.appendMessage(makeUserMessage("inspect the old file"));
+  const editedUserId = manager.appendMessage(makeUserMessage("inspect the old file"));
   manager.appendMessage({
     role: "assistant",
     content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "old.ts" } }],
@@ -414,6 +427,9 @@ test("preparation adapter matches Pi public compaction event for split turns and
     isError: false,
     timestamp: Date.now(),
   });
+  manager.appendContextEdit(editedUserId, { content: "inspect the edited file" });
+  const omittedUserId = manager.appendMessage(makeUserMessage("obsolete request"));
+  manager.appendContextEdit(omittedUserId, null);
   manager.appendMessage(makeUserMessage("continue with the current task"));
   const metadataId = manager.appendCustomEntry("fixture.metadata", { state: true });
   manager.appendMessage({
@@ -490,6 +506,12 @@ test("preparation adapter matches Pi public compaction event for split turns and
       assert.equal(publicPreparation.firstKeptEntryId, adapterPreparation.firstKeptEntryId);
       assert.deepEqual(publicPreparation.messagesToSummarize, adapterPreparation.messagesToSummarize);
       assert.deepEqual(publicPreparation.turnPrefixMessages, adapterPreparation.turnPrefixMessages);
+      const serializedPreparation = JSON.stringify([
+        ...adapterPreparation.messagesToSummarize,
+        ...adapterPreparation.turnPrefixMessages,
+      ]);
+      assert.match(serializedPreparation, /inspect the edited file/);
+      assert.doesNotMatch(serializedPreparation, /inspect the old file|obsolete request/);
       assert.equal(publicPreparation.isSplitTurn, adapterPreparation.isSplitTurn);
       assert.equal(publicPreparation.tokensBefore, adapterPreparation.tokensBefore);
       assert.equal(publicPreparation.previousSummary, adapterPreparation.previousSummary);

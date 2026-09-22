@@ -22,7 +22,7 @@
 运行要求：
 
 - Node.js `>=22.19.0`
-- Pi coding-agent `>=0.84.3`
+- Pi coding-agent `>=0.87.0`
 - 已配置可用的模型和 provider
 
 ```bash

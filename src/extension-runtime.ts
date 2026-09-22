@@ -23,6 +23,7 @@ import {
   getEntryIndex,
   getSnapshotSourceLeafId,
   isBeforeOrSame,
+  isSnapshotProjectionCompatible,
 } from "./checkpoint/selection.js";
 import { isJsonObject, isUsage, parseCheckpointData } from "./checkpoint/schema.js";
 import {
@@ -469,7 +470,11 @@ export class ExtensionRuntime {
     }
     const criticalWaitTokens = calculateCriticalWaitTokens(
       model.contextWindow,
-      loadPiCompactionReserveTokens(ctx.cwd, ctx.isProjectTrusted()),
+      loadPiCompactionReserveTokens(
+        ctx.cwd,
+        ctx.isProjectTrusted(),
+        model,
+      ),
     );
     return criticalWaitTokens !== undefined && usage.tokens >= criticalWaitTokens;
   }
@@ -952,11 +957,20 @@ export class ExtensionRuntime {
       this.diagnostics.count("formalization_skipped_stale");
       return;
     }
+    const model = asModel(ctx.model);
+    if (!model) {
+      this.diagnostics.count("formalization_skipped_unknown_model");
+      return;
+    }
     const preparation = prepareCompactionFromBranch(
       branch,
       createFormalizationPreparationSettings(
         this.currentConfig,
-        loadPiCompactionKeepRecentTokens(ctx.cwd, ctx.isProjectTrusted()),
+        loadPiCompactionKeepRecentTokens(
+          ctx.cwd,
+          ctx.isProjectTrusted(),
+          model,
+        ),
       ),
     );
     if (!preparation) {
@@ -1516,6 +1530,7 @@ export class ExtensionRuntime {
     if (
       currentEpoch !== task.epochCompactionId ||
       getEntryIndex(branch, task.snapshotLeafId) < 0 ||
+      !isSnapshotProjectionCompatible(branch, task.snapshotLeafId) ||
       !isBeforeOrSame(branch, preparation.firstKeptEntryId, task.snapshotLeafId)
     ) {
       return "skipped";
@@ -1753,10 +1768,14 @@ export class ExtensionRuntime {
       task.sessionId !== sessionId ||
       task.epochCompactionId !== epochCompactionId ||
       getEntryIndex(branch, task.snapshotLeafId) < 0 ||
+      !isSnapshotProjectionCompatible(branch, task.snapshotLeafId) ||
       (task.firstKeptEntryId !== undefined &&
         !isBeforeOrSame(branch, task.firstKeptEntryId, task.snapshotLeafId)) ||
       task.runEpoch !== this.runEpoch
     ) {
+      if (task.runEpoch === this.runEpoch) {
+        this.discardTask(task, "snapshot_projection_changed");
+      }
       return undefined;
     }
     return task;

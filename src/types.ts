@@ -10,9 +10,7 @@ export type CompactionSettings = CompactionPreparation["settings"];
 export type FileOperations = CompactionPreparation["fileOps"];
 
 export const CHECKPOINT_VERSION = 4 as const;
-export const LEGACY_CHECKPOINT_VERSION = 3 as const;
-export const PREPARATION_ALGORITHM_VERSION = 4 as const;
-export const LEGACY_PREPARATION_ALGORITHM_VERSION = 1 as const;
+export const PREPARATION_ALGORITHM_VERSION = 5 as const;
 export const SUMMARY_FORMAT_VERSION = 1 as const;
 export const CHECKPOINT_CUSTOM_TYPE = "pi-press.precompaction" as const;
 
@@ -58,9 +56,9 @@ export interface CheckpointCompaction {
 }
 
 export interface CheckpointData {
-  version: typeof CHECKPOINT_VERSION | typeof LEGACY_CHECKPOINT_VERSION;
+  version: typeof CHECKPOINT_VERSION;
   piVersion: string;
-  algorithmVersion: typeof PREPARATION_ALGORITHM_VERSION | typeof LEGACY_PREPARATION_ALGORITHM_VERSION;
+  algorithmVersion: typeof PREPARATION_ALGORITHM_VERSION;
   summaryFormatVersion: typeof SUMMARY_FORMAT_VERSION;
   checkpointId: string;
   parentCheckpointId?: string;

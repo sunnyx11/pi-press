@@ -15,6 +15,74 @@ import {
   makeUserMessage,
 } from "./fixtures.js";
 
+test("virtual context projects conversation messages when Pi hides system messages", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-system");
+  manager.appendMessage({
+    role: "system",
+    content: "System prompt",
+    timestamp: 1_000,
+  });
+  manager.appendMessage({ ...makeUserMessage("old history"), timestamp: 2_000 });
+  const keptId = manager.appendMessage({ ...makeUserMessage("kept message"), timestamp: 3_000 });
+  const snapshotId = manager.appendMessage({ ...makeUserMessage("snapshot message"), timestamp: 4_000 });
+  const eventMessages = manager.buildSessionProjection().messages.filter(
+    (message) => message.role !== "system",
+  );
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "virtual-checkpoint-system",
+    estimatedTokensAfterAtSnapshot: 100,
+  });
+
+  const result = tryProjectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages,
+    checkpoint: data,
+    contextWindow: 100_000,
+    summaryReserveTokens: 1,
+    softThresholdPercent: 50,
+    cache: new VirtualContextProjectionCache(),
+  });
+
+  assert.equal(result.status, "projected");
+  assert.deepEqual(
+    result.status === "projected"
+      ? result.projection.messages.map((message) => message.role)
+      : [],
+    ["compactionSummary", "user", "user"],
+  );
+});
+
+test("virtual context counts system growth after the checkpoint snapshot", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-system-growth");
+  manager.appendMessage({ role: "system", content: "base", timestamp: 1_000 });
+  manager.appendMessage({ ...makeUserMessage("old history"), timestamp: 2_000 });
+  const keptId = manager.appendMessage({ ...makeUserMessage("kept message"), timestamp: 3_000 });
+  const snapshotId = manager.appendMessage({ ...makeUserMessage("snapshot message"), timestamp: 4_000 });
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "virtual-checkpoint-system-growth",
+    estimatedTokensAfterAtSnapshot: 100,
+  });
+  manager.appendMessage({
+    role: "system",
+    content: "large system addition ".repeat(10_000),
+    timestamp: 5_000,
+  });
+  const eventMessages = manager.buildSessionProjection().messages.filter(
+    (message) => message.role !== "system",
+  );
+
+  const result = tryProjectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages,
+    checkpoint: data,
+    contextWindow: 10_000,
+    summaryReserveTokens: 1,
+    softThresholdPercent: 50,
+  });
+
+  assert.equal(result.status, "hard-limit");
+});
+
 test("virtual context replaces the summarized prefix and preserves the current tail", () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context");
   const oldId = manager.appendMessage(makeUserMessage("old history"));
@@ -453,8 +521,27 @@ test("virtual context cache incrementally indexes appended entries and rebuilds 
   assert.equal(cache.stats().incrementallyIndexedEntries, 1);
   assert.ok((cache.estimateTokensAfter(branch, 2) ?? 0) > 0);
 
-  cache.prepare(branch.slice(0, -1));
+  manager.appendContextEdit(keptId, { content: "edited kept message" });
+  const editedBranch = manager.getBranch();
+  const editedMessages = manager.buildSessionProjection().messages.filter(
+    (message) => message.role !== "system",
+  );
+  const editedCached = projectCheckpointToVirtualContext({
+    ...baseInput,
+    branch: editedBranch,
+    eventMessages: editedMessages,
+    cache,
+  });
+  const editedUncached = projectCheckpointToVirtualContext({
+    ...baseInput,
+    branch: editedBranch,
+    eventMessages: editedMessages,
+  });
+  assert.deepEqual(editedCached, editedUncached);
   assert.equal(cache.stats().rebuilds, 2);
+
+  cache.prepare(editedBranch.slice(0, -1));
+  assert.equal(cache.stats().rebuilds, 3);
 });
 
 test("virtual context returns no projection when the hard limit is exceeded", () => {

@@ -175,9 +175,19 @@ test("context applies a ready checkpoint and settled formalization runs after th
   }
 });
 
-test("formalization defers until a new leaf makes native preparation available", async () => {
+test("formalization uses the active model keepRecentTokens override", async () => {
   const scenario = createScenario({ summaryReserveTokens: 1 });
-  setPiCompactionKeepRecentTokens(scenario, 50_000);
+  writeFileSync(
+    `${scenario.cwd}/.pi/settings.json`,
+    JSON.stringify({
+      compaction: {
+        keepRecentTokens: 1,
+        modelOverrides: {
+          "test/model-id": { keepRecentTokens: 50_000 },
+        },
+      },
+    }),
+  );
   let compactCalls = 0;
   const ctx = {
     ...scenario.ctx,

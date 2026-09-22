@@ -201,18 +201,20 @@ function stableConfigText(config: PiPressConfig): string {
 export function loadPiCompactionKeepRecentTokens(
   cwd: string,
   projectTrusted: boolean,
+  model?: { provider: string; id: string },
   agentDir = getAgentDir(),
 ): number {
-  return SettingsManager.create(cwd, agentDir, { projectTrusted }).getCompactionKeepRecentTokens();
+  return SettingsManager.create(cwd, agentDir, { projectTrusted }).getCompactionKeepRecentTokens(model);
 }
 
 /** 读取与 Pi 正式压缩一致的上下文预留 token 数。 */
 export function loadPiCompactionReserveTokens(
   cwd: string,
   projectTrusted: boolean,
+  model?: { provider: string; id: string },
   agentDir = getAgentDir(),
 ): number {
-  return SettingsManager.create(cwd, agentDir, { projectTrusted }).getCompactionReserveTokens();
+  return SettingsManager.create(cwd, agentDir, { projectTrusted }).getCompactionReserveTokens(model);
 }
 
 /** 返回参与 snapshot key 的配置指纹。 */

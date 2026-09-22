@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  SessionManager,
+  estimateTokens,
+} from "@earendil-works/pi-coding-agent";
 import type { CheckpointData, CompactionPreparation } from "../../src/types.js";
 import { estimateCheckpointCapacity } from "../../src/checkpoint/capacity.js";
 import {
@@ -9,7 +12,21 @@ import {
   prepareCompactionFromBranch,
 } from "../../src/compaction/preparation.js";
 import { DEFAULT_CONFIG } from "../../src/config.js";
+import { calculateOriginalTokensBefore } from "../../src/compaction/reuse.js";
 import { makeCheckpointData, makePreparation, makeUsage, makeUserMessage } from "./fixtures.js";
+
+function makeUsageAssistant(text: string) {
+  return {
+    role: "assistant" as const,
+    content: [{ type: "text" as const, text }],
+    api: "openai-responses" as const,
+    provider: "test",
+    model: "model-id",
+    usage: makeUsage(),
+    stopReason: "stop" as const,
+    timestamp: Date.now(),
+  };
+}
 
 test("preparation preserves Pi metadata boundary and message selection", () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-test");
@@ -145,6 +162,64 @@ test("preparation uses a checkpoint as the previous summary boundary", () => {
   assert.deepEqual([...preparation.fileOps.edited], ["write.ts"]);
 });
 
+test("preparation uses context-edited model content", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-test-context-edits");
+  const omittedId = manager.appendMessage(makeUserMessage("OMIT-ME ".repeat(100)));
+  manager.appendMessage({
+    ...makeUsageAssistant("old answer ".repeat(100)),
+    timestamp: 2_000,
+  });
+  const replacedId = manager.appendMessage({
+    ...makeUserMessage("REPLACE-ME ".repeat(100)),
+    timestamp: 3_000,
+  });
+  manager.appendMessage({
+    ...makeUsageAssistant("second answer ".repeat(100)),
+    timestamp: 4_000,
+  });
+  manager.appendContextEdit(omittedId, null);
+  manager.appendContextEdit(replacedId, { content: "EDITED-CONTENT ".repeat(100) });
+  manager.appendMessage({ ...makeUserMessage("keep"), timestamp: 5_000 });
+  manager.appendMessage({ ...makeUsageAssistant("suffix"), timestamp: 6_000 });
+
+  const preparation = prepareCompactionFromBranch(
+    manager.getBranch(),
+    { enabled: true, reserveTokens: 1, keepRecentTokens: 1 },
+  );
+
+  assert.ok(preparation);
+  const serialized = JSON.stringify([
+    ...preparation.messagesToSummarize,
+    ...preparation.turnPrefixMessages,
+  ]);
+  assert.doesNotMatch(serialized, /OMIT-ME|REPLACE-ME/);
+  assert.match(serialized, /EDITED-CONTENT/);
+});
+
+test("preparation advances recovery omissions without dropping their input", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-test-recovery-omission");
+  const userId = manager.appendMessage({
+    ...makeUserMessage("recovery input ".repeat(100)),
+    timestamp: 1_000,
+  });
+  const attemptId = manager.appendMessage({
+    ...makeUsageAssistant("failed attempt"),
+    timestamp: 2_000,
+  });
+  manager.appendContextEdit(attemptId, null);
+  manager.appendCustomEntry("bookkeeping", { source: "test" });
+
+  const preparation = prepareCompactionFromBranch(
+    manager.getBranch(),
+    { enabled: true, reserveTokens: 1, keepRecentTokens: 1 },
+  );
+
+  assert.ok(preparation);
+  assert.equal(preparation.firstKeptEntryId, attemptId);
+  assert.equal(preparation.turnPrefixMessages[0]?.role, "user");
+  assert.equal(userId === attemptId, false);
+});
+
 test("checkpoint and formalization preparation settings use independent retention", () => {
   assert.equal(createCheckpointPreparationSettings(DEFAULT_CONFIG).keepRecentTokens, 10_000);
   assert.equal(createFormalizationPreparationSettings(DEFAULT_CONFIG, 30_000).keepRecentTokens, 30_000);
@@ -152,6 +227,53 @@ test("checkpoint and formalization preparation settings use independent retentio
     createCheckpointPreparationSettings(DEFAULT_CONFIG).reserveTokens,
     createFormalizationPreparationSettings(DEFAULT_CONFIG, 30_000).reserveTokens,
   );
+});
+
+test("original token count uses context-edited tail messages", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-test-edited-tail-tokens");
+  const firstId = manager.appendMessage(makeUserMessage("old history"));
+  const snapshotId = manager.appendMessage(makeUserMessage("snapshot"));
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, firstId);
+  data.compaction.tokensBefore = 1_000;
+  manager.appendCustomEntry("pi-press.precompaction", data);
+  const tailId = manager.appendMessage(makeUserMessage("ORIGINAL-TAIL ".repeat(1_000)));
+  manager.appendContextEdit(tailId, { content: "edited tail" });
+
+  assert.equal(
+    calculateOriginalTokensBefore(data, manager.getBranch()),
+    data.compaction.tokensBefore + estimateTokens({
+      ...makeUserMessage("edited tail"),
+      timestamp: manager.buildSessionProjection().messages.at(-1)?.timestamp ?? 0,
+    }),
+  );
+
+  manager.appendContextEdit(tailId, null);
+  assert.equal(
+    calculateOriginalTokensBefore(data, manager.getBranch()),
+    data.compaction.tokensBefore,
+  );
+});
+
+test("capacity excludes retained messages omitted by context edits", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-test-edited-retained-capacity");
+  const oldId = manager.appendMessage(makeUserMessage("old history"));
+  const keptId = manager.appendMessage(makeUserMessage("OMITTED-RETAINED ".repeat(1_000)));
+  manager.appendContextEdit(keptId, null);
+  const snapshotId = manager.getLeafId();
+  assert.ok(snapshotId);
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId);
+  const preparation = makePreparation(keptId, 100);
+
+  const capacity = estimateCheckpointCapacity(
+    manager.getBranch(),
+    data,
+    preparation,
+    100_000,
+  );
+
+  assert.ok(capacity);
+  assert.equal(capacity.keptMessagesEstimatedTokens, 0);
+  assert.notEqual(oldId, keptId);
 });
 
 test("capacity estimate includes fixed overhead and rejects an impossible hard limit", () => {

@@ -1,9 +1,10 @@
 import {
+  buildSessionProjection,
   estimateTokens,
-  sessionEntryToContextMessages,
   type CompactionResult,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 import type {
   CheckpointCandidate,
   CheckpointData,
@@ -22,13 +23,29 @@ export function calculateOriginalTokensBefore(
     return undefined;
   }
 
-  return branch
-    .slice(snapshotIndex + 1)
-    .flatMap((entry) => sessionEntryToContextMessages(entry))
-    .reduce(
-      (total, message) => total + estimateTokens(message),
-      checkpoint.compaction.tokensBefore,
-    );
+  const indexById = new Map(branch.map((entry, index) => [entry.id, index]));
+  const currentProjection = buildSessionProjection([...branch]);
+  const snapshotProjection = buildSessionProjection(branch.slice(0, snapshotIndex + 1));
+  let tailTokens = 0;
+  for (const entry of currentProjection.entries) {
+    const sourceIndex = indexById.get(entry.sourceEntry.id);
+    if (sourceIndex === undefined || sourceIndex <= snapshotIndex) {
+      continue;
+    }
+    for (const message of entry.messages) {
+      if (message.role !== "system") {
+        tailTokens += estimateTokens(message);
+      }
+    }
+  }
+  const snapshotSystem = getCurrentSystemMessage(snapshotProjection.messages);
+  const currentSystem = getCurrentSystemMessage(currentProjection.messages);
+  const snapshotSystemTokens = snapshotSystem ? estimateTokens(snapshotSystem) : 0;
+  const currentSystemTokens = currentSystem ? estimateTokens(currentSystem) : 0;
+
+  return checkpoint.compaction.tokensBefore +
+    tailTokens +
+    Math.max(0, currentSystemTokens - snapshotSystemTokens);
 }
 
 function getFileList(details: Record<string, unknown> | undefined, key: "readFiles" | "modifiedFiles"): string[] {

@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { getCurrentSystemMessage, type SystemMessage } from "@earendil-works/pi-ai";
 import {
-  buildSessionContext,
+  buildSessionProjection,
   estimateTokens,
   sessionEntryToContextMessages,
   type CompactionEntry,
@@ -16,7 +17,11 @@ function sumMessageTokens(messages: readonly AgentMessage[]): number {
   return messages.reduce((total, message) => total + estimateTokens(message), 0);
 }
 
-function makeSummaryEntry(data: CheckpointData, timestamp: string): CompactionEntry {
+function makeSummaryEntry(
+  data: CheckpointData,
+  timestamp: string,
+  systemMessage?: SystemMessage,
+): CompactionEntry {
   const details = data.compaction.details;
   return {
     type: "compaction",
@@ -26,6 +31,7 @@ function makeSummaryEntry(data: CheckpointData, timestamp: string): CompactionEn
     summary: data.compaction.summary,
     firstKeptEntryId: data.compaction.firstKeptEntryId,
     tokensBefore: data.compaction.tokensBefore,
+    ...(systemMessage === undefined ? {} : { systemMessage }),
     ...(data.compaction.usage === undefined
       ? {}
       : { usage: data.compaction.usage }),
@@ -34,7 +40,8 @@ function makeSummaryEntry(data: CheckpointData, timestamp: string): CompactionEn
 }
 
 export function checkpointToCompactionSummaryMessage(data: CheckpointData): AgentMessage | undefined {
-  return sessionEntryToContextMessages(makeSummaryEntry(data, data.createdAt))[0];
+  return sessionEntryToContextMessages(makeSummaryEntry(data, data.createdAt))
+    .find((message) => message.role === "compactionSummary");
 }
 
 export type VirtualCheckpointCapacityEstimate = {
@@ -122,12 +129,18 @@ export function estimateCheckpointCapacity(
   if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
     return undefined;
   }
-  const currentMessages = buildSessionContext([...branch]).messages;
+  const projection = buildSessionProjection([...branch]);
+  const currentSystem = getCurrentSystemMessage(projection.messages);
+  const currentMessages = [
+    ...(currentSystem ? [currentSystem] : []),
+    ...projection.messages.filter((message) => message.role !== "system"),
+  ];
   const currentMessagesEstimatedTokens = sumMessageTokens(currentMessages);
   const fixedOverhead = Math.max(0, preparation.tokensBefore - currentMessagesEstimatedTokens);
-  const summaryMessage = sessionEntryToContextMessages(
-    makeSummaryEntry(data, "1970-01-01T00:00:00.000Z"),
-  )[0];
+  const summaryMessages = sessionEntryToContextMessages(
+    makeSummaryEntry(data, "1970-01-01T00:00:00.000Z", currentSystem),
+  );
+  const summaryMessage = summaryMessages.find((message) => message.role === "compactionSummary");
   if (!summaryMessage) {
     return undefined;
   }
@@ -138,10 +151,15 @@ export function estimateCheckpointCapacity(
   if (firstKeptIndex < 0) {
     return undefined;
   }
-  const keptMessages = branch
-    .slice(firstKeptIndex)
-    .flatMap((entry) => sessionEntryToContextMessages(entry));
-  const summaryEstimatedTokens = estimateTokens(summaryMessage);
+  const indexById = new Map(branch.map((entry, index) => [entry.id, index]));
+  const keptMessages = projection.entries.flatMap((entry) => {
+    const sourceIndex = indexById.get(entry.sourceEntry.id);
+    if (sourceIndex === undefined || sourceIndex < firstKeptIndex) {
+      return [];
+    }
+    return entry.messages.filter((message) => message.role !== "system");
+  });
+  const summaryEstimatedTokens = sumMessageTokens(summaryMessages);
   const keptMessagesEstimatedTokens = sumMessageTokens(keptMessages);
   const estimatedTokensAfter =
     fixedOverhead + summaryEstimatedTokens + keptMessagesEstimatedTokens;

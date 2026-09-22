@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 import {
-  buildContextEntries,
+  buildSessionProjection,
   estimateTokens,
   sessionEntryToContextMessages,
   type SessionEntry,
@@ -176,15 +177,18 @@ function estimateMessageTokens(message: AgentMessage): number | undefined {
 }
 
 function collectSourceMessages(branch: readonly SessionEntry[]): SourceMessage[] {
-  const activeEntries = buildContextEntries([...branch]);
+  const projection = buildSessionProjection([...branch]);
   const indexById = new Map(branch.map((entry, index) => [entry.id, index]));
   const messages: SourceMessage[] = [];
-  for (const entry of activeEntries) {
-    const branchIndex = indexById.get(entry.id);
+  for (const entry of projection.entries) {
+    const branchIndex = indexById.get(entry.sourceEntry.id);
     if (branchIndex === undefined) {
       continue;
     }
-    for (const message of sessionEntryToContextMessages(entry)) {
+    for (const message of entry.messages) {
+      if (message.role === "system") {
+        continue;
+      }
       messages.push({
         branchIndex,
         message,
@@ -225,7 +229,9 @@ export class VirtualContextProjectionCache {
     const canExtend =
       this.initialized &&
       sharedPrefix &&
-      !appendedEntries.some((entry) => entry.type === "compaction");
+      !appendedEntries.some(
+        (entry) => entry.type === "compaction" || entry.type === "context_edit",
+      );
     if (!canExtend) {
       this.rebuild(branch);
     } else if (appendedEntries.length > 0) {
@@ -318,6 +324,9 @@ export class VirtualContextProjectionCache {
     for (let entryOffset = 0; entryOffset < entries.length; entryOffset += 1) {
       const entry = entries[entryOffset]!;
       for (const message of sessionEntryToContextMessages(entry)) {
+        if (message.role === "system") {
+          continue;
+        }
         const source = {
           branchIndex: offset + entryOffset,
           message,
@@ -337,6 +346,25 @@ export class VirtualContextProjectionCache {
     const tokens = source.estimatedTokens;
     this.tokenTotals.push(this.tokenTotals.at(-1)! + (tokens ?? 0));
     this.invalidTokenTotals.push(this.invalidTokenTotals.at(-1)! + (tokens === undefined ? 1 : 0));
+  }
+}
+
+function estimateSystemTokenGrowth(
+  branch: readonly SessionEntry[],
+  snapshotIndex: number,
+): number | undefined {
+  try {
+    const snapshotSystem = getCurrentSystemMessage(
+      buildSessionProjection(branch.slice(0, snapshotIndex + 1)).messages,
+    );
+    const currentSystem = getCurrentSystemMessage(
+      buildSessionProjection([...branch]).messages,
+    );
+    const snapshotTokens = snapshotSystem ? estimateTokens(snapshotSystem) : 0;
+    const currentTokens = currentSystem ? estimateTokens(currentSystem) : 0;
+    return Math.max(0, currentTokens - snapshotTokens);
+  } catch {
+    return undefined;
   }
 }
 
@@ -520,13 +548,17 @@ export function tryProjectCheckpointToVirtualContext(
       .filter((_message, eventIndex) => !matchedSourceByEvent.has(eventIndex)),
     ...eventMessages.slice(tailStart),
   ];
+  const systemTokenGrowth = estimateSystemTokenGrowth(branch, snapshotIndex);
+  if (systemTokenGrowth === undefined) {
+    return { status: "unavailable", reason: "capacity_estimate_unavailable" };
+  }
   const capacity = estimateVirtualCheckpointCapacity(
     checkpoint,
     additionalMessages,
     contextWindow,
     summaryReserveTokens,
     softThresholdPercent,
-    transformedTokenGrowth,
+    transformedTokenGrowth + systemTokenGrowth,
   );
   if (!capacity) {
     return { status: "unavailable", reason: "capacity_estimate_unavailable" };

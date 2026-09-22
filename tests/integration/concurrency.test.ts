@@ -278,7 +278,15 @@ test("critical context waits for an in-flight precompaction task", async () => {
   );
   writeFileSync(
     join(scenario.cwd, ".pi", "settings.json"),
-    JSON.stringify({ compaction: { keepRecentTokens: 1, reserveTokens: 30_000 } }),
+    JSON.stringify({
+      compaction: {
+        keepRecentTokens: 1,
+        reserveTokens: 1,
+        modelOverrides: {
+          "test/model-id": { reserveTokens: 30_000 },
+        },
+      },
+    }),
   );
   const criticalCtx = {
     ...scenario.ctx,
@@ -777,6 +785,40 @@ test("concurrent turn_end events issue only one background provider request", as
     assert.equal(activity.max, 1);
     assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 1);
   } finally {
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("context edit invalidates an in-flight task before it can append", async () => {
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const scenario = createScenario(
+    {},
+    delayedResponse(120, resolveStarted),
+  );
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await started;
+
+    scenario.manager.appendContextEdit(scenario.firstEntryId, { content: "edited history" });
+    const sourceMessages = scenario.manager.buildSessionProjection().messages.filter(
+      (message) => message.role !== "system",
+    );
+    const result = await scenario.runtime.onContext({
+      type: "context",
+      messages: sourceMessages,
+    }, scenario.ctx);
+
+    assert.equal(result.messages, sourceMessages);
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    const diagnostics = scenario.runtime.getDiagnostics();
+    assert.equal(scenario.appended.length, 0);
+    assert.equal(diagnostics.counters.checkpoint_ready ?? 0, 0);
+    assert.equal(diagnostics.counters.task_discarded, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
     rmSync(scenario.cwd, { recursive: true, force: true });
   }
 });
