@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-22
+
+### Changed
+
+- 最低兼容 Pi 版本提升到 0.87.0；升级后旧 schema 和旧 preparation algorithm checkpoint 不再读取。
+- 预压缩遵循 Pi 当前上下文投影，支持 `context_edit` 的省略与替换语义。
+- 快照内消息被 `context_edit` 修改时，相关 checkpoint 和后台任务失效。
+
+### Fixed
+
+- 虚拟压缩保留 Pi 当前系统提示词和工具声明，并将其计入容量估算。
+- 正式化与临界等待使用活动模型的 `keepRecentTokens` 和 `reserveTokens` 覆盖值。
+
 ## [0.4.0] - 2026-08-31
 
 ### Added
@@ -108,7 +121,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/sunnyx11/pi-press/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/sunnyx11/pi-press/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/sunnyx11/pi-press/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/sunnyx11/pi-press/compare/v0.3.2...v0.3.3
