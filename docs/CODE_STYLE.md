@@ -541,6 +541,10 @@ Pi settings 和诊断存储字段不属于 checkpoint 生成配置，也不参�
 
 诊断事件默认写入 `getAgentDir()/pi-press/diagnostics.sqlite3`，使用 Node 内置 `node:sqlite`。事件必须包含稳定事件名，并按可用状态附加 session、epoch、branch leaf、checkpoint ID、结构化原因码、有限数值详情和 Runtime 标量快照。SQLite 只用于事后查询，不参与 checkpoint 选择、状态恢复或生命周期判定。Node 22 的 `ExperimentalWarning` 保持可见。
 
+诊断 `at` 通过共享格式函数生成固定 UTC+8 的 ISO 8601 文本，包含毫秒和 `+08:00` 偏移。内存记录、counter、usage 和持久化失败事件使用同一函数；SQLite 写入同时规范化输入时间。`at_ms` 保存原始绝对时刻，保留清理和耗时计算使用绝对时间。
+
+历史转换工具位于 `scripts/migrate-diagnostics-time.ts`。执行前暂停目标库的 Pi 写入，使用 SQLite 备份接口保存含 WAL 数据的一致性副本。转换只更新 `at`，以 `at_ms` 为依据；提交前核对备份内容及全部记录，错误时回滚事务，已有备份文件保持原值。恢复写入前安装新代码并重新加载相关 Pi 实例。
+
 后台任务通过独立 `taskId` 和创建时捕获的 session、epoch、snapshot leaf 关联诊断。记录 preparation、认证、每次历史与 turn-prefix 摘要、重试计划和实际等待、超时阶段以及底层操作实际结束时间。每次摘要包含请求编号、阶段耗时、结束原因和取消状态；每个任务包含总耗时、阶段耗时、请求次数和重试次数。`summary_request_settled` 与 `background_operation_settled` 可晚于超时事件；进程级占用持续到实际结束。callbacks 的 provider 错误正文保持在事件之外。
 
 存储层必须使用短 busy timeout，在打开时及每 100 次写入后执行时间和容量清理。超过保留天数或文件容量时删除最早事件；数据库故障必须停用当前 Runtime 的持久化并保留内存计数和最近事件。checkpoint usage 转入正式 compaction 后标记为 consumed，不能与 Pi session stats 重复相加。
@@ -561,7 +565,9 @@ Pi settings 和诊断存储字段不属于 checkpoint 生成配置，也不参�
 - 容量公式、容量余量和 soft threshold；
 - task identity、runEpoch 和状态转换；
 - provider header 的覆盖、删除和环境变量传递；
-- SQLite 跨重启查询、session 筛选、保留天数、容量上限、写入故障降级、命令参数和 JSON 输出。
+- SQLite 跨重启查询、session 筛选、保留天数、容量上限、写入故障降级、命令参数和 JSON 输出；
+- 北京时间格式、跨日、跨年和闰日、宿主时区独立性、SQLite 输入规范化与 `at_ms` 等价；
+- 历史转换的 WAL 备份、记录及字段保留、重复执行、事务回滚、已有备份保护和显式 CLI 参数。
 
 ### 集成测试
 

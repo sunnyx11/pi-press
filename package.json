@@ -33,6 +33,7 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/unit/*.test.ts tests/integration/*.test.ts",
     "test:smoke:pi": "tsx scripts/smoke-real-pi.ts",
+    "diagnostics:migrate-time": "tsx scripts/migrate-diagnostics-time.ts",
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "publishConfig": {

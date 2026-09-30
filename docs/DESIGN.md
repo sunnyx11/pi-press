@@ -611,6 +611,41 @@ Promise
 
 结构化事件默认写入 `getAgentDir()/pi-press/diagnostics.sqlite3`。数据库只服务事后查询，不写入 session JSONL，不作为 checkpoint 有效性、候选顺序、正式化状态或 Runtime 恢复依据。每个事件包含时间、进程和 Runtime 标识、类别、事件名，以及可用的 session ID、正式 compaction epoch、branch leaf、checkpoint ID、原因码、结构化详情和 Runtime 标量状态。自由文本错误消息只保留在当前 Runtime 内存中，不写入 SQLite。状态包括当前后台任务、checkpoint claim、虚拟应用、正式化调度、pending、deferred、计数器集合大小和投影缓存统计，不包含用户消息、完整摘要、工具结果、认证信息或完整 provider 响应。
 
+诊断时间遵守以下规则：
+
+- 内存记录、结构化事件和 SQLite 的 `at` 使用固定北京时间，格式为 `YYYY-MM-DDTHH:mm:ss.SSS+08:00`，与宿主时区无关。
+- SQLite 写入按输入 `at` 解析绝对时刻，将时间文本规范化为北京时间。`at_ms` 保存同一时刻的 Unix 毫秒时间戳，保留期限和耗时计算使用绝对时间。
+- 文本和 JSON 查询报告保留事件的 `at`。Pi session entry 时间和 checkpoint `createdAt` 使用各自已有规则。
+
+例如，`2026-09-30T16:36:22.616Z` 对应诊断时间 `2026-10-01T00:36:22.616+08:00`，两者的 `at_ms` 均为 `1790786182616`。
+
+### 历史诊断时间转换
+
+在仓库根目录执行转换工具。执行前暂停使用目标诊断库的所有 Pi 实例；恢复写入前安装新代码并重新加载相关实例。后台任务、重试和当前会话本身都可能写入诊断库。
+
+```bash
+npm run diagnostics:migrate-time -- --database "C:/Users/qidi/.pi/agent/pi-press/diagnostics.sqlite3" --backup "C:/Users/qidi/.pi/agent/pi-press/diagnostics.before-beijing.sqlite3"
+```
+
+`--database` 指定已有的版本 1 诊断数据库。`--backup` 指定新的备份文件，父目录须已存在。工具使用 SQLite 备份接口保存包含已提交 WAL 数据的一致性副本，并核对备份记录。
+
+转换在单个写事务中按 `at_ms` 生成北京时间文本。提交前核对全部记录，只有 `at` 可以变化；记录数量、ID、`at_ms` 和其他字段保持原值。表结构、索引和 `user_version` 保持原状。错误使转换事务回滚；已完成的备份保留。备份创建失败时，目标文件可能存在，重试须选择新的备份文件名。
+
+成功输出如下，数量按实际数据库计算：
+
+```json
+{
+  "databasePath": "C:\\Users\\qidi\\.pi\\agent\\pi-press\\diagnostics.sqlite3",
+  "backupPath": "C:\\Users\\qidi\\.pi\\agent\\pi-press\\diagnostics.before-beijing.sqlite3",
+  "totalRows": 3,
+  "convertedRows": 2
+}
+```
+
+重复执行仍创建新的备份；已规范化记录的 `convertedRows` 为 `0`。参数、备份或转换校验失败时，命令输出错误并以状态码 `1` 退出。
+
+### 任务诊断
+
 后台诊断通过任务创建时捕获的 session、epoch、snapshot leaf 和独立 `taskId` 关联。任务阶段包括 `preparation`、`auth`、`history_summary`、`turn_prefix_summary`、`retry_backoff` 和 `checkpoint`：
 
 - `task_started` 记录模型标识、摘要级别和总期限。

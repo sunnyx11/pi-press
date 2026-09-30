@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { formatDiagnosticTimestamp } from "./diagnostics.js";
 import type {
   DiagnosticEvent,
   DiagnosticEventQuery,
@@ -192,7 +193,7 @@ export class SqliteDiagnosticStore implements DiagnosticStore {
     }
     this.insertStatement.run(
       atMs,
-      event.at,
+      formatDiagnosticTimestamp(atMs),
       event.processId,
       event.runtimeId,
       event.category,

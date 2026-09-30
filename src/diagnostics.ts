@@ -73,6 +73,13 @@ type DiagnosticContextProvider = () => DiagnosticEventMetadata;
 const MAX_RECORDS = 100;
 const MAX_MEMORY_EVENTS = 200;
 const MAX_MESSAGE_LENGTH = 500;
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1_000;
+
+/** 将 Unix 毫秒时间戳表示为固定 UTC+8 的 ISO 8601 时间；无效日期抛出 RangeError。 */
+export function formatDiagnosticTimestamp(atMs: number): string {
+  const shifted = new Date(atMs + BEIJING_OFFSET_MS).toISOString();
+  return `${shifted.slice(0, -1)}+08:00`;
+}
 
 function describePersistenceError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -128,7 +135,7 @@ export class Diagnostics {
     message: string,
     metadata: DiagnosticEventMetadata = {},
   ): void {
-    const at = new Date().toISOString();
+    const at = formatDiagnosticTimestamp(Date.now());
     const normalizedMessage = normalizeMessage(message);
     this.pushRecord({ kind, message: normalizedMessage, at });
     this.appendEvent(this.createEvent(
@@ -142,7 +149,7 @@ export class Diagnostics {
 
   count(name: string, metadata: DiagnosticEventMetadata = {}): void {
     this.counters.set(name, (this.counters.get(name) ?? 0) + 1);
-    const at = new Date().toISOString();
+    const at = formatDiagnosticTimestamp(Date.now());
     this.appendEvent(this.createEvent("counter", name, at, metadata));
   }
 
@@ -160,7 +167,7 @@ export class Diagnostics {
     } else {
       this.discardedTokens += totalTokens;
     }
-    const at = new Date().toISOString();
+    const at = formatDiagnosticTimestamp(Date.now());
     this.appendEvent(this.createEvent("usage", `usage_${kind}`, at, {
       ...metadata,
       details: {
@@ -265,7 +272,7 @@ export class Diagnostics {
       return;
     }
     this.persistenceFailure = failure;
-    const at = new Date().toISOString();
+    const at = formatDiagnosticTimestamp(Date.now());
     const message = `诊断持久化已停用：${failure}`;
     this.pushRecord({ kind: "lifecycle", message, at });
     this.pushMemoryEvent(this.createEvent(
