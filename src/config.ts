@@ -19,6 +19,7 @@ export const DEFAULT_CONFIG: PiPressConfig = {
   precomputeMode: "threshold",
   softThresholdPercent: 80,
   summaryReserveTokens: 16_384,
+  summaryThinkingLevel: "low",
   taskTimeoutMs: 300_000,
   hookWaitTimeoutMs: 1_000,
   diagnosticsPersistence: "sqlite",
@@ -35,6 +36,7 @@ const CONFIG_KEYS: readonly ConfigKey[] = [
   "precomputeMode",
   "softThresholdPercent",
   "summaryReserveTokens",
+  "summaryThinkingLevel",
   "taskTimeoutMs",
   "hookWaitTimeoutMs",
   "diagnosticsPersistence",
@@ -46,6 +48,7 @@ const CHECKPOINT_CONFIG_KEYS: readonly ConfigKey[] = [
   "precomputeMode",
   "softThresholdPercent",
   "summaryReserveTokens",
+  "summaryThinkingLevel",
   "taskTimeoutMs",
   "hookWaitTimeoutMs",
 ];
@@ -95,6 +98,9 @@ function isValidValue(key: ConfigKey, value: unknown): boolean {
       return isPercent(value);
     case "summaryReserveTokens":
       return isIntegerAtLeast(value, 0);
+    case "summaryThinkingLevel":
+      return typeof value === "string"
+        && ["inherit", "off", "minimal", "low", "medium", "high", "xhigh"].includes(value);
     case "taskTimeoutMs":
     case "hookWaitTimeoutMs":
       return isTimerDuration(value);

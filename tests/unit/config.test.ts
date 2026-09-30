@@ -33,6 +33,24 @@ test("normalizeConfig returns design defaults and reports removed fields", () =>
   assert.deepEqual(result.diagnostics, ["配置字段 targetPostCompactionPercent 已移除，当前值已忽略"]);
 });
 
+test("normalizeConfig defaults summary thinking to low and validates explicit levels", () => {
+  assert.equal(normalizeConfig({}).config.summaryThinkingLevel, "low");
+  for (const level of ["inherit", "off", "minimal", "low", "medium", "high", "xhigh"]) {
+    const result = normalizeConfig({ summaryThinkingLevel: level });
+    assert.equal(result.config.summaryThinkingLevel, level);
+    assert.deepEqual(result.diagnostics, []);
+  }
+  const invalid = normalizeConfig({ summaryThinkingLevel: "maximum" });
+  assert.equal(invalid.config.summaryThinkingLevel, "low");
+  assert.deepEqual(invalid.diagnostics, ["配置字段 summaryThinkingLevel 无效，已使用默认值"]);
+});
+
+test("summary thinking participates in checkpoint identity", () => {
+  const low = normalizeConfig({ summaryThinkingLevel: "low" }).config;
+  const inherit = normalizeConfig({ summaryThinkingLevel: "inherit" }).config;
+  assert.notEqual(configFingerprint(low), configFingerprint(inherit));
+});
+
 test("normalizeConfig falls back per invalid field", () => {
   const result = normalizeConfig({
     softThresholdPercent: 101,

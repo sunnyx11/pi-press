@@ -1,4 +1,4 @@
-import type { StreamFn } from "@earendil-works/pi-agent-core";
+import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import type {
   compact,
@@ -16,11 +16,13 @@ export const CHECKPOINT_CUSTOM_TYPE = "pi-press.precompaction" as const;
 
 export type PrecomputeMode = "off" | "threshold" | "threshold-and-manual";
 export type DiagnosticsPersistence = "sqlite" | "memory";
+export type SummaryThinkingLevel = ThinkingLevel | "inherit";
 
 export interface PiPressConfig {
   precomputeMode: PrecomputeMode;
   softThresholdPercent: number;
   summaryReserveTokens: number;
+  summaryThinkingLevel: SummaryThinkingLevel;
   taskTimeoutMs: number;
   hookWaitTimeoutMs: number;
   diagnosticsPersistence: DiagnosticsPersistence;

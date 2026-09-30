@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import test from "node:test";
 import { join } from "node:path";
 import {
@@ -33,7 +34,7 @@ const supportsSameRunToolCompaction =
 const sameRunToolCompactionTest = supportsSameRunToolCompaction ? test : test.skip;
 
 test("public agent session applies virtual context and formalizes it after settlement", async () => {
-  const cwd = mkdtempSync(join("/tmp", "pi-press-agent-loop-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-press-agent-loop-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(join(cwd, ".pi"), { recursive: true });
   mkdirSync(agentDir, { recursive: true });
@@ -232,8 +233,8 @@ test("public agent session applies virtual context and formalizes it after settl
   }
 });
 
-sameRunToolCompactionTest("Pi 0.87.0 compacts after a tool result before the next assistant request", async () => {
-  const cwd = mkdtempSync(join("/tmp", "pi-press-agent-tool-loop-"));
+sameRunToolCompactionTest(`Pi ${VERSION} compacts after a tool result before the next assistant request`, async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-press-agent-tool-loop-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(join(cwd, ".pi"), { recursive: true });
   mkdirSync(agentDir, { recursive: true });
@@ -391,7 +392,7 @@ sameRunToolCompactionTest("Pi 0.87.0 compacts after a tool result before the nex
 });
 
 test("preparation adapter matches Pi public compaction event for split turns and metadata", async () => {
-  const cwd = mkdtempSync(join("/tmp", "pi-press-preparation-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-press-preparation-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(join(cwd, ".pi"), { recursive: true });
   mkdirSync(agentDir, { recursive: true });

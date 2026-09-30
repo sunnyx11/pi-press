@@ -41,7 +41,9 @@ interface PiSdk {
 interface CheckpointData {
   checkpointId: string;
   snapshotLeafId: string;
+  provenance: { thinkingLevel: string };
   compaction: {
+    summary: string;
     tokensBefore: number;
   };
 }
@@ -55,6 +57,7 @@ interface SmokeResult {
   tailTokens: number;
   expectedTokensBefore: number;
   actualTokensBefore: number;
+  summaryThinkingLevel: string;
 }
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -108,7 +111,8 @@ export function resolveSystemPi(options: ResolveSystemPiOptions): string {
 }
 
 function readPiVersion(piExecutable: string): string {
-  const result = spawnSync(piExecutable, ["--version"], {
+  const launch = resolvePiLaunch(piExecutable);
+  const result = spawnSync(launch.command, [...launch.args, "--version"], {
     encoding: "utf8",
     timeout: 30_000,
   });
@@ -128,14 +132,21 @@ function readPiVersion(piExecutable: string): string {
 function findPiPackageRoot(piExecutable: string): string {
   let current = dirname(realpathSync(piExecutable));
   while (true) {
-    const packagePath = join(current, "package.json");
-    try {
-      const parsed = JSON.parse(readFileSync(packagePath, "utf8")) as { name?: unknown };
-      if (parsed.name === "@earendil-works/pi-coding-agent") {
-        return current;
+    for (const candidate of [current, join(current, "node_modules", "@earendil-works", "pi-coding-agent")]) {
+      let parsed: { name?: unknown };
+      try {
+        parsed = JSON.parse(readFileSync(join(candidate, "package.json"), "utf8")) as { name?: unknown };
+      } catch {
+        // 检查下一处 npm 包位置。
+        continue;
       }
-    } catch {
-      // 继续向父目录查找 Pi 包根目录。
+      if (parsed.name === "@earendil-works/pi-coding-agent") {
+        const packageRoot = realpathSync(candidate);
+        if (isWithin(join(projectRoot, "node_modules"), packageRoot)) {
+          throw new Error("真实 Pi 禁止使用仓库 node_modules 中的 SDK");
+        }
+        return packageRoot;
+      }
     }
     const parent = dirname(current);
     if (parent === current) {
@@ -146,22 +157,46 @@ function findPiPackageRoot(piExecutable: string): string {
   throw new Error(`无法从 Pi 可执行文件定位 @earendil-works/pi-coding-agent：${piExecutable}`);
 }
 
+/** Windows npm shim 使用同一外部安装包声明的 CLI 入口。 */
+export function resolvePiLaunch(piExecutable: string): { command: string; args: string[] } {
+  if (process.platform !== "win32" || !/\.(cmd|bat)$/i.test(piExecutable)) {
+    return { command: piExecutable, args: [] };
+  }
+  const packageRoot = findPiPackageRoot(piExecutable);
+  const metadata = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
+    bin?: { pi?: unknown };
+  };
+  if (typeof metadata.bin?.pi !== "string") {
+    throw new Error(`外部 Pi 包没有声明 pi CLI：${packageRoot}`);
+  }
+  const entrypoint = realpathSync(join(packageRoot, metadata.bin.pi));
+  if (!isWithin(packageRoot, entrypoint)) {
+    throw new Error(`Pi CLI 位于安装包之外：${entrypoint}`);
+  }
+  return { command: process.execPath, args: [entrypoint] };
+}
+
 async function loadPiSdk(piExecutable: string): Promise<PiSdk> {
   const packageRoot = findPiPackageRoot(piExecutable);
   const moduleUrl = pathToFileURL(join(packageRoot, "dist", "index.js")).href;
   return await import(moduleUrl) as PiSdk;
 }
 
-function createSmokeSession(
+export function createSmokeSession(
   cwd: string,
   SessionManager: PiSdk["SessionManager"],
+  splitTurn = false,
 ): string {
   const sessionDirectory = join(cwd, "sessions");
   mkdirSync(sessionDirectory, { recursive: true });
   const manager = SessionManager.create(cwd, sessionDirectory);
   manager.appendMessage({
     role: "user",
-    content: [{ type: "text", text: "Previously discussed deployment details." }],
+    content: [{ type: "text", text: splitTurn
+      ? Array.from({ length: 3_500 }, (_, index) =>
+        `Deployment record ${index}: service api-${index}, version v2, owner platform, rollback restores v1, validation checks health and logs.\n`,
+      ).join("")
+      : "Previously discussed deployment details." }],
     timestamp: Date.now(),
   });
   manager.appendMessage({
@@ -181,6 +216,26 @@ function createSmokeSession(
     stopReason: "stop",
     timestamp: Date.now(),
   });
+  if (splitTurn) {
+    manager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: Array.from({ length: 1_000 }, (_, index) =>
+        `Current deployment request ${index}: review service api-${index}, verify health before rollout, retain rollback notes and report status.\n`,
+      ).join("") }],
+      timestamp: Date.now(),
+    });
+    manager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "Preserved deployment progress: health checks passed; rollback notes remain available.\n".repeat(600) }],
+      api: "anthropic-messages",
+      provider: "pi-press-smoke",
+      model: "seed",
+      usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    });
+  }
   const sessionFile = manager.getSessionFile();
   if (!sessionFile) {
     throw new Error("Pi 未创建冒烟测试 session 文件");
@@ -188,7 +243,7 @@ function createSmokeSession(
   return sessionFile;
 }
 
-function createSmokeConfig(cwd: string): void {
+function createSmokeConfig(cwd: string, splitTurn: boolean, summaryThinkingLevel: string): void {
   const configDirectory = join(cwd, ".pi");
   mkdirSync(configDirectory, { recursive: true });
   writeFileSync(
@@ -196,8 +251,9 @@ function createSmokeConfig(cwd: string): void {
     JSON.stringify({
       precomputeMode: "threshold",
       softThresholdPercent: 0,
-      summaryReserveTokens: 1024,
-      taskTimeoutMs: 120_000,
+      summaryReserveTokens: splitTurn ? 16_384 : 1024,
+      summaryThinkingLevel,
+      taskTimeoutMs: 300_000,
       hookWaitTimeoutMs: 5_000,
     }, null, 2),
   );
@@ -206,8 +262,8 @@ function createSmokeConfig(cwd: string): void {
     JSON.stringify({
       compaction: {
         enabled: true,
-        reserveTokens: 1024,
-        keepRecentTokens: 0,
+        reserveTokens: splitTurn ? 16_384 : 1024,
+        keepRecentTokens: splitTurn ? 10_000 : 0,
       },
     }, null, 2),
   );
@@ -242,6 +298,8 @@ function verifyEntries(
   piVersion: string,
   model: string,
   sdk: PiSdk,
+  splitTurn: boolean,
+  expectedThinkingLevel: string,
 ): SmokeResult {
   const checkpointEntry = [...entries].reverse().find(
     (entry) => entry.type === "custom" &&
@@ -260,6 +318,12 @@ function verifyEntries(
   }
 
   const checkpointData = checkpointEntry.data;
+  if (checkpointData.provenance?.thinkingLevel !== expectedThinkingLevel) {
+    throw new Error(`摘要 thinking level 不匹配：${checkpointData.provenance?.thinkingLevel}`);
+  }
+  if (splitTurn && !checkpointData.compaction.summary?.includes("**Turn Context (split turn):**")) {
+    throw new Error("大输入冒烟测试没有生成原生 split turn 双摘要");
+  }
   const snapshotIndex = entries.findIndex(
     (entry) => entry.id === checkpointData.snapshotLeafId,
   );
@@ -295,6 +359,7 @@ function verifyEntries(
     tailTokens,
     expectedTokensBefore,
     actualTokensBefore: compactionEntry.tokensBefore,
+    summaryThinkingLevel: checkpointData.provenance.thinkingLevel,
   };
 }
 
@@ -311,11 +376,16 @@ function runRpcSmoke(
   cwd: string,
   sessionFile: string,
   sdk: PiSdk,
+  splitTurn: boolean,
+  summaryThinkingLevel: string,
 ): Promise<SmokeResult> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(piExecutable, [
+    const launch = resolvePiLaunch(piExecutable);
+    const mainThinkingLevel = splitTurn ? "xhigh" : "off";
+    const child = spawn(launch.command, [
+      ...launch.args,
       "--mode", "rpc",
-      "--thinking", "off",
+      "--thinking", mainThinkingLevel,
       "--no-tools",
       "--no-extensions",
       "--extension", extensionPath,
@@ -342,7 +412,7 @@ function runRpcSmoke(
       finish({
         error: new Error(`等待真实 Pi 正式 compaction 超时${stderr ? `：${stderr}` : ""}${trace}`),
       });
-    }, 180_000);
+    }, 420_000);
 
     const finish = (nextOutcome: { result?: SmokeResult; error?: Error }): void => {
       if (outcome) {
@@ -380,8 +450,14 @@ function runRpcSmoke(
           finish({ error: new Error("真实 Pi 当前模型信息不完整") });
           return;
         }
+        const thinkingLevel = (record.data as { thinkingLevel?: unknown }).thinkingLevel;
+        if (thinkingLevel !== mainThinkingLevel) {
+          finish({ error: new Error(`主会话 thinking level 不匹配：${String(thinkingLevel)}`) });
+          return;
+        }
         model = `${provider}/${modelId}`;
-        const history = `${"Historical context for compaction. ".repeat(1_600)}\n` +
+        process.stdout.write(`Model: ${model}\nMain thinking: ${thinkingLevel}\n`);
+        const history = (splitTurn ? "" : `${"Historical context for compaction. ".repeat(1_600)}\n`) +
           "Reply exactly FIRST_OK and nothing else.";
         send({ id: "initial-prompt", type: "prompt", message: history });
         return;
@@ -429,6 +505,8 @@ function runRpcSmoke(
               piVersion,
               model,
               sdk,
+              splitTurn,
+              summaryThinkingLevel === "inherit" ? mainThinkingLevel : summaryThinkingLevel,
             ),
           });
         } catch (error: unknown) {
@@ -492,6 +570,12 @@ function runRpcSmoke(
 }
 
 async function main(): Promise<void> {
+  const scenario = process.env.PI_SMOKE_SCENARIO ?? "basic";
+  const summaryThinkingLevel = process.env.PI_SMOKE_SUMMARY_THINKING ?? "low";
+  if (!["basic", "split"].includes(scenario) || !["low", "inherit"].includes(summaryThinkingLevel)) {
+    throw new Error("PI_SMOKE_SCENARIO 允许 basic 或 split；PI_SMOKE_SUMMARY_THINKING 允许 low 或 inherit");
+  }
+  const splitTurn = scenario === "split";
   const piExecutable = resolveSystemPi({
     projectRoot,
     pathValue: process.env.PATH ?? "",
@@ -507,11 +591,14 @@ async function main(): Promise<void> {
   process.stdout.write("真实 Pi 冒烟测试将调用当前配置的 provider。\n");
 
   try {
-    createSmokeConfig(cwd);
-    const sessionFile = createSmokeSession(cwd, sdk.SessionManager);
-    const result = await runRpcSmoke(piExecutable, piVersion, cwd, sessionFile, sdk);
+    process.stdout.write(`Scenario: ${scenario}\nSummary setting: ${summaryThinkingLevel}\n`);
+    createSmokeConfig(cwd, splitTurn, summaryThinkingLevel);
+    const sessionFile = createSmokeSession(cwd, sdk.SessionManager, splitTurn);
+    const startedAt = Date.now();
+    const result = await runRpcSmoke(piExecutable, piVersion, cwd, sessionFile, sdk, splitTurn, summaryThinkingLevel);
     succeeded = true;
-    process.stdout.write(`Model: ${result.model}\n`);
+    process.stdout.write(`Elapsed ms: ${Date.now() - startedAt}\n`);
+    process.stdout.write(`Summary thinking: ${result.summaryThinkingLevel}\n`);
     process.stdout.write(`Checkpoint ID: ${result.checkpointId}\n`);
     process.stdout.write(`Checkpoint tokensBefore: ${result.checkpointTokensBefore}\n`);
     process.stdout.write(`Tail tokens: ${result.tailTokens}\n`);

@@ -14,7 +14,7 @@
 
 当前项目依赖 `@earendil-works/pi-coding-agent >=0.87.0`，Node.js 版本以实际安装的发行包要求为准。设计文档是 `pi-press` 的行为契约，本文件负责把该契约转换为代码组织和实现规则。
 
-npm 发布包中的 Pi 核心包必须声明为 `peerDependencies: "*"`，由 Pi 宿主提供；`devDependencies` 保留最低兼容范围 `>=0.87.0`，本地类型检查和测试使用 `package-lock.json` 固定的 Pi 0.87.0，禁止把 Pi 核心包作为普通运行时依赖随扩展重复安装。
+npm 发布包中的 Pi 核心包必须声明为 `peerDependencies: "*"`，由 Pi 宿主提供；`devDependencies` 和 `package-lock.json` 固定 Pi 0.99.1。本地类型检查和测试验证固定版本，最低兼容版本 0.87.0 另行回归。Pi 核心包由宿主提供运行时依赖。
 
 ## 核心原则
 
@@ -239,7 +239,7 @@ import {
 | `session_tree` | 读取新分支并恢复内存状态；不重复执行已经由 `session_before_tree` 完成的 epoch 递增。 |
 | `session_shutdown` | 递增运行 epoch，先清除任务身份再发送 abort，清除 virtual、deferred、pending 和 session 资源；不等待后台认证或 provider Promise。 |
 | `model_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取模型 provenance，不废弃已有 ready checkpoint，也不改变 snapshot key。 |
-| `thinking_level_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取 thinking level，不承担 checkpoint 失效和消费判断。 |
+| `thinking_level_select` | 不注册专用处理器；`summaryThinkingLevel: "inherit"` 的后续任务读取新的主会话级别，其余配置使用指定摘要级别。已有 checkpoint 继续按分支与容量规则消费。 |
 
 `turn_end` 不调用 `ctx.compact()`，因为当前 agent loop 仍可能继续采样。Pi 在 `turn_end` 后可于下一次 assistant 请求前执行原生阈值压缩；`agent_end` 之后仍可能发生自动重试、最终压缩检查或排队消息续跑。只有 `agent_settled` 后，且虚拟 checkpoint 已实际用于请求、上下文仍有效并且 `ctx.isIdle()` 为真时，才允许等待兼容后台任务并安排正式化。正式化通过 Pi `SettingsManager` 获取活动模型的 `compaction.keepRecentTokens`，以该值对当前分支构造无 parent preparation；不可用时保存 deferred 并按叶节点等待后续检查，可用时设置 pending 并调用 `ctx.compact()`。正式 `compaction` entry 由 Pi 写入。overflow 或 `willRetry: true` 只复用比失败请求更新的 checkpoint；等待失败时返回 `undefined`，保留 Pi 原生压缩和自动重试。带 `customInstructions` 的请求使用 Pi 原生 compaction。
 
@@ -387,7 +387,7 @@ custom entry 不进入 LLM 上下文，可以作为 session tree 的 metadata。
 
 provider 请求适配必须：
 
-- 使用当前活动模型和当前 thinking level；
+- 使用当前活动模型，摘要级别由 `summaryThinkingLevel` 解析，默认 `low`；`inherit` 使用当前主会话级别，缺失时使用 `medium`；
 - 检查 `getApiKeyAndHeaders()` 的 `ok` 结果；认证失败时返回可诊断的原生回退；
 - 保留解析得到的 `baseUrl`、`apiKey`、headers 和 `env`；
 - 将值为 `null` 的 header 解释为删除，传给 `compact()` 前移除；
@@ -433,7 +433,7 @@ preparation 算法版本
 preparation 配置 fingerprint
 ```
 
-生成模型、thinking level 和生成 provenance 不参与 snapshot key。正式 compaction epoch 只由当前分支最近正式 compaction entry 的 ID 表示；没有正式 compaction 时使用 `null`，不得维护第二个整数 generation。
+生成模型、解析后的 thinking level 和生成 provenance 不参与 snapshot key。`summaryThinkingLevel` 配置值参与生成配置 fingerprint，用于新任务去重。正式 compaction epoch 只由当前分支最近正式 compaction entry 的 ID 表示；没有正式 compaction 时使用 `null`，不得维护第二个整数 generation。
 
 追加 checkpoint 前必须重新满足：
 
@@ -469,6 +469,7 @@ hardLimit = contextWindow - reserveTokens - safetyMargin
 - `precomputeMode: "threshold"`；
 - `softThresholdPercent: 80`；
 - `summaryReserveTokens: 16384`；
+- `summaryThinkingLevel: "low"`；
 - `taskTimeoutMs: 300000`；
 - `hookWaitTimeoutMs: 1000`；
 - `diagnosticsPersistence: "sqlite"`；
@@ -476,6 +477,8 @@ hardLimit = contextWindow - reserveTokens - safetyMargin
 - `diagnosticsMaxDatabaseMiB: 64`。
 
 checkpoint preparation 固定使用 `keepRecentTokens: 10000`，该值不属于 Pi-press 配置字段；正式化 preparation 使用 Pi `SettingsManager.getCompactionKeepRecentTokens(model)` 返回的活动模型生效值，请求前临界值使用 `getCompactionReserveTokens(model)`。`SettingsManager` 负责合并全局、受信任项目和 `compaction.modelOverrides` 设置，字段缺失时返回 Pi 默认值，当前默认 `keepRecentTokens` 为 `20000`；Pi-press 不得自行解析 Pi settings 文件。后台摘要请求固定允许一次瞬时错误重试。同一正式 compaction epoch 可按 `softThresholdPercent` 连续刷新，每代使用 parent summary 和 parent snapshot 后的投影历史。旧配置中的 `targetPostCompactionPercent` 记录一次警告并忽略。
+
+`summaryThinkingLevel` 允许 `inherit`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh`，无效值按配置层规则处理并记录诊断。该配置只影响新摘要请求，主会话级别保持原状，已有有效检查点继续复用。
 
 Pi settings 和诊断存储字段不属于 checkpoint 生成配置，也不参与配置 fingerprint。配置 fingerprint 必须参与 snapshot key。`diagnosticsRetentionDays` 允许 `1..3650`，`diagnosticsMaxDatabaseMiB` 允许 `1..1024`。`precomputeMode` 为 `"off"` 时中止 in-flight 任务并清除 virtual、deferred、pending 和正式化调度；诊断存储仍按自身配置工作。
 
@@ -538,13 +541,15 @@ Pi settings 和诊断存储字段不属于 checkpoint 生成配置，也不参�
 
 诊断事件默认写入 `getAgentDir()/pi-press/diagnostics.sqlite3`，使用 Node 内置 `node:sqlite`。事件必须包含稳定事件名，并按可用状态附加 session、epoch、branch leaf、checkpoint ID、结构化原因码、有限数值详情和 Runtime 标量快照。SQLite 只用于事后查询，不参与 checkpoint 选择、状态恢复或生命周期判定。Node 22 的 `ExperimentalWarning` 保持可见。
 
+后台任务通过独立 `taskId` 和创建时捕获的 session、epoch、snapshot leaf 关联诊断。记录 preparation、认证、每次历史与 turn-prefix 摘要、重试计划和实际等待、超时阶段以及底层操作实际结束时间。每次摘要包含请求编号、阶段耗时、结束原因和取消状态；每个任务包含总耗时、阶段耗时、请求次数和重试次数。`summary_request_settled` 与 `background_operation_settled` 可晚于超时事件；进程级占用持续到实际结束。callbacks 的 provider 错误正文保持在事件之外。
+
 存储层必须使用短 busy timeout，在打开时及每 100 次写入后执行时间和容量清理。超过保留天数或文件容量时删除最早事件；数据库故障必须停用当前 Runtime 的持久化并保留内存计数和最近事件。checkpoint usage 转入正式 compaction 后标记为 consumed，不能与 Pi session stats 重复相加。
 
 ## 测试规范
 
 ### 测试边界
 
-测试必须使用实际安装的 `@earendil-works/pi-coding-agent` 发布包和包根公开接口。最低兼容版本和 `package-lock.json` 固定版本均为 `0.87.0`。测试禁止导入 `dist/core/...`、内部 `prepareCompaction()` 或手工 session JSONL 解析器。
+测试必须使用实际安装的 `@earendil-works/pi-coding-agent` 发布包和包根公开接口。最低兼容版本为 `0.87.0`，`package-lock.json` 固定版本为 `0.99.1`。两者均运行类型检查和测试。测试禁止导入 `dist/core/...`、内部 `prepareCompaction()` 或手工 session JSONL 解析器。
 
 ### 单元测试
 
@@ -572,6 +577,8 @@ Pi settings 和诊断存储字段不属于 checkpoint 生成配置，也不参�
 - `context_edit` 省略和替换进入摘要、尾部 token 与容量估算；快照内编辑使 checkpoint、parent 链和后台任务失效，尾部编辑保留 checkpoint；
 - user、assistant、bash execution、custom message、branch summary、Pi-press custom entry 和 context-invisible metadata 的边界；
 - tool result 不作为错误切分点；
+- 后台摘要 `low`、`inherit`、`off` 保留主会话级别，配置枚举和 fingerprint 正确；
+- 阶段诊断覆盖双摘要、重试成功、重试等待取消、共享总期限及迟到请求结束，事件不含请求正文；
 - 后台任务不阻塞 `turn_end`，认证失败、retry、超时、signal 和 provider 错误都能释放状态；
 - ready checkpoint 被复用时不发起第二次摘要请求；
 - checkpoint custom entry 不进入 LLM 上下文，诊断 SQLite 不产生 session entry；
@@ -592,7 +599,7 @@ npm test
 npm run test:smoke:pi
 ```
 
-`npm run test:smoke:pi` 使用当前 shell 环境安装的仓库外部 Pi 可执行文件和当前配置模型，调用真实 provider，并验证 checkpoint 原始计数与正式 `tokensBefore`。可通过 `PI_BIN` 指定 Pi 可执行文件。
+`npm run test:smoke:pi` 使用当前 shell 环境安装的仓库外部 Pi 可执行文件和当前配置模型，调用真实 provider，并验证 checkpoint 原始计数与正式 `tokensBefore`。可通过 `PI_BIN` 指定 Pi 可执行文件。Windows npm shim 使用同一外部安装包的 `package.json` 声明的 CLI 入口，不启动命令 shell。`PI_SMOKE_SCENARIO=split` 使用主会话 `xhigh` 和大输入双摘要；摘要默认 `low`，`PI_SMOKE_SUMMARY_THINKING=inherit` 提供同输入对照。所有真实测试可能产生调用费用。
 
 涉及公开 API、版本适配、provider、session 生命周期或并发控制时，必须同时运行相关集成测试。测试未覆盖的行为应在变更说明中列出，不能仅以主流程通过作为完成依据。
 

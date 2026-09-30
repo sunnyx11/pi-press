@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   VERSION,
@@ -89,7 +89,14 @@ const sharedRuntimeState = runtimeStateHost[SHARED_RUNTIME_STATE_KEY] ??= {};
 type SessionManager = ExtensionContext["sessionManager"];
 type ModelRegistry = ExtensionContext["modelRegistry"];
 
+type BackgroundTaskStage = "preparation" | "auth" | "history_summary" | "turn_prefix_summary" | "retry_backoff" | "checkpoint";
+
 type BackgroundTask = {
+  taskId: string;
+  stage: BackgroundTaskStage;
+  stageStartedAt: number;
+  requestCount: number;
+  retryCount: number;
   sessionId: string;
   runEpoch: number;
   snapshotLeafId: string;
@@ -762,7 +769,9 @@ export class ExtensionRuntime {
       snapshotKey,
       branchEntries: [...branchEntries],
       model,
-      thinkingLevel: ctx.thinkingLevel ?? "medium",
+      thinkingLevel: config.summaryThinkingLevel === "inherit"
+        ? ctx.thinkingLevel ?? "medium"
+        : config.summaryThinkingLevel,
       config,
       ...(existingCandidate === undefined ? {} : { parentCheckpoint: existingCandidate.data }),
     });
@@ -1097,6 +1106,10 @@ export class ExtensionRuntime {
       hookInFlight: this.hookInFlight,
       inFlightTask: task
         ? {
+          taskId: task.taskId,
+          stage: task.stage,
+          requestCount: task.requestCount,
+          retryCount: task.retryCount,
           sessionId: task.sessionId,
           runEpoch: task.runEpoch,
           snapshotLeafId: task.snapshotLeafId,
@@ -1305,29 +1318,60 @@ export class ExtensionRuntime {
     );
   }
 
+  private taskMetadata(task: BackgroundTask, details: JsonObject = {}): DiagnosticEventMetadata {
+    return {
+      sessionId: task.sessionId,
+      epochCompactionId: task.epochCompactionId,
+      branchLeafId: task.snapshotLeafId,
+      details: {
+        taskId: task.taskId,
+        stage: task.stage,
+        elapsedMs: Date.now() - task.startedAt,
+        stageElapsedMs: Date.now() - task.stageStartedAt,
+        requestCount: task.requestCount,
+        retryCount: task.retryCount,
+        ...details,
+      },
+    };
+  }
+
   private startBackgroundTask(
-    input: Omit<BackgroundTask, "runEpoch" | "controller" | "startedAt" | "discarded">
+    input: Omit<BackgroundTask, "taskId" | "stage" | "stageStartedAt" | "requestCount" | "retryCount" | "runEpoch" | "controller" | "startedAt" | "discarded">
   ): BackgroundTask | undefined {
     if (sharedRuntimeState.activeBackgroundOperation) {
       return undefined;
     }
     const task: BackgroundTask = {
       ...input,
+      taskId: randomUUID(),
+      stage: "preparation",
+      stageStartedAt: Date.now(),
+      requestCount: 0,
+      retryCount: 0,
       runEpoch: this.runEpoch,
       controller: new AbortController(),
       startedAt: Date.now(),
       discarded: false,
     };
     this.inFlightTask = task;
-    this.diagnostics.count("task_started");
+    this.diagnostics.count("task_started", this.taskMetadata(task, {
+      provider: task.model.provider,
+      modelId: task.model.id,
+      thinkingLevel: task.thinkingLevel,
+      taskTimeoutMs: task.config.taskTimeoutMs,
+    }));
     const operation = Promise.resolve().then(() => this.generateCheckpoint(task));
     sharedRuntimeState.activeBackgroundOperation = operation;
-    const releaseOperation = (): void => {
+    const releaseOperation = (outcome: "resolved" | "rejected"): void => {
+      this.diagnostics.count("background_operation_settled", this.taskMetadata(task, {
+        outcome,
+        aborted: task.controller.signal.aborted,
+      }));
       if (sharedRuntimeState.activeBackgroundOperation === operation) {
         delete sharedRuntimeState.activeBackgroundOperation;
       }
     };
-    void operation.then(releaseOperation, releaseOperation);
+    void operation.then(() => releaseOperation("resolved"), () => releaseOperation("rejected"));
     const promise = this.runBackgroundTask(task, operation);
     task.promise = promise;
     void promise.then(
@@ -1350,14 +1394,15 @@ export class ExtensionRuntime {
       await this.runWithTimeout(() => operation, task);
     } catch (error: unknown) {
       if (isTimeoutError(error)) {
-        this.diagnostics.count("task_timed_out");
-        this.reportTaskFailure("后台预压缩超时");
+        this.diagnostics.count("task_timed_out", this.taskMetadata(task));
+        this.reportTaskFailure(`后台预压缩超时（${task.stage}，请求 ${task.requestCount} 次，重试 ${task.retryCount} 次）`);
         return;
       }
       if (task.discarded || task.controller.signal.aborted || isAbortLike(error)) {
-        this.diagnostics.count("task_cancelled");
+        this.diagnostics.count("task_cancelled", this.taskMetadata(task));
         return;
       }
+      this.diagnostics.count("task_failed", this.taskMetadata(task));
       this.reportTaskFailure("后台预压缩执行失败");
     }
   }
@@ -1371,6 +1416,16 @@ export class ExtensionRuntime {
       createCheckpointPreparationSettings(task.config),
       task.parentCheckpoint,
     );
+    this.diagnostics.count("task_stage_finished", this.taskMetadata(task, {
+      durationMs: Date.now() - task.stageStartedAt,
+      prepared: nativePreparation !== undefined,
+      ...(nativePreparation ? {
+        isSplitTurn: nativePreparation.isSplitTurn,
+        historyMessageCount: nativePreparation.messagesToSummarize.length,
+        turnPrefixMessageCount: nativePreparation.turnPrefixMessages.length,
+        tokensBefore: nativePreparation.tokensBefore,
+      } : {}),
+    }));
     if (!nativePreparation) {
       const message = "当前分支无法构造可用 preparation";
       this.diagnostics.count("task_skipped_no_preparation");
@@ -1404,11 +1459,17 @@ export class ExtensionRuntime {
       this.reportTaskFailure("缺少当前模型的 provider 注册表");
       return;
     }
+    task.stage = "auth";
+    task.stageStartedAt = Date.now();
     const providerResult = await resolveProviderRequest(
       registry,
       task.model,
       task.controller.signal,
     );
+    this.diagnostics.count("task_stage_finished", this.taskMetadata(task, {
+      durationMs: Date.now() - task.stageStartedAt,
+      ok: providerResult.ok,
+    }));
     if (!this.isCurrentTask(task)) {
       return;
     }
@@ -1427,6 +1488,39 @@ export class ExtensionRuntime {
       maxRetries: MAX_BACKGROUND_RETRIES,
       baseDelayMs: RETRY_BASE_DELAY_MS,
     };
+    let historyFinished = preparation.messagesToSummarize.length === 0;
+    const streamFn: StreamFn = async (model, context, options) => {
+      task.stage = historyFinished ? "turn_prefix_summary" : "history_summary";
+      task.stageStartedAt = Date.now();
+      const stage = task.stage;
+      const startedAt = task.stageStartedAt;
+      const requestIndex = ++task.requestCount;
+      this.diagnostics.count("summary_request_started", this.taskMetadata(task, { requestIndex }));
+      const settled = (stopReason: string): void => {
+        this.diagnostics.count("summary_request_settled", this.taskMetadata(task, {
+          stage,
+          requestIndex,
+          durationMs: Date.now() - startedAt,
+          stopReason,
+          aborted: task.controller.signal.aborted,
+        }));
+        if (stopReason === "stop") {
+          historyFinished = true;
+        }
+      };
+      try {
+        const stream = await providerResult.request.streamFn(model, context, options);
+        // 观察同一个结果 Promise，保留 Pi 的流消费、摘要编排和重试行为。
+        void stream.result().then(
+          (message) => settled(message.stopReason),
+          () => settled("rejected"),
+        );
+        return stream;
+      } catch (error: unknown) {
+        settled("rejected");
+        throw error;
+      }
+    };
     const request = Promise.resolve().then(() => compact(
       preparation,
       providerResult.request.model,
@@ -1435,15 +1529,35 @@ export class ExtensionRuntime {
       undefined,
       task.controller.signal,
       task.thinkingLevel,
-      providerResult.request.streamFn,
+      streamFn,
       providerResult.request.env,
       retry,
+      {
+        onRetryScheduled: (attempt, maxRetries, delayMs) => {
+          task.retryCount++;
+          task.stage = "retry_backoff";
+          task.stageStartedAt = Date.now();
+          this.diagnostics.count("summary_retry_scheduled", this.taskMetadata(task, {
+            attempt, maxRetries, delayMs,
+          }));
+        },
+        onRetryAttemptStart: () => {
+          this.diagnostics.count("summary_retry_started", this.taskMetadata(task, {
+            durationMs: Date.now() - task.stageStartedAt,
+          }));
+        },
+        onRetryFinished: (success, attempt) => {
+          this.diagnostics.count("summary_retry_finished", this.taskMetadata(task, { success, attempt }));
+        },
+      },
     ));
     const result = await request;
     if (!this.isCurrentTask(task)) {
       this.diagnostics.recordUsage("discarded", result.usage);
       return;
     }
+    task.stage = "checkpoint";
+    task.stageStartedAt = Date.now();
     const appendOutcome = this.appendCheckpoint(
       task,
       preparation,
@@ -1457,7 +1571,7 @@ export class ExtensionRuntime {
       }
       return;
     }
-    this.diagnostics.count("checkpoint_ready");
+    this.diagnostics.count("checkpoint_ready", this.taskMetadata(task));
     this.notifyCheckpointReady(task);
   }
 
@@ -1465,8 +1579,8 @@ export class ExtensionRuntime {
     if (this.inFlightTask === task) {
       this.inFlightTask = undefined;
       this.diagnostics.count("task_finished", {
+        ...this.taskMetadata(task, { snapshotLeafId: task.snapshotLeafId }),
         reason: task.discarded ? "discarded" : "completed",
-        details: { snapshotLeafId: task.snapshotLeafId },
       });
     }
   }
@@ -1478,8 +1592,8 @@ export class ExtensionRuntime {
     if (!task.discarded) {
       task.discarded = true;
       const metadata = {
+        ...this.taskMetadata(task, { snapshotLeafId: task.snapshotLeafId }),
         reason,
-        details: { snapshotLeafId: task.snapshotLeafId },
       };
       this.diagnostics.count("task_discarded", metadata);
       this.diagnostics.record("lifecycle", reason, metadata);
