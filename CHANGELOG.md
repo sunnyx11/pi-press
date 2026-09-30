@@ -7,6 +7,23 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-30
+
+### Added
+
+- 新增 `summaryThinkingLevel` 配置，后台摘要可独立设置思考级别，主会话级别保持原状。
+- 后台任务诊断包含阶段耗时、摘要请求和重试次数，以及超时后底层操作的实际结束信息。
+- 真实 Pi 冒烟测试支持大输入双摘要，以及 `low` 与 `inherit` 思考级别对照。
+
+### Changed
+
+- 后台摘要默认使用 `low`；设置 `summaryThinkingLevel: "inherit"` 可继承主会话思考级别。
+- 精简使用说明，完整配置、诊断机制和验证要求由详细文档提供。
+
+### Fixed
+
+- 修复 Windows 下真实 Pi 冒烟测试的可执行文件解析和启动。
+
 ## [0.4.1] - 2026-09-22
 
 ### Changed
@@ -121,7 +138,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/sunnyx11/pi-press/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/sunnyx11/pi-press/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/sunnyx11/pi-press/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/sunnyx11/pi-press/compare/v0.3.3...v0.3.4
