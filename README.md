@@ -2,20 +2,13 @@
 
 `pi-press` 是一个面向 Pi 的 TypeScript 扩展，在上下文接近压缩阈值时提前在后台生成摘要。
 
-检查点可用后，provider 请求使用“摘要 + 当前未压缩尾部”的虚拟上下文。
-
-当前 agent 运行结束后，再由 Pi 写入正式 compaction entry。
-
 ## 功能与取舍
 
-- 后台生成摘要，不阻塞当前 agent。
-- 虚拟上下文只影响当前 provider 请求，不修改 Pi 内部消息或原始 session entry。
-- 正式压缩、上下文重建、session 恢复和分支管理继续使用 Pi 原生实现。
-- 同一正式压缩周期内可按增量历史连续刷新检查点，避免长时间工具调用使虚拟尾部持续增长。
-- 结构化运行事件默认写入独立 SQLite 数据库，可按 session 查询且不参与压缩状态恢复。
-- 检查点失效、超过 hard limit 或 provider 请求失败时，使用 Pi 原生压缩。
+- 后台生成摘要，当前 agent 继续运行。
+- 后续请求复用摘要和近期消息，并按新增历史刷新检查点。
+- 保留原始会话记录，正式压缩和会话恢复使用 Pi 原生实现。
 
-与 Pi 原生压缩相比，`pi-press` 可以减少正式压缩时等待摘要的时间，但可能产生额外的 provider 请求和 token 消耗，并需要维护额外配置。完整设计和边界规则见[预压缩设计](https://github.com/sunnyx11/pi-press/blob/main/docs/DESIGN.md)。
+预压缩可能产生额外的 provider 请求和 token 消耗。摘要不可用时使用 Pi 原生压缩。
 
 ## 安装
 
@@ -55,36 +48,22 @@ pi remove npm:@sunnyx11/pi-press
 {
   "precomputeMode": "threshold",
   "softThresholdPercent": 80,
-  "taskTimeoutMs": 300000,
-  "diagnosticsPersistence": "sqlite",
-  "diagnosticsRetentionDays": 30,
-  "diagnosticsMaxDatabaseMiB": 64
+  "summaryThinkingLevel": "low",
+  "taskTimeoutMs": 300000
 }
 ```
 
-`softThresholdPercent` 同时用于首次预压缩和后续增量刷新。旧版 `targetPostCompactionPercent` 已移除；配置中仍存在该字段时会记录一次警告并忽略其值。
-
-`precomputeMode` 支持以下取值：
-
-| 值 | 作用 |
-| --- | --- |
-| `"off"` | 停止后台预压缩和检查点复用。 |
-| `"threshold"` | 处理阈值触发的后台预压缩、请求级虚拟上下文和 settled 后正式化。 |
-| `"threshold-and-manual"` | 在阈值压缩之外，复用没有自定义指令的手动压缩检查点。 |
-
-完整字段、默认值、校验规则和容量计算见[预压缩设计](https://github.com/sunnyx11/pi-press/blob/main/docs/DESIGN.md)。
+`summaryThinkingLevel` 只影响后台摘要；设置为 `"inherit"` 可使用主会话思考级别。完整配置见[预压缩设计](https://github.com/sunnyx11/pi-press/blob/main/docs/DESIGN.md)。
 
 ## 诊断查询
 
-默认数据库为 `~/.pi/agent/pi-press/diagnostics.sqlite3`，保留 30 天且上限为 64 MiB。SQLite 只保存结构化事件和 Runtime 标量状态，不保存用户消息、完整摘要、工具结果、认证信息或完整 provider 响应。数据库故障不会阻止预压缩或 Pi 原生压缩。
+默认查询当前会话的最近事件。持久化诊断不保存用户消息、完整摘要、工具结果或认证信息。
 
 ```text
 /pi-press-diagnostics
 /pi-press-diagnostics --session <session-id> --last 50
 /pi-press-diagnostics --session <session-id> --last 100 --json
 ```
-
-默认查询当前 session 最近 20 条事件；`--last` 允许 `1..100`。设置 `"diagnosticsPersistence": "memory"` 可以只保留当前进程内诊断。Node 22 使用内置 `node:sqlite` 时会显示 SQLite 实验性功能警告。
 
 ## 开发
 
@@ -96,9 +75,7 @@ npm test
 npm run test:smoke:pi
 ```
 
-`npm run test:smoke:pi` 使用当前 shell 环境中安装的 Pi 和当前配置模型执行真实 provider 冒烟测试，可能产生调用费用。该命令拒绝仓库本地 Pi；特殊环境可通过 `PI_BIN` 指定外部 Pi 可执行文件。
-
-项目入口由 `package.json` 的 `pi.extensions` 指向 `src/index.ts`。扩展结构、生命周期、并发、持久化和测试约束见[代码规范](https://github.com/sunnyx11/pi-press/blob/main/docs/CODE_STYLE.md)。
+`npm run test:smoke:pi` 使用当前环境安装的 Pi 和当前配置模型，可能产生真实 provider 调用费用。详细开发与验证要求见[代码规范](https://github.com/sunnyx11/pi-press/blob/main/docs/CODE_STYLE.md)。
 
 ## 相关文档
 
