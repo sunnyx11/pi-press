@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-01
+
+### Fixed
+
+- 诊断事件时间统一为北京时间（`+08:00`），内存与 SQLite 保持一致，绝对时刻保持原值。
+- 支持通过仓库命令 `diagnostics:migrate-time` 修复历史诊断时间；执行前暂停 Pi 写入，工具自动备份。
+
 ## [0.5.0] - 2026-09-30
 
 ### Added
@@ -138,7 +145,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/sunnyx11/pi-press/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/sunnyx11/pi-press/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/sunnyx11/pi-press/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/sunnyx11/pi-press/compare/v0.3.4...v0.4.0
