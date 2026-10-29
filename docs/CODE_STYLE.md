@@ -234,7 +234,7 @@ import {
 | `agent_settled` | 等待兼容后台任务，选择最新 checkpoint，以同步保留量预检查当前分支；不可用时保存 deferred，可用时延迟调用 `ctx.compact()`。 |
 | `session_before_compact` | 校验 reason、signal、分支、epoch、checkpoint 和容量；可返回兼容 `CompactionResult`，否则返回 `undefined` 让 Pi 使用原生实现。 |
 | `session_compact` | 记录正式 entry 对 checkpoint 的消费，递增运行 epoch，取消旧 epoch 任务并清除 virtual、deferred 和 pending 状态。 |
-| `session_compact_failed` | `fromExtension` 为真时释放当前 checkpoint claim；内部正式化的 pending、失败计数和通知继续由对应 `onError` 回调处理。 |
+| `session_compact_failed` | 传递完整事件，结合当前内部请求和已中止的同一 signal 标记取消归属；`fromExtension` 为真且 `aborted` 为假时释放当前 checkpoint claim。取消由所属 signal 释放领取，迟到取消事件保留其他操作的 claim。对应 `onError` 清理 pending；已确认的取消保持静默并保留既有失败次数，普通错误按失败规则处理。 |
 | `session_before_tree` | 递增运行 epoch，取消当前任务并清除当前分支的 virtual、deferred 和 pending 状态；不读取将要失效的旧 session 对象。 |
 | `session_tree` | 读取新分支并恢复内存状态；不重复执行已经由 `session_before_tree` 完成的 epoch 递增。 |
 | `session_shutdown` | 递增运行 epoch，先清除任务身份再发送 abort，清除 virtual、deferred、pending 和 session 资源；不等待后台认证或 provider Promise。 |
@@ -490,6 +490,7 @@ Pi settings 和诊断存储字段不属于 checkpoint 生成配置，也不参�
 | 达到阈值但 checkpoint preparation 不可用 | 记录诊断并静默跳过；后续 `turn_end` 可以再次尝试。 |
 | 正式化 preparation 不可用 | 保存当前 checkpoint、session、epoch 和叶节点为 deferred，记录 `formalization_deferred`，不调用 `ctx.compact()`，不显示 warning。 |
 | `Nothing to compact (session too small)` | 精确匹配完整错误消息并恢复为 deferred；不增加 `formalization_failed` 或普通失败次数，不显示 warning。 |
+| 已确认归属的内部正式化取消 | 核对当前 pending 的运行 epoch、session、正式 compaction epoch、`reason: "manual"`、`willRetry: false`、`aborted: true` 及当前已中止 signal。对应 `onError` 清除本请求的 pending 和 claim，保留有效 checkpoint、virtual、投影缓存和既有失败次数，保持静默。新的 `agent_settled` 重新检查有效性后可以再次正式化。 |
 | 其他正式化错误 | 清除 pending，增加当前 session 和 epoch 的失败次数并显示 warning；最多累计两次失败。达到上限时中止当前后台任务，清除虚拟状态和投影缓存，并停止该 epoch 的虚拟投影与 checkpoint 生成；后续请求使用原始上下文并由 Pi 处理正式压缩。 |
 | 生成阶段容量预测超过 hard limit 或无法计算 | 记录容量诊断，通过 CLI warning 显示容量数值或不可用状态，丢弃本次摘要 usage，不追加 checkpoint；正式 compaction 继续使用 Pi 原生实现。 |
 | 消费阶段容量预测超过 hard limit 或无法计算 | 记录容量诊断，通过 CLI warning 显示 checkpoint ID、容量数值和 Pi 原生处理状态。 |
@@ -577,7 +578,10 @@ Pi settings 和诊断存储字段不属于 checkpoint 生成配置，也不参�
 - Pi 在同一 agent 的工具结果后、下一次 assistant 请求前触发 threshold compaction 时，ready checkpoint 被复用，正式摘要和该工具结果尾部进入下一次 provider 请求；
 - `agent_settled` 的无 parent preparation 预检查、同叶 deferred 去重、新叶重检和 `Nothing to compact (session too small)` 分类；
 - native compaction、tree 切换、session shutdown 和 `precomputeMode: "off"` 清除 deferred 状态；
-- 正式化普通错误最多累计两次失败；第一次失败保留虚拟状态并允许重试，第二次失败使当前 epoch 的虚拟投影和 checkpoint 生成停用；延期不产生 warning 或失败计数；
+- 正式化普通错误最多累计两次失败；第一次失败保留虚拟状态并允许重试，第二次失败使当前 epoch 的虚拟投影和 checkpoint 生成停用；延期和已确认取消保持静默且保留既有失败次数；
+- 内部正式化在领取 checkpoint 前后取消、连续取消、取消后由新 `agent_settled` 重试，以及一次普通失败后的取消与第二次普通失败；
+- 完整取消事件、pending、request ID、`runEpoch` 和 signal 共同保护请求归属；其他压缩、不同 signal、重复事件、迟到回调、shutdown、tree 和正式消费均保护当前状态及其他请求的 claim；
+- 公开 SDK 实际取消后仍可正式化同一 checkpoint；持久化会话恢复复用有效摘要和完整尾部，版本、分支或容量无效时排除该 checkpoint；
 - `agent_settled` 正式化成功后，Pi 写入的 entry、session 重建和 resume 结果必须通过公开 SDK 集成测试验证；
 - preparation 与 Pi 公开事件产生的 preparation 在 `firstKeptEntryId`、投影消息集合、split turn、恢复省略、`previousSummary`、file operations、settings 和 `tokensBefore` 上一致；
 - `context_edit` 省略和替换进入摘要、尾部 token 与容量估算；快照内编辑使 checkpoint、parent 链和后台任务失效，尾部编辑保留 checkpoint；

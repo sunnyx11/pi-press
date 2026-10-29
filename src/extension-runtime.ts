@@ -11,6 +11,7 @@ import {
   type ExtensionContext,
   type SessionBeforeCompactEvent,
   type SessionCompactEvent,
+  type SessionCompactFailedEvent,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -142,6 +143,11 @@ type FormalizationSchedule = {
 
 type PendingFormalization = Omit<FormalizationSchedule, "ctx" | "timer"> & {
   attempt: number;
+  compaction?: {
+    signal: AbortSignal;
+    isCurrent: boolean;
+    cancelled: boolean;
+  };
 };
 
 type DeferredFormalization = {
@@ -652,15 +658,32 @@ export class ExtensionRuntime {
     }
   }
 
-  onSessionCompactFailed(event: Readonly<{ fromExtension: boolean }>): void {
+  onSessionCompactFailed(event: SessionCompactFailedEvent): void {
+    const pending = this.pendingFormalization;
+    if (
+      pending &&
+      pending.runEpoch === this.runEpoch &&
+      pending.sessionId === this.currentSessionId &&
+      pending.epochCompactionId === this.currentEpochCompactionId &&
+      event.reason === "manual" &&
+      !event.willRetry &&
+      event.aborted &&
+      pending.compaction?.isCurrent &&
+      pending.compaction.signal.aborted
+    ) {
+      pending.compaction.cancelled = true;
+    }
     if (event.fromExtension) {
       this.diagnostics.count("session_compact_failed", {
-        ...(this.checkpointClaim === undefined
+        ...(event.aborted || this.checkpointClaim === undefined
           ? {}
           : { checkpointId: this.checkpointClaim.checkpointId }),
         reason: "extension_compaction_failed",
       });
-      this.releaseCheckpointClaim();
+      // 取消由所属 signal 释放 claim，迟到的取消事件保留其他操作的领取。
+      if (!event.aborted) {
+        this.releaseCheckpointClaim();
+      }
     }
   }
 
@@ -795,8 +818,15 @@ export class ExtensionRuntime {
       this.releaseCheckpointClaim();
     }
     const internalFormalization = this.isPendingFormalization(event, ctx);
+    const pending = this.pendingFormalization;
+    // 失败事件没有 signal；独立于 claim 保存内部请求及最近压缩操作的归属。
+    if (pending?.compaction) {
+      pending.compaction.isCurrent = pending.compaction.signal === event.signal;
+    } else if (internalFormalization && pending) {
+      pending.compaction = { signal: event.signal, isCurrent: true, cancelled: false };
+    }
     const internalCheckpointId = internalFormalization
-      ? this.pendingFormalization?.checkpointId
+      ? pending?.checkpointId
       : undefined;
     if (config.precomputeMode === "off" || !this.isSupportedCompaction(event, config, internalFormalization)) {
       return undefined;
@@ -866,6 +896,8 @@ export class ExtensionRuntime {
     if (
       !pending ||
       event.reason !== "manual" ||
+      event.willRetry ||
+      (pending.compaction !== undefined && pending.compaction.signal !== event.signal) ||
       (event.customInstructions !== undefined && event.customInstructions.trim().length > 0) ||
       pending.runEpoch !== this.runEpoch ||
       pending.sessionId !== ctx.sessionManager.getSessionId()
@@ -1030,11 +1062,23 @@ export class ExtensionRuntime {
   }
 
   private onFormalizationError(pending: PendingFormalization, error: unknown): void {
-    if (this.pendingFormalization?.requestId !== pending.requestId) {
+    if (
+      this.pendingFormalization?.requestId !== pending.requestId ||
+      pending.runEpoch !== this.runEpoch
+    ) {
       return;
     }
-    this.releaseCheckpointClaim(pending.checkpointId);
+    if (this.checkpointClaim?.signal === pending.compaction?.signal) {
+      this.releaseCheckpointClaim(pending.checkpointId);
+    }
     this.pendingFormalization = undefined;
+    if (pending.compaction?.cancelled) {
+      this.diagnostics.count("formalization_cancelled", {
+        checkpointId: pending.checkpointId,
+        reason: "internal_compaction_aborted",
+      });
+      return;
+    }
     if (isSessionTooSmallError(error)) {
       this.deferredFormalization = {
         checkpointId: pending.checkpointId,

@@ -11,6 +11,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   SessionBeforeCompactEvent,
+  SessionCompactFailedEvent,
 } from "@earendil-works/pi-coding-agent";
 import { ExtensionRuntime } from "../../src/extension-runtime.js";
 import { makeCheckpointData, makeModel, makePreparation, makeUserMessage } from "./fixtures.js";
@@ -121,7 +122,7 @@ test("failed extension compaction releases checkpoint claim", async () => {
     aborted: false,
     willRetry: false,
     fromExtension: false,
-  };
+  } satisfies SessionCompactFailedEvent;
   runtime.onSessionCompactFailed(failedEvent);
   assert.equal(await runtime.beforeCompact(event, ctx), undefined);
 
