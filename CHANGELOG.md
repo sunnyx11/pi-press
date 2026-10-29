@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-29
+
+### Fixed
+
+- 主动取消内部正式化压缩时保持插件静默，保留有效预压缩状态、失败预算与后续正式化机会。
+- 迟到取消事件和旧错误回调保留新请求与新压缩操作持有的 checkpoint claim。
+
 ## [0.5.1] - 2026-10-01
 
 ### Fixed
@@ -145,7 +152,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/sunnyx11/pi-press/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/sunnyx11/pi-press/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/sunnyx11/pi-press/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/sunnyx11/pi-press/compare/v0.4.0...v0.4.1
