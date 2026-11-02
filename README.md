@@ -15,7 +15,7 @@
 运行要求：
 
 - Node.js `>=22.19.0`
-- Pi coding-agent `>=0.87.0`
+- Pi coding-agent `>=1.5.0`
 - 已配置可用的模型和 provider
 
 ```bash
@@ -53,7 +53,7 @@ pi remove npm:@sunnyx11/pi-press
 }
 ```
 
-`summaryThinkingLevel` 只影响后台摘要；设置为 `"inherit"` 可使用主会话思考级别。完整配置见[预压缩设计](https://github.com/sunnyx11/pi-press/blob/main/docs/DESIGN.md)。
+`summaryThinkingLevel` 只影响后台摘要；设置为 `"inherit"` 可使用主会话思考级别。摘要输出上限由 Pi 和模型决定，容量检查使用宿主当前模型生效的 `compaction.reserveTokens`。旧配置字段 `summaryReserveTokens` 仅提示一次并忽略。完整配置见[预压缩设计](https://github.com/sunnyx11/pi-press/blob/main/docs/DESIGN.md)。
 
 ## 诊断查询
 

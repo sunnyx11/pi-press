@@ -91,6 +91,16 @@ test("selection requires current session, epoch and branch ancestry", () => {
   assert.equal(findReadyCheckpointCandidates(branch, "session", null, data.checkpointId).length, 0);
 });
 
+test("selection accepts checkpoints from other Pi versions and preserves provenance", () => {
+  const { branch, data } = makeBranch();
+  data.piVersion = "0.87.0";
+  const candidates = findReadyCheckpointCandidates(branch, "session", null, undefined);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.data.piVersion, "0.87.0");
+  data.summaryFormatVersion += 1;
+  assert.equal(findReadyCheckpointCandidates(branch, "session", null, undefined).length, 0);
+});
+
 test("selection rejects edits to snapshot history and allows edits to later tail entries", () => {
   const { branch, data } = makeBranch();
   const tail = makeMessageEntry("entry-4", "entry-3", makeUserMessage("tail work"));
@@ -138,6 +148,7 @@ test("critical wait threshold follows the Pi reserve and context safety margin",
 
 test("selection validates every checkpoint parent against the current branch", () => {
   const { branch, data } = makeBranch();
+  data.piVersion = "0.87.0";
   const nextSnapshot = makeMessageEntry("entry-4", "entry-3", makeUserMessage("new work"));
   const childData = makeCheckpointData("session", nextSnapshot.id, data.compaction.firstKeptEntryId, {
     checkpointId: "checkpoint-2",

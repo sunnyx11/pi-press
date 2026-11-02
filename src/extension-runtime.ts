@@ -107,6 +107,7 @@ type BackgroundTask = {
   branchEntries: SessionEntry[];
   model: Model<Api>;
   thinkingLevel: ThinkingLevel;
+  reserveTokens: number;
   config: PiPressConfig;
   controller: AbortController;
   startedAt: number;
@@ -239,6 +240,7 @@ export class ExtensionRuntime {
   private readonly formalizationAttemptsByEpoch = new Map<string, number>();
   private readonly reportedConfigDiagnostics = new Set<string>();
   private removedTargetPercentReported = false;
+  private removedSummaryReserveReported = false;
   private virtualApplication: VirtualApplication | undefined;
   private formalizationSchedule: FormalizationSchedule | undefined;
   private pendingFormalization: PendingFormalization | undefined;
@@ -356,7 +358,7 @@ export class ExtensionRuntime {
         eventMessages: event.messages,
         checkpoint: candidate.data,
         contextWindow: model.contextWindow,
-        summaryReserveTokens: this.currentConfig.summaryReserveTokens,
+        reserveTokens: loadPiCompactionReserveTokens(ctx.cwd, ctx.isProjectTrusted(), model),
         softThresholdPercent: this.currentConfig.softThresholdPercent,
         cache: this.virtualContextCache,
       });
@@ -795,6 +797,7 @@ export class ExtensionRuntime {
       thinkingLevel: config.summaryThinkingLevel === "inherit"
         ? ctx.thinkingLevel ?? "medium"
         : config.summaryThinkingLevel,
+      reserveTokens: loadPiCompactionReserveTokens(ctx.cwd, ctx.isProjectTrusted(), model),
       config,
       ...(existingCandidate === undefined ? {} : { parentCheckpoint: existingCandidate.data }),
     });
@@ -1006,7 +1009,7 @@ export class ExtensionRuntime {
     const preparation = prepareCompactionFromBranch(
       branch,
       createFormalizationPreparationSettings(
-        this.currentConfig,
+        loadPiCompactionReserveTokens(ctx.cwd, ctx.isProjectTrusted(), model),
         loadPiCompactionKeepRecentTokens(
           ctx.cwd,
           ctx.isProjectTrusted(),
@@ -1290,15 +1293,21 @@ export class ExtensionRuntime {
     }
     for (const message of result.diagnostics) {
       const removedTargetPercent = message.includes("targetPostCompactionPercent");
+      const removedSummaryReserve = message.includes("summaryReserveTokens");
       if (
         this.reportedConfigDiagnostics.has(message) ||
-        (removedTargetPercent && this.removedTargetPercentReported)
+        (removedTargetPercent && this.removedTargetPercentReported) ||
+        (removedSummaryReserve && this.removedSummaryReserveReported)
       ) {
         continue;
       }
       this.reportedConfigDiagnostics.add(message);
       if (removedTargetPercent) {
         this.removedTargetPercentReported = true;
+      }
+      if (removedSummaryReserve) {
+        this.removedSummaryReserveReported = true;
+        this.notifyWarning(message);
       }
       this.diagnostics.record("config", message);
     }
@@ -1457,7 +1466,7 @@ export class ExtensionRuntime {
     }
     const nativePreparation = prepareCompactionFromBranch(
       task.branchEntries,
-      createCheckpointPreparationSettings(task.config),
+      createCheckpointPreparationSettings(task.reserveTokens),
       task.parentCheckpoint,
     );
     this.diagnostics.count("task_stage_finished", this.taskMetadata(task, {

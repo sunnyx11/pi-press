@@ -39,7 +39,7 @@ async function createDeferredFormalizationScenario(): Promise<{
   scenario: ReturnType<typeof createScenario>;
   ctx: ExtensionContext;
 }> {
-  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const scenario = createScenario();
   setPiCompactionKeepRecentTokens(scenario, 50_000);
   const ctx = {
     ...scenario.ctx,
@@ -62,7 +62,6 @@ async function createDeferredFormalizationScenario(): Promise<{
 test("threshold turn schedules compact once and hook reuses the checkpoint", async () => {
   const scenario = createScenario({
     softThresholdPercent: 80,
-    summaryReserveTokens: 1,
     taskTimeoutMs: 2_000,
     hookWaitTimeoutMs: 500,
   });
@@ -123,10 +122,49 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
   }
 });
 
+test("checkpoint persistence uses the active model reserve override", async () => {
+  const scenario = createScenario();
+  writeFileSync(`${scenario.cwd}/.pi/settings.json`, JSON.stringify({
+    compaction: { reserveTokens: 1, modelOverrides: { "test/model-id": { reserveTokens: 90_000 } } },
+  }));
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length > 0 || Boolean(
+      scenario.runtime.getDiagnostics().counters.checkpoint_skipped_capacity,
+    ));
+    assert.equal(scenario.appended.length, 0);
+    assert.equal(scenario.runtime.getDiagnostics().counters.checkpoint_skipped_capacity, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("virtual capacity follows the current model reserve after checkpoint generation", async () => {
+  const scenario = createScenario();
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length === 1);
+    const messages = scenario.manager.buildSessionContext().messages;
+    const ctx = { ...scenario.ctx, getContextUsage: () => undefined } as ExtensionContext;
+    assert.equal((await scenario.runtime.onContext({ type: "context", messages }, ctx)).messages[0]?.role, "compactionSummary");
+    writeFileSync(`${scenario.cwd}/.pi/settings.json`, JSON.stringify({
+      compaction: { modelOverrides: { "test/model-id": { reserveTokens: 90_000 } } },
+    }));
+    const result = await scenario.runtime.onContext({ type: "context", messages }, ctx);
+    assert.equal(result.messages === messages, true);
+    assert.equal(scenario.runtime.getDiagnostics().counters.virtual_skipped_hard_limit, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
 test("context applies a ready checkpoint and settled formalization runs after the handler returns", async () => {
   const scenario = createScenario({
     softThresholdPercent: 50,
-    summaryReserveTokens: 1,
   });
   const compactCalls: Array<{ onComplete?: (result: unknown) => void; onError?: (error: Error) => void }> = [];
   const ctx = {
@@ -176,7 +214,7 @@ test("context applies a ready checkpoint and settled formalization runs after th
 });
 
 test("formalization uses the active model keepRecentTokens override", async () => {
-  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const scenario = createScenario();
   writeFileSync(
     `${scenario.cwd}/.pi/settings.json`,
     JSON.stringify({
@@ -226,7 +264,7 @@ test("formalization uses the active model keepRecentTokens override", async () =
 });
 
 test("session too small callback remains deferred without consuming failure attempts", async () => {
-  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const scenario = createScenario();
   let compactCalls = 0;
   const ctx = {
     ...scenario.ctx,
@@ -268,7 +306,7 @@ test("session too small callback remains deferred without consuming failure atte
 });
 
 test("settled formalization does not start while the agent is busy", async () => {
-  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const scenario = createScenario();
   let compactCalls = 0;
   const ctx = {
     ...scenario.ctx,
@@ -295,7 +333,7 @@ test("settled formalization does not start while the agent is busy", async () =>
 });
 
 test("native compaction cancels delayed formalization", async () => {
-  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const scenario = createScenario();
   const compactCalls: unknown[] = [];
   const ctx = {
     ...scenario.ctx,
@@ -339,7 +377,7 @@ test("native compaction cancels delayed formalization", async () => {
 });
 
 test("formalization failure disables virtual precompaction for the current epoch after one retry", async () => {
-  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const scenario = createScenario();
   let compactCalls = 0;
   const ctx = {
     ...scenario.ctx,
@@ -394,7 +432,7 @@ test("formalization failure disables virtual precompaction for the current epoch
 });
 
 test("formalization failure after checkpoint reuse releases the claim for one retry", async () => {
-  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const scenario = createScenario();
   const compactCalls: Array<{ onError?: (error: Error) => void }> = [];
   const ctx = {
     ...scenario.ctx,
@@ -435,7 +473,7 @@ test("formalization failure after checkpoint reuse releases the claim for one re
 });
 
 test("branch switching cancels a scheduled formalization", async () => {
-  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const scenario = createScenario();
   let compactCalls = 0;
   const ctx = {
     ...scenario.ctx,
@@ -465,7 +503,7 @@ test("branch switching cancels a scheduled formalization", async () => {
 });
 
 test("session shutdown cancels a scheduled formalization", async () => {
-  const scenario = createScenario({ summaryReserveTokens: 1 });
+  const scenario = createScenario();
   let compactCalls = 0;
   const ctx = {
     ...scenario.ctx,
@@ -589,7 +627,6 @@ test("precomputeMode off clears deferred formalization", async () => {
 test("virtual context can refresh a checkpoint three times in one compaction epoch", async () => {
   const scenario = createScenario({
     softThresholdPercent: 20,
-    summaryReserveTokens: 1,
   });
   scenario.faux.setResponses([
     async () => fauxAssistantMessage("first checkpoint summary"),
@@ -663,7 +700,6 @@ test("virtual context can refresh a checkpoint three times in one compaction epo
 test("virtual context refresh request from an injected message survives until turn_end", async () => {
   const scenario = createScenario({
     softThresholdPercent: 20,
-    summaryReserveTokens: 1,
   });
   const response: ResponseFactory = async () => fauxAssistantMessage("refreshed checkpoint summary");
   scenario.faux.setResponses([response, response]);
@@ -718,7 +754,7 @@ test("virtual context refresh request from an injected message survives until tu
 });
 
 test("threshold mode keeps user manual compaction on the native path", async () => {
-  const scenario = createScenario({ precomputeMode: "threshold", summaryReserveTokens: 1 });
+  const scenario = createScenario({ precomputeMode: "threshold" });
 
   try {
     scenario.runtime.onTurnEnd(scenario.ctx);
@@ -736,7 +772,7 @@ test("threshold mode keeps user manual compaction on the native path", async () 
 
 test("checkpoint append failure reports an error without a success notification", async () => {
   const scenario = createScenario(
-    { summaryReserveTokens: 1, taskTimeoutMs: 2_000 },
+    { taskTimeoutMs: 2_000 },
     undefined,
     () => {
       throw new Error("simulated persistence failure");
@@ -836,7 +872,6 @@ test("invalid checkpoint data is rejected by the full schema before persistence"
 test("checkpoint above the refresh threshold is persisted for immediate use", async () => {
   const scenario = createScenario({
     softThresholdPercent: 0,
-    summaryReserveTokens: 1,
     taskTimeoutMs: 2_000,
   });
   const { appended, ctx, cwd, faux, runtime } = scenario;

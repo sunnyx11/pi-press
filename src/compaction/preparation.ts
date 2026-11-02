@@ -16,7 +16,6 @@ import type {
   CompactionPreparation,
   CompactionSettings,
   FileOperations,
-  PiPressConfig,
 } from "../types.js";
 import { isRecord } from "../checkpoint/schema.js";
 
@@ -380,21 +379,23 @@ export function prepareCompactionFromBranch(
   };
 }
 
-export function createCheckpointPreparationSettings(config: PiPressConfig): CompactionSettings {
+/** 使用宿主容量预留和固定近期保留量构造 checkpoint preparation 设置。 */
+export function createCheckpointPreparationSettings(reserveTokens: number): CompactionSettings {
   return {
     enabled: true,
-    reserveTokens: config.summaryReserveTokens,
+    reserveTokens,
     keepRecentTokens: CHECKPOINT_KEEP_RECENT_TOKENS,
   };
 }
 
+/** 使用宿主生效的容量预留和近期保留量构造正式化 preparation 设置。 */
 export function createFormalizationPreparationSettings(
-  config: PiPressConfig,
+  reserveTokens: number,
   keepRecentTokens: number,
 ): CompactionSettings {
   return {
     enabled: true,
-    reserveTokens: config.summaryReserveTokens,
+    reserveTokens,
     keepRecentTokens,
   };
 }

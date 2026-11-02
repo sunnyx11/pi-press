@@ -251,7 +251,6 @@ function createSmokeConfig(cwd: string, splitTurn: boolean, summaryThinkingLevel
     JSON.stringify({
       precomputeMode: "threshold",
       softThresholdPercent: 0,
-      summaryReserveTokens: splitTurn ? 16_384 : 1024,
       summaryThinkingLevel,
       taskTimeoutMs: 300_000,
       hookWaitTimeoutMs: 5_000,

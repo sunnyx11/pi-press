@@ -80,15 +80,15 @@ export function estimateVirtualCheckpointCapacity(
   data: CheckpointData,
   additionalMessages: readonly AgentMessage[],
   contextWindow: number,
-  summaryReserveTokens: number,
+  reserveTokens: number,
   softThresholdPercent: number,
   additionalTokens = 0,
 ): VirtualCheckpointCapacityEstimate | undefined {
   if (
     !Number.isFinite(contextWindow) ||
     contextWindow <= 0 ||
-    !Number.isFinite(summaryReserveTokens) ||
-    summaryReserveTokens < 0 ||
+    !Number.isFinite(reserveTokens) ||
+    reserveTokens < 0 ||
     !Number.isFinite(softThresholdPercent) ||
     softThresholdPercent < 0 ||
     softThresholdPercent > 100 ||
@@ -109,7 +109,7 @@ export function estimateVirtualCheckpointCapacity(
   if (safetyMargin === undefined) {
     return undefined;
   }
-  const hardLimit = contextWindow - summaryReserveTokens - safetyMargin;
+  const hardLimit = contextWindow - reserveTokens - safetyMargin;
   const refreshLimit = Math.floor((contextWindow * softThresholdPercent) / 100);
   return {
     estimatedTokens,

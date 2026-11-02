@@ -1,4 +1,3 @@
-import { VERSION } from "@earendil-works/pi-coding-agent";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   CHECKPOINT_CUSTOM_TYPE,
@@ -98,7 +97,6 @@ function isCompatibleCheckpoint(
   while (true) {
     if (
       currentData.sessionId !== sessionId ||
-      currentData.piVersion !== VERSION ||
       currentData.summaryFormatVersion !== SUMMARY_FORMAT_VERSION ||
       currentData.epochCompactionId !== epochCompactionId
     ) {

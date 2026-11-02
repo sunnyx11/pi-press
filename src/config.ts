@@ -18,7 +18,6 @@ import {
 export const DEFAULT_CONFIG: PiPressConfig = {
   precomputeMode: "threshold",
   softThresholdPercent: 80,
-  summaryReserveTokens: 16_384,
   summaryThinkingLevel: "low",
   taskTimeoutMs: 300_000,
   hookWaitTimeoutMs: 1_000,
@@ -35,7 +34,6 @@ type ConfigKey = keyof PiPressConfig;
 const CONFIG_KEYS: readonly ConfigKey[] = [
   "precomputeMode",
   "softThresholdPercent",
-  "summaryReserveTokens",
   "summaryThinkingLevel",
   "taskTimeoutMs",
   "hookWaitTimeoutMs",
@@ -47,7 +45,6 @@ const CONFIG_KEYS: readonly ConfigKey[] = [
 const CHECKPOINT_CONFIG_KEYS: readonly ConfigKey[] = [
   "precomputeMode",
   "softThresholdPercent",
-  "summaryReserveTokens",
   "summaryThinkingLevel",
   "taskTimeoutMs",
   "hookWaitTimeoutMs",
@@ -96,8 +93,6 @@ function isValidValue(key: ConfigKey, value: unknown): boolean {
       return isMode(value);
     case "softThresholdPercent":
       return isPercent(value);
-    case "summaryReserveTokens":
-      return isIntegerAtLeast(value, 0);
     case "summaryThinkingLevel":
       return typeof value === "string"
         && ["inherit", "off", "minimal", "low", "medium", "high", "xhigh"].includes(value);
@@ -128,8 +123,10 @@ function normalizeConfigLayer(raw: unknown): ConfigLayerResult {
 
   const config: Partial<PiPressConfig> = {};
   const diagnostics: string[] = [];
-  if ("targetPostCompactionPercent" in raw) {
-    diagnostics.push("配置字段 targetPostCompactionPercent 已移除，当前值已忽略");
+  for (const field of ["targetPostCompactionPercent", "summaryReserveTokens"]) {
+    if (field in raw) {
+      diagnostics.push(`配置字段 ${field} 已移除，当前值已忽略`);
+    }
   }
   for (const key of CONFIG_KEYS) {
     if (!(key in raw)) {

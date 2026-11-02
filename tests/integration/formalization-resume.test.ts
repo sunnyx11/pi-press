@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { copyFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  estimateTokens,
+  sessionEntryToContextMessages,
   SessionManager,
   type CompactOptions,
   type ExtensionContext,
@@ -107,23 +109,69 @@ test("cancelled formalization resumes from a persisted checkpoint without regene
       reason: "manual",
     }, resumedCtx);
     assert.equal(reuse?.compaction.summary, checkpoint.compaction.summary);
+    const tailTokens = resumed.getBranch()
+      .slice(resumed.getBranch().findIndex((entry) => entry.id === checkpoint.snapshotLeafId) + 1)
+      .flatMap((entry) => sessionEntryToContextMessages(entry))
+      .reduce((total, message) => total + estimateTokens(message), 0);
+    assert.equal(reuse?.compaction.tokensBefore, checkpoint.compaction.tokensBefore + tailTokens);
     assert.equal(fixture.faux.state.callCount, 1);
     assert.equal(fixture.notifications.some((item) => item.type === "warning"), false);
     resumedRuntime.onSessionShutdown();
 
-    for (const invalidCondition of ["Pi version", "branch", "capacity"] as const) {
+    await t.test("resume accepts a checkpoint from another Pi version", async () => {
+      const crossVersionFile = join(fixture.cwd, "cross-version.jsonl");
+      copyFileSync(sessionFile, crossVersionFile);
+      const crossVersionManager = SessionManager.open(crossVersionFile);
+      crossVersionManager.branch(checkpoint.snapshotLeafId);
+      crossVersionManager.appendCustomEntry("pi-press.precompaction", {
+        ...checkpoint,
+        piVersion: "0.99.1",
+      });
+      crossVersionManager.appendMessage(tail);
+      const reopened = SessionManager.open(crossVersionFile);
+      const crossVersionRuntime = new ExtensionRuntime({
+        appendEntry: () => assert.fail("cross-version resume must reuse the persisted checkpoint"),
+      });
+      const crossVersionCtx = { ...resumedCtx, sessionManager: reopened } as ExtensionContext;
+      try {
+        crossVersionRuntime.onSessionStart(crossVersionCtx);
+        const messages = reopened.buildSessionContext().messages;
+        const result = await crossVersionRuntime.onContext({ type: "context", messages }, crossVersionCtx);
+        assert.equal(result.messages[0]?.role, "compactionSummary");
+        assert.deepEqual(result.messages.at(-1), tail);
+        crossVersionRuntime.onAgentSettled(crossVersionCtx);
+        await waitFor(() => compactCalls.length === 4);
+        const crossVersionReuse = await crossVersionRuntime.beforeCompact({
+          ...makeCompactEvent({ ...scenario, manager: reopened }, new AbortController().signal),
+          reason: "manual",
+        }, crossVersionCtx);
+        assert.equal(crossVersionReuse?.compaction.summary, checkpoint.compaction.summary);
+        assert.equal(crossVersionReuse?.compaction.tokensBefore, reuse?.compaction.tokensBefore);
+        const details = crossVersionReuse?.compaction.details as { piPress: { piVersion: string } };
+        assert.equal(details.piPress.piVersion, "0.99.1");
+        assert.equal(fixture.faux.state.callCount, 1);
+      } finally {
+        crossVersionRuntime.onSessionShutdown();
+      }
+    });
+
+    for (const invalidCondition of ["summary format", "branch", "capacity"] as const) {
       await t.test(`resume rejects an invalid checkpoint: ${invalidCondition}`, async () => {
-        const invalidManager = SessionManager.open(sessionFile);
+        const invalidFile = join(fixture.cwd, `${invalidCondition}.jsonl`);
+        copyFileSync(sessionFile, invalidFile);
+        const invalidManager = SessionManager.open(invalidFile);
         if (invalidCondition === "capacity") {
           invalidManager.branch(storedCheckpoint.id);
         } else {
-          const branchPoint = invalidCondition === "Pi version"
+          const branchPoint = invalidCondition === "summary format"
             ? checkpoint.snapshotLeafId
             : manager.getBranch()[0]!.id;
           invalidManager.branch(branchPoint);
           invalidManager.appendCustomEntry("pi-press.precompaction", {
             ...checkpoint,
-            ...(invalidCondition === "Pi version" ? { piVersion: "incompatible-version" } : {}),
+            ...(invalidCondition === "summary format"
+              ? { summaryFormatVersion: checkpoint.summaryFormatVersion + 1 }
+              : {}),
           });
         }
         const invalidCtx = {
@@ -155,6 +203,6 @@ test("cancelled formalization resumes from a persisted checkpoint without regene
     resumedRuntime?.onSessionShutdown();
     runtime.onSessionShutdown();
     fixture.runtime.onSessionShutdown();
-    rmSync(fixture.cwd, { recursive: true, force: true });
+    t.after(() => rmSync(fixture.cwd, { recursive: true, force: true }));
   }
 });

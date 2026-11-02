@@ -13,7 +13,6 @@ import { delimiter, join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createCheckpointPreparationSettings, prepareCompactionFromBranch } from "../../src/compaction/preparation.js";
-import { DEFAULT_CONFIG } from "../../src/config.js";
 import { createSmokeSession, resolvePiLaunch, resolveSystemPi } from "../../scripts/smoke-real-pi.js";
 
 const executableName = process.platform === "win32" ? "pi.cmd" : "pi";
@@ -29,7 +28,7 @@ test("large real Pi smoke fixture requires both native summaries", () => {
     const sessionFile = createSmokeSession(root, SessionManager, true);
     const manager = SessionManager.open(sessionFile);
     const preparation = prepareCompactionFromBranch(
-      manager.getBranch(), createCheckpointPreparationSettings(DEFAULT_CONFIG),
+      manager.getBranch(), createCheckpointPreparationSettings(16_384),
     );
     assert.ok(preparation);
     assert.equal(preparation.isSplitTurn, true);

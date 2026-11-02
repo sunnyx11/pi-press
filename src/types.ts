@@ -21,7 +21,6 @@ export type SummaryThinkingLevel = ThinkingLevel | "inherit";
 export interface PiPressConfig {
   precomputeMode: PrecomputeMode;
   softThresholdPercent: number;
-  summaryReserveTokens: number;
   summaryThinkingLevel: SummaryThinkingLevel;
   taskTimeoutMs: number;
   hookWaitTimeoutMs: number;

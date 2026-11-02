@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
+  DEFAULT_COMPACTION_SETTINGS,
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
@@ -23,15 +24,9 @@ import {
   createCheckpointPreparationSettings,
   prepareCompactionFromBranch,
 } from "../../src/compaction/preparation.js";
-import { DEFAULT_CONFIG } from "../../src/config.js";
 import registerPiPress from "../../src/index.js";
 import { waitFor } from "../runtime-fixture.js";
 import { makeCheckpointData, makeUsage, makeUserMessage } from "../unit/fixtures.js";
-
-const [piMajor = 0, piMinor = 0, piPatch = 0] = VERSION.split(".").map(Number);
-const supportsSameRunToolCompaction =
-  piMajor > 0 || piMinor > 84 || (piMinor === 84 && piPatch >= 4);
-const sameRunToolCompactionTest = supportsSameRunToolCompaction ? test : test.skip;
 
 test("public agent session applies virtual context and formalizes it after settlement", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-press-agent-loop-"));
@@ -42,7 +37,6 @@ test("public agent session applies virtual context and formalizes it after settl
     join(cwd, ".pi", "pi-press.json"),
     JSON.stringify({
       precomputeMode: "threshold",
-      summaryReserveTokens: 1,
       diagnosticsPersistence: "memory",
     }),
   );
@@ -233,7 +227,7 @@ test("public agent session applies virtual context and formalizes it after settl
   }
 });
 
-sameRunToolCompactionTest(`Pi ${VERSION} compacts after a tool result before the next assistant request`, async () => {
+test(`Pi ${VERSION} compacts after a tool result before the next assistant request`, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-press-agent-tool-loop-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(join(cwd, ".pi"), { recursive: true });
@@ -243,7 +237,6 @@ sameRunToolCompactionTest(`Pi ${VERSION} compacts after a tool result before the
     join(cwd, ".pi", "pi-press.json"),
     JSON.stringify({
       precomputeMode: "threshold",
-      summaryReserveTokens: 1,
       diagnosticsPersistence: "memory",
     }),
   );
@@ -401,7 +394,7 @@ test("preparation adapter matches Pi public compaction event for split turns and
     JSON.stringify({
       compaction: {
         enabled: true,
-        reserveTokens: DEFAULT_CONFIG.summaryReserveTokens,
+        reserveTokens: DEFAULT_COMPACTION_SETTINGS.reserveTokens,
         keepRecentTokens: 10_000,
       },
     }),
@@ -446,7 +439,7 @@ test("preparation adapter matches Pi public compaction event for split turns and
   const branchBeforeCompaction = manager.getBranch();
   const adapterPreparation = prepareCompactionFromBranch(
     branchBeforeCompaction,
-    createCheckpointPreparationSettings(DEFAULT_CONFIG),
+    createCheckpointPreparationSettings(DEFAULT_COMPACTION_SETTINGS.reserveTokens),
   );
   assert.ok(adapterPreparation);
 

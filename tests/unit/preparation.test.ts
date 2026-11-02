@@ -11,7 +11,6 @@ import {
   createFormalizationPreparationSettings,
   prepareCompactionFromBranch,
 } from "../../src/compaction/preparation.js";
-import { DEFAULT_CONFIG } from "../../src/config.js";
 import { calculateOriginalTokensBefore } from "../../src/compaction/reuse.js";
 import { makeCheckpointData, makePreparation, makeUsage, makeUserMessage } from "./fixtures.js";
 
@@ -39,7 +38,7 @@ test("preparation preserves Pi metadata boundary and message selection", () => {
   );
   const preparation = prepareCompactionFromBranch(
     manager.getBranch(),
-    createCheckpointPreparationSettings(DEFAULT_CONFIG),
+    createCheckpointPreparationSettings(16_384),
   );
 
   assert.ok(preparation);
@@ -95,7 +94,7 @@ test("preparation carries previous summary and file operations into the next com
 
   const preparation = prepareCompactionFromBranch(
     manager.getBranch(),
-    createCheckpointPreparationSettings(DEFAULT_CONFIG),
+    createCheckpointPreparationSettings(16_384),
   );
 
   assert.ok(preparation);
@@ -130,7 +129,7 @@ test("preparation uses a checkpoint as the previous summary boundary", () => {
   ) => CompactionPreparation | undefined;
   const preparation = prepareIncremental(
     manager.getBranch(),
-    createCheckpointPreparationSettings(DEFAULT_CONFIG),
+    createCheckpointPreparationSettings(16_384),
     parent,
   );
 
@@ -220,13 +219,13 @@ test("preparation advances recovery omissions without dropping their input", () 
   assert.equal(userId === attemptId, false);
 });
 
-test("checkpoint and formalization preparation settings use independent retention", () => {
-  assert.equal(createCheckpointPreparationSettings(DEFAULT_CONFIG).keepRecentTokens, 10_000);
-  assert.equal(createFormalizationPreparationSettings(DEFAULT_CONFIG, 30_000).keepRecentTokens, 30_000);
-  assert.equal(
-    createCheckpointPreparationSettings(DEFAULT_CONFIG).reserveTokens,
-    createFormalizationPreparationSettings(DEFAULT_CONFIG, 30_000).reserveTokens,
-  );
+test("checkpoint and formalization settings use host reserve with independent retention", () => {
+  const checkpointSettings = createCheckpointPreparationSettings(50_000);
+  const formalizationSettings = createFormalizationPreparationSettings(50_000, 30_000);
+  assert.equal(checkpointSettings.keepRecentTokens, 10_000);
+  assert.equal(formalizationSettings.keepRecentTokens, 30_000);
+  assert.equal(checkpointSettings.reserveTokens, 50_000);
+  assert.equal(formalizationSettings.reserveTokens, 50_000);
 });
 
 test("original token count uses context-edited tail messages", () => {

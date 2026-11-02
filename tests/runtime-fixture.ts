@@ -16,7 +16,7 @@ import {
   createCheckpointPreparationSettings,
   prepareCompactionFromBranch,
 } from "../src/compaction/preparation.js";
-import { DEFAULT_CONFIG } from "../src/config.js";
+import { DEFAULT_CONFIG, loadPiCompactionReserveTokens } from "../src/config.js";
 import { ExtensionRuntime } from "../src/extension-runtime.js";
 import type { PiPressConfig } from "../src/types.js";
 import { makeUserMessage } from "./unit/fixtures.js";
@@ -56,7 +56,6 @@ export function createScenario(
   const config: PiPressConfig = {
     ...DEFAULT_CONFIG,
     softThresholdPercent: 80,
-    summaryReserveTokens: 1,
     taskTimeoutMs: 2_000,
     hookWaitTimeoutMs: 500,
     ...overrides,
@@ -137,7 +136,9 @@ export function makeCompactEvent(
 ): SessionBeforeCompactEvent {
   const preparation = prepareCompactionFromBranch(
     scenario.manager.getBranch(),
-    createCheckpointPreparationSettings(scenario.config),
+    createCheckpointPreparationSettings(loadPiCompactionReserveTokens(
+      scenario.cwd, true, scenario.ctx.model,
+    )),
   );
   assert.ok(preparation);
   return {

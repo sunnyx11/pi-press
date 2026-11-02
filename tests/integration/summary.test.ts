@@ -21,8 +21,10 @@ for (const level of ["low", "inherit", "off"] as const) {
       thinkingLevel: "xhigh",
     } as ExtensionContext;
     let reasoning: unknown;
+    let maxTokens: unknown;
     scenario.faux.setResponses([(_context, options) => {
       reasoning = options?.reasoning;
+      maxTokens = options?.maxTokens;
       return fauxAssistantMessage("summary");
     }]);
     try {
@@ -33,6 +35,7 @@ for (const level of ["low", "inherit", "off"] as const) {
       assert.equal(reasoning, level === "inherit" ? "xhigh" : level === "off" ? undefined : "low");
       assert.equal(checkpoint.provenance.thinkingLevel, level === "inherit" ? "xhigh" : level);
       assert.equal(ctx.thinkingLevel, "xhigh");
+      assert.equal(maxTokens, undefined);
     } finally {
       scenario.runtime.onSessionShutdown();
       rmSync(scenario.cwd, { recursive: true, force: true });
@@ -47,7 +50,7 @@ function addSplitTurn(scenario: ReturnType<typeof createScenario>): void {
 }
 
 test("split summaries record stages and retry metadata without request content", async () => {
-  const scenario = createScenario({ summaryReserveTokens: 16_384 });
+  const scenario = createScenario();
   addSplitTurn(scenario);
   scenario.faux.setResponses([
     fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 provider-response-secret" }),
@@ -108,7 +111,7 @@ test("timeout cancels retry backoff before a second request starts", async () =>
 });
 
 test("split summaries share a total deadline and record late request settlement", async () => {
-  const scenario = createScenario({ taskTimeoutMs: 250, summaryReserveTokens: 16_384 });
+  const scenario = createScenario({ taskTimeoutMs: 250 });
   addSplitTurn(scenario);
   let finishPrefix!: () => void;
   const prefixFinished = new Promise<void>((resolve) => { finishPrefix = resolve; });

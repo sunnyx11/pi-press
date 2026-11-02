@@ -17,7 +17,7 @@ export interface VirtualContextProjectionInput {
   eventMessages: readonly AgentMessage[];
   checkpoint: CheckpointData;
   contextWindow: number;
-  summaryReserveTokens: number;
+  reserveTokens: number;
   softThresholdPercent: number;
   cache?: VirtualContextProjectionCache;
 }
@@ -409,15 +409,15 @@ export function tryProjectCheckpointToVirtualContext(
     eventMessages,
     checkpoint,
     contextWindow,
-    summaryReserveTokens,
+    reserveTokens,
     softThresholdPercent,
     cache,
   } = input;
   if (
     !Number.isFinite(contextWindow) ||
     contextWindow <= 0 ||
-    !Number.isFinite(summaryReserveTokens) ||
-    summaryReserveTokens < 0 ||
+    !Number.isFinite(reserveTokens) ||
+    reserveTokens < 0 ||
     !Number.isFinite(softThresholdPercent) ||
     softThresholdPercent < 0 ||
     softThresholdPercent > 100
@@ -556,7 +556,7 @@ export function tryProjectCheckpointToVirtualContext(
     checkpoint,
     additionalMessages,
     contextWindow,
-    summaryReserveTokens,
+    reserveTokens,
     softThresholdPercent,
     transformedTokenGrowth + systemTokenGrowth,
   );

@@ -38,7 +38,7 @@ test("virtual context projects conversation messages when Pi hides system messag
     eventMessages,
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
     cache: new VirtualContextProjectionCache(),
   });
@@ -76,7 +76,7 @@ test("virtual context counts system growth after the checkpoint snapshot", () =>
     eventMessages,
     checkpoint: data,
     contextWindow: 10_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
   });
 
@@ -108,7 +108,7 @@ test("virtual context replaces the summarized prefix and preserves the current t
     eventMessages,
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
   });
 
@@ -152,7 +152,7 @@ test("virtual context tolerates an auto-retried error missing before the kept bo
     eventMessages,
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
     cache: new VirtualContextProjectionCache(),
   });
@@ -198,7 +198,7 @@ test("virtual context tolerates an auto-retried error missing from the current t
     eventMessages,
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
   });
 
@@ -230,7 +230,7 @@ test("virtual context refuses a missing assistant error without an adjacent retr
     eventMessages,
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
     cache: new VirtualContextProjectionCache(),
   });
@@ -256,7 +256,7 @@ test("virtual context reports a structured reason for a missing ordinary session
     eventMessages,
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
     cache: new VirtualContextProjectionCache(),
   });
@@ -308,7 +308,7 @@ test("virtual context preserves a transformed message identified by stable metad
     eventMessages,
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
   });
 
@@ -354,7 +354,7 @@ test("virtual context counts transformed kept-message growth toward the hard lim
     eventMessages,
     checkpoint: data,
     contextWindow: 10_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
   });
 
@@ -390,7 +390,7 @@ test("virtual context keeps an unmatched message from another context handler", 
     eventMessages,
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
   });
 
@@ -430,7 +430,7 @@ test("virtual context counts an unmatched pre-snapshot message toward the hard l
     eventMessages: [baseMessages[0]!, injected, ...baseMessages.slice(1)],
     checkpoint: data,
     contextWindow: 10_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
   });
 
@@ -462,7 +462,7 @@ test("virtual context refuses an ambiguous duplicate at the compaction boundary"
     eventMessages,
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
     cache: new VirtualContextProjectionCache(),
   });
@@ -484,7 +484,7 @@ test("virtual context cache incrementally indexes appended entries and rebuilds 
   const baseInput = {
     checkpoint: data,
     contextWindow: 100_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
   };
 
@@ -567,7 +567,7 @@ test("virtual context returns no projection when the hard limit is exceeded", ()
     eventMessages: manager.buildSessionContext().messages,
     checkpoint: data,
     contextWindow: 10_000,
-    summaryReserveTokens: 1,
+    reserveTokens: 1,
     softThresholdPercent: 50,
   });
 

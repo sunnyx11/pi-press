@@ -15,7 +15,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { ExtensionRuntime } from "../../src/extension-runtime.js";
 import { makeCheckpointData, makeModel, makePreparation, makeUserMessage } from "./fixtures.js";
-import { waitFor, type Notification } from "../runtime-fixture.js";
+import { createScenario, waitFor, type Notification } from "../runtime-fixture.js";
 
 test("checkpoint claim stays exclusive within one attempt and recovers for a newer attempt", async () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime");
@@ -251,6 +251,29 @@ test("removed target percentage is warned once and does not reject a checkpoint"
   }
 });
 
+test("removed summary reserve is reported once across repeated loads and projects", () => {
+  const scenario = createScenario();
+  const otherCwd = join(scenario.cwd, "another-project");
+  mkdirSync(join(otherCwd, ".pi"), { recursive: true });
+  for (const cwd of [scenario.cwd, otherCwd]) {
+    writeFileSync(join(cwd, ".pi", "pi-press.json"), JSON.stringify({ summaryReserveTokens: 1 }));
+  }
+  try {
+    const ctx = { ...scenario.ctx, getContextUsage: () => undefined } as ExtensionContext;
+    scenario.runtime.onSessionStart(ctx);
+    scenario.runtime.onTurnEnd(ctx);
+    scenario.runtime.onSessionStart({ ...ctx, cwd: otherCwd });
+    const warnings = scenario.runtime.getDiagnostics().records.filter(
+      (record) => record.kind === "config" && record.message.includes("summaryReserveTokens"),
+    );
+    assert.equal(warnings.length, 1);
+    assert.equal(scenario.notifications.filter((item) => item.message.includes("summaryReserveTokens")).length, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
 test("unsupported compaction reasons fall back to Pi", async () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-runtime");
   manager.appendMessage(makeUserMessage("history"));
@@ -286,7 +309,7 @@ test("timed out authentication remains occupied across runtime instances until i
   mkdirSync(join(cwd, ".pi"));
   writeFileSync(
     join(cwd, ".pi", "pi-press.json"),
-    JSON.stringify({ taskTimeoutMs: 20, summaryReserveTokens: 1 }),
+    JSON.stringify({ taskTimeoutMs: 20 }),
   );
 
   try {
@@ -304,6 +327,7 @@ test("timed out authentication remains occupied across runtime instances until i
       cwd,
       sessionManager: manager,
       model,
+      isProjectTrusted: () => true,
       modelRegistry: {
         getApiKeyAndHeaders: () => {
           authLookups += 1;
@@ -376,6 +400,7 @@ test("persisted checkpoint can continue refreshing after restore", () => {
   const model = makeModel();
   const ctx = {
     cwd: "/tmp/pi-press-runtime-refresh",
+    isProjectTrusted: () => true,
     sessionManager: manager,
     model,
     modelRegistry: {},
@@ -415,6 +440,7 @@ test("single oversized turn silently skips unavailable preparation", async () =>
   const notifications: Notification[] = [];
   const ctx = {
     cwd: "/tmp/pi-press-runtime-no-preparation",
+    isProjectTrusted: () => true,
     sessionManager: manager,
     model,
     modelRegistry: {
@@ -455,6 +481,7 @@ test("authentication failure is shown as a CLI error notification", async () => 
   const notifications: Notification[] = [];
   const ctx = {
     cwd: `/tmp/pi-press-runtime-failure-${process.pid}`,
+    isProjectTrusted: () => true,
     sessionManager: manager,
     model,
     modelRegistry: {

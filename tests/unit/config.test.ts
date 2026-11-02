@@ -33,6 +33,16 @@ test("normalizeConfig returns design defaults and reports removed fields", () =>
   assert.deepEqual(result.diagnostics, ["配置字段 targetPostCompactionPercent 已移除，当前值已忽略"]);
 });
 
+test("normalizeConfig ignores removed summary reserve values and keeps checkpoint identity", () => {
+  const fingerprint = configFingerprint(DEFAULT_CONFIG);
+  for (const value of [0, 1, 90_000, -1, "invalid", null]) {
+    const result = normalizeConfig({ summaryReserveTokens: value });
+    assert.equal("summaryReserveTokens" in result.config, false);
+    assert.equal(configFingerprint(result.config), fingerprint);
+    assert.deepEqual(result.diagnostics, ["配置字段 summaryReserveTokens 已移除，当前值已忽略"]);
+  }
+});
+
 test("normalizeConfig defaults summary thinking to low and validates explicit levels", () => {
   assert.equal(normalizeConfig({}).config.summaryThinkingLevel, "low");
   for (const level of ["inherit", "off", "minimal", "low", "medium", "high", "xhigh"]) {

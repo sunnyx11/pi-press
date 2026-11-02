@@ -52,8 +52,8 @@ Pi-press 自行实现并维护以下内容：
 
 ## 兼容范围
 
-- npm 发布包将 `@earendil-works/pi-agent-core`、`@earendil-works/pi-ai` 和 `@earendil-works/pi-coding-agent` 声明为 `peerDependencies: "*"`，由 Pi 宿主提供运行时核心包；最低兼容版本为 `0.87.0`，开发依赖和 `package-lock.json` 固定的当前集成验证版本为 `0.99.1`。
-- 当前包根 `VERSION` 写入 checkpoint provenance，并用于拒绝复用其他 Pi 版本生成的 checkpoint。版本升级后会生成新的 checkpoint。
+- npm 发布包将 `@earendil-works/pi-agent-core`、`@earendil-works/pi-ai` 和 `@earendil-works/pi-coding-agent` 声明为 `peerDependencies: "*"`，由 Pi 宿主提供运行时核心包；最低兼容版本、开发依赖和 `package-lock.json` 固定的集成验证版本均为 `1.5.0`。
+- 当前包根 `VERSION` 写入 checkpoint 的 `piVersion`，仅记录生成来源。消费按 schema、preparation 算法、摘要格式、会话、分支和当前容量校验，允许复用其他 Pi 版本生成的兼容 checkpoint。
 - 公开 API、provider、超时、结果校验或 checkpoint 追加失败时，通过 CLI error 通知显示错误；虚拟转换返回事件原消息，正式 hook 返回空结果并由 Pi 原生流程继续处理。preparation 不可用时只记录诊断并静默跳过；生成或消费阶段容量不满足目标、hook 等待超时时，通过 CLI warning 通知显示跳过原因和原生后备处理状态。
 - 所有运行时导入必须来自包根入口，禁止通过 `dist/core/...` 引用深层模块。
 - 目标契约包括 coding-agent 的 `context`、`agent_settled`、compaction 扩展事件、`ctx.compact()`、`CompactionResult`、公开 SessionManager 读取接口、custom entry 和上下文重建规则。
@@ -169,7 +169,7 @@ checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只
 
 - `context` 在每次 provider 请求前执行，输入是 Pi 为扩展创建的消息副本；返回值只影响该次请求。
 - 每次事件都重新读取当前 branch、正式 compaction epoch 和 ready checkpoint。分支到消息的稳定标识、累计 token 和 checkpoint 边界使用实例内缓存；分支仅追加时增量索引新 entry，分支切换、截断或正式 compaction 时完整重建。
-- checkpoint 必须通过 schema、Pi 版本、session、epoch、祖先、消费状态和当前模型容量校验。
+- checkpoint 必须通过 schema、preparation 算法、摘要格式、session、epoch、祖先、消费状态和当前模型容量校验。
 - 虚拟上下文由一个 `role: "compactionSummary"` 消息和 `firstKeptEntryId` 开始的当前 context-visible 消息组成，使用 Pi 的公开 entry-to-message 语义构造。
 - 新增 assistant 消息、工具结果、steering 消息和 follow-up 消息在下一次 `context` 事件中进入当前尾部，不修改 checkpoint 摘要。
 - 虚拟转换不得修改 `event.messages`、`agent.state.messages` 或 SessionManager 返回的数据；必须返回新数组和新建的摘要消息。
@@ -206,7 +206,6 @@ Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项�
 | --- | --- | --- |
 | `precomputeMode` | `"threshold"` | `"off"` 停用；`"threshold"` 启用预压缩、虚拟压缩和 agent settled 后正式化；`"threshold-and-manual"` 还允许无自定义指令的使用者手动 compaction 复用 checkpoint |
 | `softThresholdPercent` | `80` | 首次预压缩与后续增量刷新的上下文百分比 |
-| `summaryReserveTokens` | `16384` | 传给 preparation 的摘要输出预算 |
 | `summaryThinkingLevel` | `"low"` | 后台摘要思考级别；允许 `"inherit"`、`"off"`、`"minimal"`、`"low"`、`"medium"`、`"high"`、`"xhigh"`。`"inherit"` 使用当前主会话级别，缺失时使用 `"medium"`；其他值只影响摘要请求 |
 | `taskTimeoutMs` | `300000` | 单次后台任务总超时 |
 | `hookWaitTimeoutMs` | `1000` | 正式压缩 hook 与临界值之前的 hard-limit 场景等待兼容任务的最长时间；临界 `context` 等待使用任务自身的剩余 `taskTimeoutMs` |
@@ -214,11 +213,17 @@ Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项�
 | `diagnosticsRetentionDays` | `30` | SQLite 事件保留天数，允许范围为 `1..3650` |
 | `diagnosticsMaxDatabaseMiB` | `64` | SQLite 数据库容量上限，允许范围为 `1..1024` MiB；超过上限时删除最早事件 |
 
-checkpoint preparation 固定使用 `keepRecentTokens: 10000`，用于在 checkpoint 中保存约 10000 token 的原始近期消息。正式化 preparation 使用 Pi `SettingsManager.getCompactionKeepRecentTokens(model)` 返回的活动模型生效值；请求前临界值使用 `SettingsManager.getCompactionReserveTokens(model)` 返回的活动模型生效值。该管理器合并全局、受信任项目和 `compaction.modelOverrides` 设置，字段缺失时返回 Pi 默认值。后台摘要请求固定允许一次瞬时错误重试。同一正式 compaction epoch 可连续刷新 checkpoint，每一代继承 parent 摘要并只处理新增历史。
+checkpoint preparation 固定使用 `keepRecentTokens: 10000`，用于在 checkpoint 中保存约 10000 token 的原始近期消息。正式化 preparation 使用 Pi `SettingsManager.getCompactionKeepRecentTokens(model)` 返回的活动模型生效值。
 
-容量校验与请求前临界等待均预留 `max(4096, ceil(contextWindow * 0.02))` 的容量余量。预计上下文达到 `softThresholdPercent` 时启动下一代任务，超过 hard limit 的 checkpoint 不用于 provider 请求或正式复用。临界等待值随每次事件的活动模型 `contextWindow` 和 Pi `compaction.reserveTokens` 计算，不属于 Pi-press 配置。实现必须校验百分比、token、超时和诊断存储字段的范围；`taskTimeoutMs` 与 `hookWaitTimeoutMs` 必须是 `1..2147483647` 范围内的整数，无效字段使用默认值并记录诊断。旧版 `targetPostCompactionPercent` 字段只记录一次警告并忽略，不参与 fingerprint。
+后台 preparation、虚拟容量、请求前临界值和正式化 preparation 均使用 `SettingsManager.getCompactionReserveTokens(model)` 返回的活动模型生效值。后台任务在创建时捕获该值；消费时读取当前值，正式 hook 使用 Pi 事件 preparation 中的值。`SettingsManager` 合并全局、受信任项目和 `compaction.modelOverrides` 设置，字段缺失时返回 Pi 默认值。
 
-`summaryThinkingLevel` 参与生成配置 fingerprint，影响新任务去重。摘要 provenance 保存解析后的实际请求级别。主会话模型和思考级别保持原状。已有检查点按当前分支、Pi 版本和容量规则复用，配置变化本身不使其失效。
+摘要输出上限由 Pi 和模型决定。Pi 1.5.0 的摘要生成忽略 `reserveTokens` 输出预算参数，Pi-press 使用原生行为。后台摘要请求固定允许一次瞬时错误重试。同一正式 compaction epoch 可连续刷新 checkpoint，每一代继承 parent 摘要并只处理新增历史。
+
+容量校验与请求前临界等待均预留 `max(4096, ceil(contextWindow * 0.02))` 的容量余量。预计上下文达到 `softThresholdPercent` 时启动下一代任务，超过 hard limit 的 checkpoint 使用 Pi 原生后备处理。临界等待值随每次事件的活动模型 `contextWindow` 和 Pi `compaction.reserveTokens` 计算，属于宿主设置。实现必须校验百分比、token、超时和诊断存储字段的范围；`taskTimeoutMs` 与 `hookWaitTimeoutMs` 必须是 `1..2147483647` 范围内的整数，无效字段使用默认值并记录诊断。
+
+旧字段 `targetPostCompactionPercent` 与 `summaryReserveTokens` 的值均忽略，且均排除在配置 fingerprint 之外。每个 Runtime 实例对两字段各记录一次诊断；`summaryReserveTokens` 另显示一次 CLI warning。
+
+`summaryThinkingLevel` 参与生成配置 fingerprint，影响新任务去重。摘要 provenance 保存解析后的实际请求级别。主会话模型和思考级别保持原状。已有检查点按当前分支、算法、摘要格式和容量规则复用，配置变化本身不使其失效。
 
 Pi compaction 的保留量属于 Pi settings，不属于 Pi-press 配置，也不参与配置 fingerprint。诊断存储方式、保留天数和容量上限同样不参与 fingerprint，修改这些字段不会改变 checkpoint 内容身份。Pi-press 通过公开 `SettingsManager` 读取生效值，不自行解析 Pi settings 文件。配置 fingerprint 参与 snapshot key，防止同一内容在不同 checkpoint 生成配置下错误去重。已生成 checkpoint 不因模型、thinking level 或预算配置变化自动失效；虚拟应用和正式消费时均按当前模型重新校验容量。`precomputeMode` 为 `"off"` 时中止 in-flight 任务、取消正式化调度、清除 deferred、pending 和虚拟状态，并停止消费 ready checkpoint；已经交给 Pi 的正式 compaction 由宿主继续完成。
 
@@ -273,11 +278,11 @@ Pi compaction 的保留量属于 Pi settings，不属于 Pi-press 配置，也�
 字段规则：
 
 - `version`：checkpoint schema 版本。当前写入版本为 `4`；版本 `3`、`algorithmVersion: 1` 的旧 checkpoint 可作为无 parent 的根节点读取。
-- `piVersion`：生成结果的 Pi 版本，必须与运行时 `VERSION` 相同。
+- `piVersion`：生成结果的 Pi 版本，作为来源信息保留。
 - `algorithmVersion`：Pi-press preparation 适配算法版本；当前值为 `5`。其他算法版本不属于当前 checkpoint。
 - `summaryFormatVersion`：摘要格式和原生 compact 编排版本。
 - `checkpointId`：扩展生成的逻辑唯一标识；不依赖 Pi 自动生成的 custom entry ID。
-- `parentCheckpointId`：同 epoch 上一代 checkpoint 的 ID。首代 checkpoint 可以省略。选择候选时校验完整 parent 链的先后顺序、epoch、session、Pi 版本和保留边界。
+- `parentCheckpointId`：同 epoch 上一代 checkpoint 的 ID。首代 checkpoint 可以省略。选择候选时校验完整 parent 链的先后顺序、epoch、session、算法、摘要格式和保留边界。
 - `sessionId`：生成 checkpoint 时的 session ID。
 - `snapshotLeafId`：生成快照时当前分支的实际叶子 entry ID，用于祖先校验。
 - `snapshotSourceLeafId`：忽略所有 `customType` 以 `pi-press.` 开头的状态 entry 后，最新的其他 entry ID。该字段用于 snapshot 去重，只表示生成输入边界，不替代实际叶子。
@@ -322,7 +327,7 @@ checkpoint 不复制原始消息，不可原地更新。原始消息继续由 Pi
 10. 完成容量估算并写入 `estimatedTokensAfterAtSnapshot` 后，通过统一 checkpoint parser 校验整个 checkpoint；任一字段无效时丢弃结果并交给 Pi 原生处理。
 11. 校验通过后调用 `pi.appendEntry("pi-press.precompaction", data)` 追加 checkpoint。
 
-模型、thinking level 或 endpoint 在摘要完成后发生变化，不会单独使已生成摘要失效；这些字段只作为生成来源记录。消费时按当前模型上下文窗口重新计算压缩后 token。Pi 版本、preparation 算法版本或摘要格式版本变化时，结果必须作废。
+模型、thinking level 或 endpoint 在摘要完成后发生变化，不会单独使已生成摘要失效；这些字段只作为生成来源记录。消费时按当前模型上下文窗口与宿主预留量重新计算压缩后 token。schema、preparation 算法版本或摘要格式版本不兼容时，结果视为无效。Pi 版本只记录来源。
 
 追加前检查与 `pi.appendEntry()` 之间不保证原子性。正式 compaction 可能在该窗口内插入，产生一条过期 custom checkpoint；该 entry 会被 `epochCompactionId` 校验拒绝，不进入 LLM 上下文，可以保留。
 
@@ -349,8 +354,9 @@ estimatedVirtualTokens = estimatedTokensAfterAtSnapshot
   + additionalMessageTokens
   + transformedGrowthTokens
   + systemGrowthTokens
+reserveTokens = 当前模型生效的 Pi compaction.reserveTokens
 safetyMargin = max(4096, ceil(contextWindow * 0.02))
-hardLimit = contextWindow - summaryReserveTokens - safetyMargin
+hardLimit = contextWindow - reserveTokens - safetyMargin
 softLimit = floor(contextWindow * softThresholdPercent / 100)
 ```
 
@@ -463,16 +469,16 @@ Pi 随后追加正式 `compaction` entry。恢复后的上下文为：
 + 正式 compaction entry 之后的新消息
 ```
 
-此时 `context` 处理器观察到新的 epoch，后续请求使用 Pi 正式上下文。后续 resume 也由 Pi 从正式 compaction entry 重建相同上下文。正式化完成前进程退出、失败或取消时，持久化 custom checkpoint 仍可在 resume 后按 Pi 版本、schema、session、epoch、祖先关系、parent 链、内容和容量重新校验。有效摘要及保留尾部可继续用于 provider 请求，并在新的 `agent_settled` 后再次正式化。
+此时 `context` 处理器观察到新的 epoch，后续请求使用 Pi 正式上下文。后续 resume 也由 Pi 从正式 compaction entry 重建相同上下文。正式化完成前进程退出、失败或取消时，持久化 custom checkpoint 仍可在 resume 后按 schema、算法、摘要格式、session、epoch、祖先关系、parent 链、内容和容量重新校验。有效摘要及保留尾部可继续用于 provider 请求，并在新的 `agent_settled` 后再次正式化。
 
 ## 检查点失效和后备处理
 
 以下情况使 checkpoint 不可消费：
 
-- 当前 checkpoint 的 Pi 版本、checkpoint schema、preparation 算法版本或摘要格式版本与运行时不匹配；
+- 当前 checkpoint 的 schema、preparation 算法版本或摘要格式版本与运行时不兼容；
 - 当前 `precomputeMode` 为 `"off"`；内部正式化已交给 Pi 后只停止复用 checkpoint，不中止宿主 compaction；
 - overflow 恢复中只有旧 checkpoint 可用，或没有比失败请求更新的 checkpoint；
-- parent checkpoint 缺失、位于子 checkpoint 之后，或 parent 链中的 session、epoch、Pi 版本、snapshot 顺序和保留边界不一致；
+- parent checkpoint 缺失、位于子 checkpoint 之后，或 parent 链中的 session、epoch、算法、摘要格式、snapshot 顺序和保留边界不兼容；
 - 使用者发起的 `reason: "manual"` 未启用 `"threshold-and-manual"`，或者内部 manual 事件与 `pendingFormalization` 的 checkpoint、session 或 epoch 不匹配；
 - 当前 session 与 checkpoint session 不同；
 - 当前分支不继承 `snapshotLeafId`；
@@ -517,7 +523,7 @@ checkpoint 不可用于正式 compaction 时，扩展返回空结果，由 Pi �
 当前分支包含 firstKeptEntryId
 firstKeptEntryId 位于 snapshotLeafId 之前或与其相同
 当前最新正式 compaction ID == snapshot epochCompactionId
-当前 checkpoint 的 Pi 版本、算法版本和摘要格式版本仍满足消费校验
+当前 checkpoint 的 schema、算法版本和摘要格式版本受支持
 ```
 
 当前分支仅在快照后追加新 entry 时，checkpoint 仍然有效，新消息作为未压缩尾部保留。切换到其他分支时中止当前后台任务并清除分支内存状态；旧分支已持久化的 checkpoint 保留。再次导航回旧分支时，只要祖先、epoch 和容量校验通过，该 checkpoint 可以恢复使用。
@@ -669,7 +675,7 @@ Pi 命令 `/pi-press-diagnostics [--session <id>] [--last <1-100>] [--json]` 查
 
 ### 发布包接口与版本适配
 
-测试以 `package-lock.json` 固定的 `@earendil-works/pi-coding-agent 0.99.1` 发布包为默认对象，最低兼容版本为 `0.87.0`，两者均需运行类型检查和测试：
+测试以 `package-lock.json` 固定的 `@earendil-works/pi-coding-agent 1.5.0` 发布包为对象，该版本同时为最低兼容版本。类型检查和测试均使用固定依赖：
 
 - 生产代码只从包根入口导入，构建测试阻止 `dist/core/...` 深层导入；
 - 不通过 `VERSION` 做全局启用门控；当前版本会写入 checkpoint，版本不兼容产生的运行时错误通过 CLI 通知显示，并回退 Pi 原生 compaction；
@@ -683,7 +689,8 @@ Pi 命令 `/pi-press-diagnostics [--session <id>] [--last <1-100>] [--json]` 查
 
 - 版本适配模块生成的 preparation 传给公开 `compact()` 后，验证原生摘要格式、`previousSummary` 更新和文件标签；
 - 后台摘要默认使用 `low`，`inherit` 继承主会话级别，`off` 保持原生无 reasoning 请求；主会话级别保持原状。
-- 配置枚举、无效值回退和 fingerprint 具有测试。
+- 配置枚举、无效值回退、旧 `summaryReserveTokens` 的忽略与单次提示，以及 fingerprint 具有测试。
+- 宿主模型 reserve override 用于生成容量；修改宿主预留量后，虚拟应用和正式消费按当前容量重新校验。摘要输出上限保持 Pi 原生行为。
 - 阶段诊断覆盖重试成功、重试等待取消、双摘要共用总期限和迟到请求结束；事件包含任务关联信息且排除请求正文。
 - 真实 Pi 基础冒烟验证正式复用和 `tokensBefore`；`PI_SMOKE_SCENARIO=split` 覆盖大输入双摘要与主会话 `xhigh`，`PI_SMOKE_SUMMARY_THINKING=inherit` 提供同输入级别对照。
 - split turn 产生正确的历史摘要与 turn-prefix 摘要，调用次数和合并 usage 正确；
@@ -730,7 +737,7 @@ Pi 命令 `/pi-press-diagnostics [--session <id>] [--last <1-100>] [--json]` 查
 - `Nothing to compact (session too small)` 进入 deferred，不产生 warning、`formalization_failed` 或失败次数；普通正式化错误最多累计两次失败，达到上限后当前 epoch 使用原始上下文且不再生成 checkpoint。
 - 内部请求在领取 checkpoint 前后取消均保持静默，清除本请求 pending 和 claim，保留有效 checkpoint、虚拟投影、缓存和既有失败次数；连续取消仍保留后续机会，取消前已有一次普通失败时，下一次普通失败仍达到两次上限。
 - 取消归属依赖完整事件、当前 pending 和已中止的同一 signal；其他压缩、无 pending、不同 signal、重试事件和普通错误保持各自处理规则，重复事件和迟到回调保护新请求及其 claim。
-- 公开 SDK 的宿主取消事件经过入口传递后，由后续新运行正式化同一 checkpoint；持久化会话恢复复用原摘要和完整尾部，版本、分支或容量无效时排除该 checkpoint。
+- 公开 SDK 的宿主取消事件经过入口传递后，由后续新运行正式化同一 checkpoint；持久化会话恢复复用其他 Pi 版本的兼容摘要和完整尾部，并验证正式 `tokensBefore`。schema、算法、摘要格式、分支或容量无效时排除该 checkpoint。
 - `session_before_compact` 拒绝内部候选时，Pi 原生摘要仍能完成正式 compaction；overflow 或 `willRetry: true` 只复用更新候选，等待超时或没有更新候选时保持 Pi 原生处理。
 - 扩展结果的普通压缩失败通过 `session_compact_failed(fromExtension: true, aborted: false)` 释放 checkpoint claim；取消由所属 signal 释放领取。迟到取消事件保留其他 signal 的 claim，Pi 原生压缩的普通失败保留当前 claim。
 - 宿主有效事件顺序、重复取消事件和迟到 callback 均保持请求清理幂等，保护当前请求及其 claim。
