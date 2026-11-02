@@ -246,7 +246,7 @@ Pi compaction 的保留量属于 Pi settings，不属于 Pi-press 配置，也�
     "snapshotLeafId": "entry-42",
     "snapshotSourceLeafId": "entry-41",
     "epochCompactionId": null,
-    "snapshotKey": "session-1:null:entry-41:current-pi-version:4:1:config",
+    "snapshotKey": "session-1:null:entry-41:current-pi-version:5:1:config",
     "compaction": {
       "summary": "...",
       "firstKeptEntryId": "entry-18",
@@ -277,7 +277,7 @@ Pi compaction 的保留量属于 Pi settings，不属于 Pi-press 配置，也�
 
 字段规则：
 
-- `version`：checkpoint schema 版本。当前写入版本为 `4`；版本 `3`、`algorithmVersion: 1` 的旧 checkpoint 可作为无 parent 的根节点读取。
+- `version`：checkpoint schema 版本。当前读取和写入版本均为 `4`。
 - `piVersion`：生成结果的 Pi 版本，作为来源信息保留。
 - `algorithmVersion`：Pi-press preparation 适配算法版本；当前值为 `5`。其他算法版本不属于当前 checkpoint。
 - `summaryFormatVersion`：摘要格式和原生 compact 编排版本。

@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-02
+
+### Changed
+
+- 最低支持 Pi coding-agent 版本为 `1.5.0`，使用旧版 Pi 的环境需要先升级宿主。
+- 后台摘要输出上限遵循 Pi 原生模型设置。
+- 预压缩生成与复用的容量检查统一使用宿主当前模型生效的 `compaction.reserveTokens`。
+- 允许复用其他 Pi 版本生成的兼容 checkpoint，保留格式、算法、会话、分支和容量校验。
+
+### Removed
+
+- 移除 `summaryReserveTokens`；旧值提示一次并忽略，预留量改用 Pi `compaction.reserveTokens`。
+
 ## [0.5.2] - 2026-10-29
 
 ### Fixed
@@ -152,7 +165,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/sunnyx11/pi-press/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/sunnyx11/pi-press/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/sunnyx11/pi-press/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/sunnyx11/pi-press/compare/v0.4.1...v0.5.0
