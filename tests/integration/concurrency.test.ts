@@ -856,3 +856,660 @@ test("formal compaction invalidates an in-flight task before it can append", asy
     rmSync(scenario.cwd, { recursive: true, force: true });
   }
 });
+
+test("raw context exceeding hard limit without checkpoint or usage stats enters foreground precompaction", async () => {
+  let resolveStarted!: () => void;
+  let resolveResponse!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const responseGate = new Promise<void>((resolve) => {
+    resolveResponse = resolve;
+  });
+  const response: ResponseFactory = async () => {
+    resolveStarted();
+    await responseGate;
+    return fauxAssistantMessage("raw overflow emergency summary");
+  };
+  const scenario = createScenario({ taskTimeoutMs: 500 }, response);
+  // Grow raw branch messages past the 85% hard limit (79,520 tokens on 100k window)
+  // while getContextUsage() is unknown.
+  for (let index = 0; index < 60; index += 1) {
+    scenario.manager.appendMessage(makeUserMessage("x".repeat(3_000)));
+  }
+  const unknownUsageCtx = {
+    ...scenario.ctx,
+    getContextUsage: () => ({
+      tokens: null,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: null,
+    }),
+  } as ExtensionContext;
+
+  try {
+    const contextPromise = Promise.resolve(scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, unknownUsageCtx));
+
+    const taskStarted = await Promise.race([
+      started.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+    assert.equal(taskStarted, true);
+    assert.equal(scenario.runtime.getDiagnostics().counters.critical_task_started, 1);
+    resolveResponse();
+
+    const result = await contextPromise;
+    assert.equal(result.messages[0]?.role, "compactionSummary");
+    assert.equal(
+      (result.messages[0] as { summary?: string }).summary,
+      "raw overflow emergency summary",
+    );
+    assert.equal(scenario.runtime.getDiagnostics().counters.critical_waited, 1);
+  } finally {
+    resolveResponse();
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("uncompactable oversized context sends when within contextWindow and aborts via ctx.abort only when exceeding contextWindow", async () => {
+  // Part 1: 90,000 tokens (> hardLimit 79,520, <= contextWindow 100,000) sends without aborting.
+  const withinWindow = createScenario({ taskTimeoutMs: 500 });
+  withinWindow.manager.branch(withinWindow.firstEntryId);
+  withinWindow.manager.appendContextEdit(withinWindow.firstEntryId, { content: "x".repeat(360_000) });
+  let withinWindowAborted = 0;
+  const withinWindowCtx = {
+    ...withinWindow.ctx,
+    abort: () => {
+      withinWindowAborted += 1;
+    },
+    getContextUsage: () => undefined,
+  } as ExtensionContext;
+
+  // Part 2: 110,000 tokens (> contextWindow 100,000) aborts via ctx.abort.
+  const overWindow = createScenario({ taskTimeoutMs: 500 });
+  overWindow.manager.branch(overWindow.firstEntryId);
+  overWindow.manager.appendContextEdit(overWindow.firstEntryId, { content: "x".repeat(440_000) });
+  let overWindowAborted = 0;
+  const overWindowCtx = {
+    ...overWindow.ctx,
+    abort: () => {
+      overWindowAborted += 1;
+    },
+    getContextUsage: () => undefined,
+  } as ExtensionContext;
+
+  try {
+    const withinWindowMessages = withinWindow.manager.buildSessionProjection().messages.filter(
+      (message) => message.role !== "system",
+    );
+    const withinResult = await withinWindow.runtime.onContext({
+      type: "context",
+      messages: withinWindowMessages,
+    }, withinWindowCtx);
+    assert.equal(withinResult.messages, withinWindowMessages);
+    assert.equal(withinWindowAborted, 0);
+    assert.equal(withinWindow.runtime.getDiagnostics().counters.context_aborted_capacity ?? 0, 0);
+
+    const overWindowMessages = overWindow.manager.buildSessionProjection().messages.filter(
+      (message) => message.role !== "system",
+    );
+    const overResult = await overWindow.runtime.onContext({
+      type: "context",
+      messages: overWindowMessages,
+    }, overWindowCtx);
+    assert.equal(overResult.messages, overWindowMessages);
+    assert.equal(overWindowAborted, 1);
+    assert.equal(overWindow.runtime.getDiagnostics().counters.context_aborted_capacity, 1);
+  } finally {
+    withinWindow.runtime.onSessionShutdown();
+    overWindow.runtime.onSessionShutdown();
+    rmSync(withinWindow.cwd, { recursive: true, force: true });
+    rmSync(overWindow.cwd, { recursive: true, force: true });
+  }
+});
+
+test("context_with_system exceeding hard limit sends without aborting and records delta D so next context precompacts", async () => {
+  const scenario = createScenario(
+    { taskTimeoutMs: 500 },
+    async () => fauxAssistantMessage("summary triggered by recorded delta D"),
+  );
+  let aborted = 0;
+  const ctx = {
+    ...scenario.ctx,
+    abort: () => {
+      aborted += 1;
+    },
+    getContextUsage: () => ({
+      tokens: 40_500,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 40.5,
+    }),
+  } as ExtensionContext;
+
+  try {
+    const conversationMessages = scenario.manager.buildSessionContext().messages;
+    const contextResult = await scenario.runtime.onContext({
+      type: "context",
+      messages: conversationMessages,
+    }, ctx);
+    assert.equal(contextResult.messages, conversationMessages);
+    assert.equal(aborted, 0);
+
+    // 45,000-token system prompt makes fullTokens = 40,500 + 45,000 = 85,500 > H (79,520).
+    // Request 1 proceeds without aborting and records D = 45,000.
+    const largeSystemMessage = {
+      role: "system" as const,
+      content: "S".repeat(180_000),
+      timestamp: Date.now(),
+    };
+    const systemResult = await scenario.runtime.onContextWithSystem({
+      type: "context_with_system",
+      messages: [largeSystemMessage, ...contextResult.messages],
+    }, ctx);
+    assert.equal(systemResult, undefined);
+    assert.equal(aborted, 0);
+    assert.equal(scenario.runtime.getDiagnostics().counters.context_aborted_capacity ?? 0, 0);
+
+    // Request 2 in the same session + model adds D (45,000) to E (40,500) -> 85,500 > H,
+    // so onContext waits in foreground and returns the projected summary (~22,505 + 45,000 = 67,505 <= H).
+    const nextResult = await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, ctx);
+    assert.equal(aborted, 0);
+    assert.equal(nextResult.messages[0]?.role, "compactionSummary");
+    assert.equal(
+      (nextResult.messages[0] as { summary?: string }).summary,
+      "summary triggered by recorded delta D",
+    );
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("critical context waits for external background slot to free before starting emergency task", async () => {
+  let resolveFirstResponse!: () => void;
+  const firstGate = new Promise<void>((resolve) => {
+    resolveFirstResponse = resolve;
+  });
+  let callCount = 0;
+  const response: ResponseFactory = async () => {
+    callCount += 1;
+    if (callCount === 1) {
+      await firstGate;
+      return fauxAssistantMessage("first session background summary");
+    }
+    return fauxAssistantMessage("second session emergency summary");
+  };
+  const first = createScenario({ taskTimeoutMs: 500 }, response);
+  const second = createScenario({ taskTimeoutMs: 500 }, response);
+
+  try {
+    first.runtime.onTurnEnd(first.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const secondCriticalCtx = {
+      ...second.ctx,
+      getContextUsage: () => ({
+        tokens: 80_000,
+        contextWindow: second.ctx.model!.contextWindow,
+        percent: 80,
+      }),
+    } as ExtensionContext;
+
+    const contextPromise = Promise.resolve(second.runtime.onContext({
+      type: "context",
+      messages: second.manager.buildSessionContext().messages,
+    }, secondCriticalCtx));
+
+    // Release the first session's background slot so the second session can start its emergency task.
+    setTimeout(() => {
+      resolveFirstResponse();
+    }, 30);
+
+    const result = await contextPromise;
+    assert.equal(result.messages[0]?.role, "compactionSummary");
+    assert.equal(
+      (result.messages[0] as { summary?: string }).summary,
+      "second session emergency summary",
+    );
+    assert.equal(second.runtime.getDiagnostics().counters.critical_task_started, 1);
+  } finally {
+    resolveFirstResponse();
+    first.runtime.onSessionShutdown();
+    second.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(first.cwd, { recursive: true, force: true });
+    rmSync(second.cwd, { recursive: true, force: true });
+  }
+});
+
+test("foreground wait updates TUI working message and status timer and cleans up on completion", async () => {
+  let resolveStarted!: () => void;
+  let resolveResponse!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const responseGate = new Promise<void>((resolve) => {
+    resolveResponse = resolve;
+  });
+  const response: ResponseFactory = async () => {
+    resolveStarted();
+    await responseGate;
+    return fauxAssistantMessage("foreground timer summary");
+  };
+  const scenario = createScenario({ taskTimeoutMs: 500 }, response);
+  const workingMessages: Array<string | undefined> = [];
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const tuiCtx = {
+    ...scenario.ctx,
+    mode: "tui" as const,
+    hasUI: true,
+    ui: {
+      ...scenario.ctx.ui,
+      setWorkingMessage: (message?: string) => {
+        workingMessages.push(message);
+      },
+      setStatus: (key: string, text: string | undefined) => {
+        statuses.push({ key, text });
+      },
+    },
+    getContextUsage: () => ({
+      tokens: 80_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 80,
+    }),
+  } as unknown as ExtensionContext;
+
+  try {
+    const contextPromise = Promise.resolve(scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, tuiCtx));
+
+    await Promise.race([
+      started,
+      new Promise<void>((resolve) => setTimeout(resolve, 100)),
+    ]);
+    assert.ok(
+      workingMessages.some((msg) => typeof msg === "string" && msg.includes("pi-press 正在压缩 · 已等待")),
+    );
+    assert.ok(
+      statuses.some(
+        (entry) =>
+          entry.key === "pi-press" &&
+          typeof entry.text === "string" &&
+          entry.text.includes("pi-press 正在压缩 · 已等待"),
+      ),
+    );
+
+    resolveResponse();
+    await contextPromise;
+
+    assert.equal(workingMessages.at(-1), undefined);
+    assert.equal(statuses.at(-1)?.text, undefined);
+  } finally {
+    resolveResponse();
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("pressing Esc during foreground wait aborts current session compatible task but never aborts another session task", async () => {
+  let resolveOwnStarted!: () => void;
+  let resolveOwnResponse!: () => void;
+  const ownStarted = new Promise<void>((resolve) => {
+    resolveOwnStarted = resolve;
+  });
+  const ownGate = new Promise<void>((resolve) => {
+    resolveOwnResponse = resolve;
+  });
+  const ownScenario = createScenario({ taskTimeoutMs: 500 }, async () => {
+    resolveOwnStarted();
+    await ownGate;
+    return fauxAssistantMessage("own session summary");
+  });
+  const ownAbortController = new AbortController();
+  const workingMessages: Array<string | undefined> = [];
+  const ownCtx = {
+    ...ownScenario.ctx,
+    mode: "tui" as const,
+    hasUI: true,
+    signal: ownAbortController.signal,
+    ui: {
+      ...ownScenario.ctx.ui,
+      setWorkingMessage: (message?: string) => {
+        workingMessages.push(message);
+      },
+      setStatus: () => {},
+    },
+    getContextUsage: () => ({
+      tokens: 80_000,
+      contextWindow: ownScenario.ctx.model!.contextWindow,
+      percent: 80,
+    }),
+  } as unknown as ExtensionContext;
+
+  let resolveOtherResponse!: () => void;
+  const otherGate = new Promise<void>((resolve) => {
+    resolveOtherResponse = resolve;
+  });
+  const otherScenario = createScenario({ taskTimeoutMs: 500 }, async () => {
+    await otherGate;
+    return fauxAssistantMessage("other session summary");
+  });
+  const secondScenario = createScenario({ taskTimeoutMs: 500 });
+  const secondAbortController = new AbortController();
+  const secondCtx = {
+    ...secondScenario.ctx,
+    signal: secondAbortController.signal,
+    getContextUsage: () => ({
+      tokens: 80_000,
+      contextWindow: secondScenario.ctx.model!.contextWindow,
+      percent: 80,
+    }),
+  } as unknown as ExtensionContext;
+
+  try {
+    // Part 1: Esc on own session aborts own compatible task and cleans up UI.
+    const ownContextPromise = Promise.resolve(ownScenario.runtime.onContext({
+      type: "context",
+      messages: ownScenario.manager.buildSessionContext().messages,
+    }, ownCtx));
+    await Promise.race([
+      ownStarted,
+      new Promise<void>((resolve) => setTimeout(resolve, 100)),
+    ]);
+    ownAbortController.abort();
+    await ownContextPromise;
+    assert.equal(ownScenario.runtime.getDiagnostics().counters.foreground_wait_aborted, 1);
+    assert.equal(ownScenario.runtime.getDiagnostics().counters.task_discarded, 1);
+    assert.equal(workingMessages.at(-1), undefined);
+    resolveOwnResponse();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(ownScenario.appended.length, 0);
+
+    // Part 2: Esc while waiting for another session's background slot exits wait without aborting the other session's task.
+    otherScenario.runtime.onTurnEnd(otherScenario.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const secondContextPromise = Promise.resolve(secondScenario.runtime.onContext({
+      type: "context",
+      messages: secondScenario.manager.buildSessionContext().messages,
+    }, secondCtx));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    secondAbortController.abort();
+    await secondContextPromise;
+    assert.equal(secondScenario.runtime.getDiagnostics().counters.foreground_wait_aborted, 1);
+    assert.equal(otherScenario.runtime.getDiagnostics().counters.task_discarded ?? 0, 0);
+
+    resolveOtherResponse();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(otherScenario.appended.length, 1);
+  } finally {
+    resolveOwnResponse();
+    resolveOtherResponse();
+    ownScenario.runtime.onSessionShutdown();
+    otherScenario.runtime.onSessionShutdown();
+    secondScenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(ownScenario.cwd, { recursive: true, force: true });
+    rmSync(otherScenario.cwd, { recursive: true, force: true });
+    rmSync(secondScenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("retained giant tool result sends compressed projection when within contextWindow and aborts only when exceeding contextWindow", async () => {
+  // Part 1: 85,000-token tool result ("G".repeat(340_000)) -> compressed ~86k (> H 79,520, <= W 100,000) sends compressed projection.
+  const withinWindow = createScenario({ taskTimeoutMs: 500 });
+  withinWindow.faux.setResponses([
+    () => fauxAssistantMessage("history summary before 85k tool result"),
+    () => fauxAssistantMessage("turn prefix summary before 85k tool result"),
+  ]);
+  withinWindow.manager.appendMessage({
+    role: "assistant",
+    content: [
+      {
+        type: "toolCall",
+        id: "call-giant-85k",
+        name: "read",
+        arguments: { path: "giant-85k.txt" },
+      },
+    ],
+    api: "openai-responses",
+    provider: "faux",
+    model: "faux-1",
+    usage: {
+      input: 100,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 120,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "toolUse",
+    timestamp: Date.now(),
+  });
+  withinWindow.manager.appendMessage({
+    role: "toolResult",
+    toolCallId: "call-giant-85k",
+    toolName: "read",
+    content: [{ type: "text", text: "G".repeat(340_000) }],
+    isError: false,
+    timestamp: Date.now(),
+  });
+
+  let withinAborted = 0;
+  const withinCtx = {
+    ...withinWindow.ctx,
+    abort: () => {
+      withinAborted += 1;
+    },
+  } as unknown as ExtensionContext;
+
+  // Part 2: 110,000-token tool result ("G".repeat(440_000)) -> compressed ~111k (> W 100,000) aborts via ctx.abort.
+  const overWindow = createScenario({ taskTimeoutMs: 500 });
+  overWindow.faux.setResponses([
+    () => fauxAssistantMessage("history summary before 110k tool result"),
+    () => fauxAssistantMessage("turn prefix summary before 110k tool result"),
+  ]);
+  overWindow.manager.appendMessage({
+    role: "assistant",
+    content: [
+      {
+        type: "toolCall",
+        id: "call-giant-110k",
+        name: "read",
+        arguments: { path: "giant-110k.txt" },
+      },
+    ],
+    api: "openai-responses",
+    provider: "faux",
+    model: "faux-1",
+    usage: {
+      input: 100,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 120,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "toolUse",
+    timestamp: Date.now(),
+  });
+  overWindow.manager.appendMessage({
+    role: "toolResult",
+    toolCallId: "call-giant-110k",
+    toolName: "read",
+    content: [{ type: "text", text: "G".repeat(440_000) }],
+    isError: false,
+    timestamp: Date.now(),
+  });
+
+  let overAborted = 0;
+  const overCtx = {
+    ...overWindow.ctx,
+    abort: () => {
+      overAborted += 1;
+    },
+  } as unknown as ExtensionContext;
+
+  try {
+    const withinResult = await withinWindow.runtime.onContext({
+      type: "context",
+      messages: withinWindow.manager.buildSessionContext().messages,
+    }, withinCtx);
+    assert.equal(withinAborted, 0);
+    assert.equal(withinResult.messages[0]?.role, "compactionSummary");
+    assert.equal(withinWindow.runtime.getDiagnostics().counters.context_aborted_capacity ?? 0, 0);
+
+    await overWindow.runtime.onContext({
+      type: "context",
+      messages: overWindow.manager.buildSessionContext().messages,
+    }, overCtx);
+    assert.equal(overAborted, 1);
+    assert.equal(overWindow.runtime.getDiagnostics().counters.context_aborted_capacity, 1);
+  } finally {
+    withinWindow.runtime.onSessionShutdown();
+    overWindow.runtime.onSessionShutdown();
+    rmSync(withinWindow.cwd, { recursive: true, force: true });
+    rmSync(overWindow.cwd, { recursive: true, force: true });
+  }
+});
+
+test("foreground compaction loops for a second round when in-flight checkpoint at earlier leaf still exceeds hard limit", async () => {
+  let resolveFirstStarted!: () => void;
+  let resolveFirstGate!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    resolveFirstStarted = resolve;
+  });
+  const firstGate = new Promise<void>((resolve) => {
+    resolveFirstGate = resolve;
+  });
+  let callIndex = 0;
+  const scenario = createScenario({ taskTimeoutMs: 500 }, async () => {
+    callIndex += 1;
+    if (callIndex === 1) {
+      resolveFirstStarted();
+      await firstGate;
+      return fauxAssistantMessage("round 1 checkpoint at earlier leaf");
+    }
+    return fauxAssistantMessage("round 2 checkpoint at latest leaf");
+  });
+  scenario.faux.setResponses([
+    async () => {
+      callIndex += 1;
+      resolveFirstStarted();
+      await firstGate;
+      return fauxAssistantMessage("round 1 checkpoint at earlier leaf");
+    },
+    async () => {
+      callIndex += 1;
+      return fauxAssistantMessage("round 2 checkpoint at latest leaf");
+    },
+  ]);
+
+  try {
+    // Start task 1 at the initial branch leaf.
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await firstStarted;
+
+    // Append 65k tokens of new turns after task 1's snapshot leaf, plus a small final turn,
+    // so that after task 1 finishes, its projection (~22.5k + 65k = 87.5k > H 79,520) still exceeds H,
+    // while compacting again at the new leaf brings it well below H (~1k <= H).
+    scenario.manager.appendMessage(makeUserMessage("M".repeat(260_000)));
+    scenario.manager.appendMessage(makeUserMessage("final short turn"));
+
+    let aborted = 0;
+    const ctx = {
+      ...scenario.ctx,
+      abort: () => {
+        aborted += 1;
+      },
+    } as unknown as ExtensionContext;
+
+    const contextPromise = Promise.resolve(scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, ctx));
+
+    resolveFirstGate();
+    const result = await contextPromise;
+
+    assert.equal(aborted, 0);
+    assert.equal(scenario.appended.length, 2);
+    assert.equal(result.messages[0]?.role, "compactionSummary");
+    assert.equal(
+      (result.messages[0] as { summary?: string }).summary,
+      "round 2 checkpoint at latest leaf",
+    );
+  } finally {
+    resolveFirstGate();
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("foreground compaction retries up to 3 times on task failure before falling back by contextWindow rule", async () => {
+  let attempts = 0;
+  const scenario = createScenario({ taskTimeoutMs: 500 });
+  scenario.faux.setResponses([
+    async () => {
+      attempts += 1;
+      return fauxAssistantMessage("", { stopReason: "error", errorMessage: "auth failure 1" });
+    },
+    async () => {
+      attempts += 1;
+      return fauxAssistantMessage("", { stopReason: "error", errorMessage: "auth failure 2" });
+    },
+    async () => {
+      attempts += 1;
+      return fauxAssistantMessage("", { stopReason: "error", errorMessage: "auth failure 3" });
+    },
+    async () => {
+      attempts += 1;
+      return fauxAssistantMessage("", { stopReason: "error", errorMessage: "auth failure 4" });
+    },
+    async () => {
+      attempts += 1;
+      return fauxAssistantMessage("should not reach 5th attempt");
+    },
+  ]);
+
+  let aborted = 0;
+  const criticalWithinWindowCtx = {
+    ...scenario.ctx,
+    abort: () => {
+      aborted += 1;
+    },
+    getContextUsage: () => ({
+      tokens: 85_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 85,
+    }),
+  } as unknown as ExtensionContext;
+
+  try {
+    const sourceMessages = scenario.manager.buildSessionContext().messages;
+    const result = await scenario.runtime.onContext({
+      type: "context",
+      messages: sourceMessages,
+    }, criticalWithinWindowCtx);
+
+    // 1 initial attempt + 3 retries = 4 total attempts, then falls back to sending because 85,000 <= W (100,000).
+    assert.equal(attempts, 4);
+    assert.equal(aborted, 0);
+    assert.equal(result.messages, sourceMessages);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});

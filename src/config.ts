@@ -26,6 +26,7 @@ export const DEFAULT_CONFIG: PiPressConfig = {
   diagnosticsMaxDatabaseMiB: 64,
 };
 
+export const MAX_SOFT_THRESHOLD_PERCENT = 85;
 const CONFIG_FILE_NAME = "pi-press.json";
 const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
 
@@ -72,7 +73,7 @@ function isTimerDuration(value: unknown): value is number {
 }
 
 function isPercent(value: unknown): value is number {
-  return isFiniteNumber(value) && value >= 0 && value <= 100;
+  return isFiniteNumber(value) && value >= 0 && value <= MAX_SOFT_THRESHOLD_PERCENT;
 }
 
 function isMode(value: unknown): value is PrecomputeMode {

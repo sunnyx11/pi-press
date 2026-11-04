@@ -2,15 +2,25 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 import {
   buildSessionProjection,
+  calculateContextTokens,
   estimateTokens,
   sessionEntryToContextMessages,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
+  calculateContextCapacityLimits,
   checkpointToCompactionSummaryMessage,
   estimateVirtualCheckpointCapacity,
 } from "../checkpoint/capacity.js";
+import { isUsage } from "../checkpoint/schema.js";
+import { MAX_SOFT_THRESHOLD_PERCENT } from "../config.js";
 import type { CheckpointData } from "../types.js";
+
+export interface VirtualContextUsageBaseline {
+  appliedSinceLeafId: string;
+  appliedModelKey: string;
+  currentModelKey: string;
+}
 
 export interface VirtualContextProjectionInput {
   branch: readonly SessionEntry[];
@@ -20,6 +30,7 @@ export interface VirtualContextProjectionInput {
   reserveTokens: number;
   softThresholdPercent: number;
   cache?: VirtualContextProjectionCache;
+  usageBaseline?: VirtualContextUsageBaseline;
 }
 
 export interface VirtualContextProjection {
@@ -377,6 +388,105 @@ function makeUncachedSourceIndex(branch: readonly SessionEntry[]): CachedSourceI
   return { sourceMessages, sourceKeys: sourceKeys as string[] };
 }
 
+function sumEstimatedMessages(messages: readonly AgentMessage[]): number | undefined {
+  let total = 0;
+  for (const message of messages) {
+    const tokens = estimateMessageTokens(message);
+    if (tokens === undefined) {
+      return undefined;
+    }
+    total += tokens;
+  }
+  return total;
+}
+
+export function findLatestPostApplicationAssistantUsage(
+  branch: readonly SessionEntry[],
+  snapshotIndex: number,
+  usageBaseline: VirtualContextUsageBaseline | undefined,
+): { branchIndex: number; usageTokens: number } | undefined {
+  if (!usageBaseline || usageBaseline.appliedModelKey !== usageBaseline.currentModelKey) {
+    return undefined;
+  }
+  const appliedSinceIndex = branch.findIndex(
+    (entry) => entry.id === usageBaseline.appliedSinceLeafId,
+  );
+  if (appliedSinceIndex < 0 || snapshotIndex < 0) {
+    return undefined;
+  }
+  const minIndex = Math.max(appliedSinceIndex, snapshotIndex);
+  let latestInvalidatingIndex = -1;
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index]!;
+    if (entry.type === "compaction" || entry.type === "context_edit") {
+      latestInvalidatingIndex = index;
+      break;
+    }
+  }
+  for (let index = branch.length - 1; index > minIndex; index -= 1) {
+    if (index <= latestInvalidatingIndex) {
+      return undefined;
+    }
+    const entry = branch[index]!;
+    if (entry.type !== "message" || entry.message.role !== "assistant") {
+      continue;
+    }
+    const assistant = entry.message;
+    if (assistant.stopReason === "aborted" || assistant.stopReason === "error") {
+      return undefined;
+    }
+    if (
+      typeof assistant.provider === "string" &&
+      typeof assistant.model === "string" &&
+      `${assistant.provider}/${assistant.model}` !== usageBaseline.currentModelKey
+    ) {
+      return undefined;
+    }
+    if (!isUsage(assistant.usage)) {
+      return undefined;
+    }
+    const usageTokens = calculateContextTokens(assistant.usage);
+    if (!Number.isFinite(usageTokens) || usageTokens <= 0) {
+      return undefined;
+    }
+    return { branchIndex: index, usageTokens };
+  }
+  return undefined;
+}
+
+/** 计算已应用 checkpoint 在同前缀真实响应基线下的当前分支 token 数。 */
+export function estimateAppliedCheckpointBranchTokens(
+  branch: readonly SessionEntry[],
+  checkpoint: CheckpointData,
+  usageBaseline: VirtualContextUsageBaseline | undefined,
+  cache?: VirtualContextProjectionCache,
+): number | undefined {
+  const snapshotIndex = branch.findIndex((entry) => entry.id === checkpoint.snapshotLeafId);
+  if (snapshotIndex < 0) {
+    return undefined;
+  }
+  const anchor = findLatestPostApplicationAssistantUsage(
+    branch,
+    snapshotIndex,
+    usageBaseline,
+  );
+  if (!anchor) {
+    return undefined;
+  }
+  const trailingTokens =
+    cache?.estimateTokensAfter(branch, anchor.branchIndex) ??
+    sumEstimatedMessages(
+      branch
+        .slice(anchor.branchIndex + 1)
+        .flatMap((entry) => sessionEntryToContextMessages(entry)),
+    );
+  const systemGrowth = estimateSystemTokenGrowth(branch, anchor.branchIndex);
+  if (trailingTokens === undefined || systemGrowth === undefined) {
+    return undefined;
+  }
+  return anchor.usageTokens + trailingTokens + systemGrowth;
+}
+
 export type VirtualContextProjectionUnavailableReason =
   | "invalid_projection_input"
   | "source_index_unavailable"
@@ -396,7 +506,12 @@ export type VirtualContextProjectionAttempt =
     sourceMessageCount?: number;
     eventMessageCount?: number;
   }
-  | { status: "hard-limit"; estimatedTokens: number; hardLimit: number };
+  | {
+    status: "hard-limit";
+    estimatedTokens: number;
+    hardLimit: number;
+    projection: VirtualContextProjection;
+  };
 
 /**
  * 将有效 checkpoint 投影为当前 provider 请求使用的虚拟上下文，并保留容量拒绝原因。
@@ -412,6 +527,7 @@ export function tryProjectCheckpointToVirtualContext(
     reserveTokens,
     softThresholdPercent,
     cache,
+    usageBaseline,
   } = input;
   if (
     !Number.isFinite(contextWindow) ||
@@ -420,7 +536,7 @@ export function tryProjectCheckpointToVirtualContext(
     reserveTokens < 0 ||
     !Number.isFinite(softThresholdPercent) ||
     softThresholdPercent < 0 ||
-    softThresholdPercent > 100
+    softThresholdPercent > MAX_SOFT_THRESHOLD_PERCENT
   ) {
     return { status: "unavailable", reason: "invalid_projection_input" };
   }
@@ -552,7 +668,7 @@ export function tryProjectCheckpointToVirtualContext(
   if (systemTokenGrowth === undefined) {
     return { status: "unavailable", reason: "capacity_estimate_unavailable" };
   }
-  const capacity = estimateVirtualCheckpointCapacity(
+  let capacity = estimateVirtualCheckpointCapacity(
     checkpoint,
     additionalMessages,
     contextWindow,
@@ -563,23 +679,76 @@ export function tryProjectCheckpointToVirtualContext(
   if (!capacity) {
     return { status: "unavailable", reason: "capacity_estimate_unavailable" };
   }
+  const usageAnchor = findLatestPostApplicationAssistantUsage(
+    branch,
+    snapshotIndex,
+    usageBaseline,
+  );
+  if (usageAnchor) {
+    let lastAssistantEventIndex = -1;
+    for (let sourceIndex = 0; sourceIndex < sourceMessages.length; sourceIndex += 1) {
+      const eventIndex = earliestMatches[sourceIndex];
+      if (
+        sourceMessages[sourceIndex]!.branchIndex <= usageAnchor.branchIndex &&
+        eventIndex !== undefined
+      ) {
+        lastAssistantEventIndex = Math.max(lastAssistantEventIndex, eventIndex);
+      }
+    }
+    if (lastAssistantEventIndex >= 0) {
+      const unsentStart = lastAssistantEventIndex + 1;
+      const unsentMessages = [
+        ...eventMessages
+          .slice(0, unsentStart)
+          .filter((_message, eventIndex) => !matchedSourceByEvent.has(eventIndex)),
+        ...eventMessages.slice(unsentStart),
+      ];
+      const unsentTokens = sumEstimatedMessages(unsentMessages);
+      const postAssistantSystemGrowth = estimateSystemTokenGrowth(
+        branch,
+        usageAnchor.branchIndex,
+      );
+      const limits = calculateContextCapacityLimits(
+        contextWindow,
+        reserveTokens,
+        softThresholdPercent,
+      );
+      if (
+        unsentTokens === undefined ||
+        postAssistantSystemGrowth === undefined ||
+        !limits
+      ) {
+        return { status: "unavailable", reason: "capacity_estimate_unavailable" };
+      }
+      const anchoredTokens =
+        usageAnchor.usageTokens + unsentTokens + postAssistantSystemGrowth;
+      capacity = {
+        estimatedTokens: anchoredTokens,
+        hardLimit: limits.hardLimit,
+        refreshLimit: limits.refreshLimit,
+        needsRefresh: anchoredTokens >= limits.refreshLimit,
+      };
+    }
+  }
+  const projection: VirtualContextProjection = {
+    messages,
+    estimatedTokens: capacity.estimatedTokens,
+    hardLimit: capacity.hardLimit,
+    refreshLimit: capacity.refreshLimit,
+    needsRefresh: capacity.needsRefresh,
+  };
   if (capacity.estimatedTokens > capacity.hardLimit) {
     return {
       status: "hard-limit",
       estimatedTokens: capacity.estimatedTokens,
       hardLimit: capacity.hardLimit,
+      projection,
     };
   }
 
   return {
     status: "projected",
-    projection: {
-      messages,
-      estimatedTokens: capacity.estimatedTokens,
-      hardLimit: capacity.hardLimit,
-      refreshLimit: capacity.refreshLimit,
-      needsRefresh: capacity.needsRefresh,
-    },
+    projection,
   };
 }
 

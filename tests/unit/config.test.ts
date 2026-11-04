@@ -61,9 +61,13 @@ test("summary thinking participates in checkpoint identity", () => {
   assert.notEqual(configFingerprint(low), configFingerprint(inherit));
 });
 
-test("normalizeConfig falls back per invalid field", () => {
+test("normalizeConfig falls back per invalid field and enforces the 85 percent ceiling", () => {
+  const validEdge = normalizeConfig({ softThresholdPercent: 85 });
+  assert.equal(validEdge.config.softThresholdPercent, 85);
+  assert.deepEqual(validEdge.diagnostics, []);
+
   const result = normalizeConfig({
-    softThresholdPercent: 101,
+    softThresholdPercent: 86,
     taskTimeoutMs: 0,
     precomputeMode: "threshold-and-manual",
   });
@@ -94,12 +98,12 @@ test("loadConfig merges global config before project overrides", () => {
     );
     writeFileSync(
       join(projectDir, ".pi", "pi-press.json"),
-      JSON.stringify({ softThresholdPercent: 90 }),
+      JSON.stringify({ softThresholdPercent: 85 }),
     );
 
     const result = loadConfig(projectDir, globalDir);
 
-    assert.equal(result.config.softThresholdPercent, 90);
+    assert.equal(result.config.softThresholdPercent, 85);
     assert.equal(result.config.hookWaitTimeoutMs, DEFAULT_CONFIG.hookWaitTimeoutMs);
     assert.deepEqual(result.diagnostics, []);
   } finally {

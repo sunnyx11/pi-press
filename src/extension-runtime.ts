@@ -1,12 +1,21 @@
 import { randomUUID } from "node:crypto";
 import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import {
+  contentText,
+  getCurrentSystemMessage,
+  isRetryableAssistantError,
+  type Api,
+  type Model,
+} from "@earendil-works/pi-ai";
 import {
   VERSION,
+  buildSessionProjection,
   compact,
+  estimateTokens,
   sessionEntryToContextMessages,
   type CompactionResult,
   type ContextEvent,
+  type ContextWithSystemEvent,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
@@ -15,6 +24,7 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
+  calculateContextCapacityLimits,
   calculateCriticalWaitTokens,
   estimateCheckpointCapacity,
 } from "./checkpoint/capacity.js";
@@ -47,10 +57,12 @@ import {
   calculateOriginalTokensBefore,
 } from "./compaction/reuse.js";
 import {
+  estimateAppliedCheckpointBranchTokens,
   tryProjectCheckpointToVirtualContext,
   VirtualContextProjectionCache,
 } from "./compaction/virtual-context.js";
 import {
+  CHECKPOINT_KEEP_RECENT_TOKENS,
   createCheckpointPreparationSettings,
   createFormalizationPreparationSettings,
   estimateMessagesTokens,
@@ -92,6 +104,12 @@ type ModelRegistry = ExtensionContext["modelRegistry"];
 
 type BackgroundTaskStage = "preparation" | "auth" | "history_summary" | "turn_prefix_summary" | "retry_backoff" | "checkpoint";
 
+type TaskFailureKind =
+  | "transient_error"
+  | "empty_summary"
+  | "invalid_summary"
+  | "deterministic_error";
+
 type BackgroundTask = {
   taskId: string;
   stage: BackgroundTaskStage;
@@ -111,10 +129,12 @@ type BackgroundTask = {
   config: PiPressConfig;
   controller: AbortController;
   startedAt: number;
+  keepRecentTokens?: number;
   firstKeptEntryId?: string;
   parentCheckpoint?: CheckpointData;
   promise?: Promise<void>;
   discarded: boolean;
+  failureKind?: TaskFailureKind | undefined;
 };
 
 type CheckpointClaim = {
@@ -127,7 +147,9 @@ type VirtualApplication = {
   checkpointId: string;
   sessionId: string;
   epochCompactionId: string | null;
+  firstAppliedLeafId: string;
   lastAppliedLeafId: string;
+  modelKey: string;
   refreshRequested: boolean;
 };
 
@@ -156,6 +178,28 @@ type DeferredFormalization = {
   sessionId: string;
   epochCompactionId: string | null;
   checkedLeafId: string;
+};
+
+type LastContextEvaluation = {
+  runEpoch: number;
+  sessionId: string;
+  epochCompactionId: string | null;
+  leafId: string | null;
+  conversationMessages: ContextEvent["messages"];
+  conversationEstimatedTokens: number;
+  countedSystemTokens: number;
+  hardLimit: number;
+  refreshLimit: number;
+  foregroundAttempted: boolean;
+  aborted: boolean;
+};
+
+type ForegroundWaitProgressHandle = {
+  runEpoch: number;
+  closed: boolean;
+  timer?: NodeJS.Timeout | undefined;
+  refresh: () => void;
+  cleanup: () => void;
 };
 
 type WaitOutcome = "finished" | "timeout" | "aborted";
@@ -223,6 +267,57 @@ function sanitizeProvenanceBaseUrl(baseUrl: string): string | undefined {
   }
 }
 
+function isProjectTrustedContext(ctx: ExtensionContext): boolean {
+  return typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : true;
+}
+
+function hasContextSourceProgressAfter(
+  branch: readonly SessionEntry[],
+  afterIndex: number,
+): boolean {
+  for (let index = afterIndex + 1; index < branch.length; index += 1) {
+    const entry = branch[index];
+    if (!entry) {
+      continue;
+    }
+    if (entry.type === "context_edit" || sessionEntryToContextMessages(entry).length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasInvalidatingEntryAfterLastAssistant(branch: readonly SessionEntry[]): boolean {
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index];
+    if (!entry) {
+      continue;
+    }
+    if (entry.type === "context_edit" || entry.type === "compaction") {
+      return true;
+    }
+    if (
+      entry.type === "message" &&
+      entry.message.role === "assistant" &&
+      entry.message.stopReason !== "aborted" &&
+      entry.message.stopReason !== "error"
+    ) {
+      return false;
+    }
+  }
+  return false;
+}
+
+function estimateContextMessagesTokens(
+  messages: readonly ContextEvent["messages"][number][],
+): number {
+  let total = 0;
+  for (const message of messages) {
+    total += estimateTokens(message);
+  }
+  return total;
+}
+
 /** 管理单个扩展实例的 session 状态、后台摘要任务和 checkpoint 复用。 */
 export class ExtensionRuntime {
   private readonly diagnostics: Diagnostics;
@@ -245,7 +340,11 @@ export class ExtensionRuntime {
   private formalizationSchedule: FormalizationSchedule | undefined;
   private pendingFormalization: PendingFormalization | undefined;
   private deferredFormalization: DeferredFormalization | undefined;
+  private lastContextEvaluation: LastContextEvaluation | undefined;
+  private activeForegroundWait: ForegroundWaitProgressHandle | undefined;
   private readonly virtualContextCache = new VirtualContextProjectionCache();
+  private readonly recordedTranscriptDeltas = new Map<string, number>();
+  private lastUnpersistedCandidate: { sessionId: string; candidate: CheckpointData } | undefined;
 
   constructor(
     private readonly pi: Pick<ExtensionAPI, "appendEntry">,
@@ -302,6 +401,35 @@ export class ExtensionRuntime {
     }
   }
 
+  onContextWithSystem(
+    event: ContextWithSystemEvent,
+    ctx: ExtensionContext,
+  ):
+    | Pick<ContextWithSystemEvent, "messages">
+    | undefined
+    | Promise<Pick<ContextWithSystemEvent, "messages"> | undefined> {
+    try {
+      const result = this.verifyContextWithSystem(event, ctx);
+      return result instanceof Promise
+        ? result.catch((error: unknown) => {
+          this.diagnostics.count("virtual_failed");
+          this.diagnostics.record(
+            "checkpoint",
+            `完整上下文复核失败：${describeError(error)}`,
+          );
+          return undefined;
+        })
+        : result;
+    } catch (error: unknown) {
+      this.diagnostics.count("virtual_failed");
+      this.diagnostics.record(
+        "checkpoint",
+        `完整上下文复核失败：${describeError(error)}`,
+      );
+      return undefined;
+    }
+  }
+
   private handleVirtualContextError(
     event: ContextEvent,
     error: unknown,
@@ -335,6 +463,7 @@ export class ExtensionRuntime {
     if (this.isFormalizationExhausted(sessionId, epochCompactionId)) {
       return { messages: event.messages };
     }
+    const compatibleTaskBeforeCheck = this.findCompatibleTask(ctx);
     const candidates = findReadyCheckpointCandidates(
       branch,
       sessionId,
@@ -345,25 +474,76 @@ export class ExtensionRuntime {
       this.virtualApplication &&
       (this.virtualApplication.sessionId !== sessionId ||
         this.virtualApplication.epochCompactionId !== epochCompactionId ||
+        getEntryIndex(branch, this.virtualApplication.firstAppliedLeafId) < 0 ||
         getEntryIndex(branch, this.virtualApplication.lastAppliedLeafId) < 0)
     ) {
       this.virtualApplication = undefined;
       this.deferredFormalization = undefined;
     }
 
+    const modelKey = `${model.provider}/${model.id}`;
+    const deltaKey = `${sessionId}:${modelKey}`;
+    const deltaD = this.recordedTranscriptDeltas.get(deltaKey) ?? 0;
+    const reserveTokens = loadPiCompactionReserveTokens(
+      ctx.cwd,
+      isProjectTrustedContext(ctx),
+      model,
+    );
+    const limits = calculateContextCapacityLimits(
+      model.contextWindow,
+      reserveTokens,
+      this.currentConfig.softThresholdPercent,
+    );
+    const rawEstimate = this.estimateRawCandidateTokens(event.messages, branch, ctx);
+    const effectiveRawTokens = rawEstimate.totalTokens + deltaD;
+    const rawHardLimitExceeded = limits !== undefined && effectiveRawTokens > limits.hardLimit;
+
     let hardLimitExceeded = false;
+    let bestFallbackProjection: { messages: ContextEvent["messages"]; tokens: number } | undefined;
+
     for (const candidate of candidates) {
+      const previousApplication = this.virtualApplication;
+      const sameApplicationPrefix = Boolean(
+        previousApplication &&
+        previousApplication.checkpointId === candidate.data.checkpointId &&
+        previousApplication.sessionId === sessionId &&
+        previousApplication.epochCompactionId === epochCompactionId &&
+        previousApplication.modelKey === modelKey &&
+        getEntryIndex(branch, previousApplication.firstAppliedLeafId) >= 0,
+      );
       const attempt = tryProjectCheckpointToVirtualContext({
         branch,
         eventMessages: event.messages,
         checkpoint: candidate.data,
         contextWindow: model.contextWindow,
-        reserveTokens: loadPiCompactionReserveTokens(ctx.cwd, ctx.isProjectTrusted(), model),
+        reserveTokens,
         softThresholdPercent: this.currentConfig.softThresholdPercent,
         cache: this.virtualContextCache,
+        ...(sameApplicationPrefix
+          ? {
+            usageBaseline: {
+              appliedSinceLeafId: previousApplication!.firstAppliedLeafId,
+              appliedModelKey: previousApplication!.modelKey,
+              currentModelKey: modelKey,
+            },
+          }
+          : {}),
       });
       if (attempt.status === "hard-limit") {
         hardLimitExceeded = true;
+        this.diagnostics.count("virtual_skipped_hard_limit");
+        const candidateEffectiveTokens = attempt.estimatedTokens + deltaD;
+        if (
+          effectiveRawTokens > model.contextWindow &&
+          candidateEffectiveTokens <= model.contextWindow
+        ) {
+          if (!bestFallbackProjection || candidateEffectiveTokens < bestFallbackProjection.tokens) {
+            bestFallbackProjection = {
+              messages: attempt.projection.messages,
+              tokens: candidateEffectiveTokens,
+            };
+          }
+        }
         this.diagnostics.count("virtual_projection_hard_limit", {
           checkpointId: candidate.data.checkpointId,
           reason: "hard_limit_exceeded",
@@ -390,6 +570,24 @@ export class ExtensionRuntime {
         continue;
       }
       const projection = attempt.projection;
+      const candidateEffectiveTokens = projection.estimatedTokens + deltaD;
+      if (limits && candidateEffectiveTokens > limits.hardLimit) {
+        hardLimitExceeded = true;
+        this.diagnostics.count("virtual_skipped_hard_limit");
+        if (
+          effectiveRawTokens > model.contextWindow &&
+          candidateEffectiveTokens <= model.contextWindow
+        ) {
+          if (!bestFallbackProjection || candidateEffectiveTokens < bestFallbackProjection.tokens) {
+            bestFallbackProjection = {
+              messages: projection.messages,
+              tokens: candidateEffectiveTokens,
+            };
+          }
+        }
+        continue;
+      }
+
       const leafId = ctx.sessionManager.getLeafId();
       if (!leafId) {
         this.diagnostics.count("virtual_skipped_empty_branch");
@@ -404,7 +602,6 @@ export class ExtensionRuntime {
       ) {
         this.deferredFormalization = undefined;
       }
-      const previousApplication = this.virtualApplication;
       const refreshRequested = projection.needsRefresh || Boolean(
         previousApplication &&
         previousApplication.checkpointId === candidate.data.checkpointId &&
@@ -416,8 +613,25 @@ export class ExtensionRuntime {
         checkpointId: candidate.data.checkpointId,
         sessionId,
         epochCompactionId,
+        firstAppliedLeafId: sameApplicationPrefix
+          ? previousApplication!.firstAppliedLeafId
+          : leafId,
         lastAppliedLeafId: leafId,
+        modelKey,
         refreshRequested,
+      };
+      this.lastContextEvaluation = {
+        runEpoch: this.runEpoch,
+        sessionId,
+        epochCompactionId,
+        leafId,
+        conversationMessages: projection.messages,
+        conversationEstimatedTokens: candidateEffectiveTokens,
+        countedSystemTokens: rawEstimate.countedSystemTokens,
+        hardLimit: projection.hardLimit,
+        refreshLimit: projection.refreshLimit,
+        foregroundAttempted: !allowWait,
+        aborted: false,
       };
       this.diagnostics.count("virtual_applied", {
         checkpointId: candidate.data.checkpointId,
@@ -440,21 +654,41 @@ export class ExtensionRuntime {
       return { messages: projection.messages };
     }
 
-    if (allowWait && this.isCriticalWaitRequired(ctx)) {
-      let task = this.findCompatibleTask(ctx);
-      if (!task) {
-        task = this.startBackgroundTaskIfEligible(ctx, true);
-        if (task) {
-          this.diagnostics.count("critical_task_started");
+    if (this.lastUnpersistedCandidate && this.lastUnpersistedCandidate.sessionId === sessionId) {
+      const attempt = tryProjectCheckpointToVirtualContext({
+        branch,
+        eventMessages: event.messages,
+        checkpoint: this.lastUnpersistedCandidate.candidate,
+        contextWindow: model.contextWindow,
+        reserveTokens,
+        softThresholdPercent: this.currentConfig.softThresholdPercent,
+        cache: this.virtualContextCache,
+      });
+      if (attempt.status === "projected" || attempt.status === "hard-limit") {
+        const candidateTokens = (attempt.status === "projected"
+          ? attempt.projection.estimatedTokens
+          : attempt.estimatedTokens) + deltaD;
+        if (candidateTokens <= model.contextWindow) {
+          if (!bestFallbackProjection || candidateTokens < bestFallbackProjection.tokens) {
+            bestFallbackProjection = {
+              messages: attempt.projection.messages,
+              tokens: candidateTokens,
+            };
+          }
         }
-      }
-      if (task) {
-        return this.waitForCriticalCheckpoint(event, ctx, task);
       }
     }
 
-    if (hardLimitExceeded && allowWait && this.currentConfig.hookWaitTimeoutMs > 0) {
-      const task = this.findCompatibleTask(ctx);
+    const usageInvalidated = hasInvalidatingEntryAfterLastAssistant(branch);
+    const usageCritical = !usageInvalidated && this.isCriticalWaitRequired(ctx);
+
+    if (
+      hardLimitExceeded &&
+      allowWait &&
+      !usageCritical &&
+      this.currentConfig.hookWaitTimeoutMs > 0
+    ) {
+      const task = compatibleTaskBeforeCheck ?? this.findCompatibleTask(ctx);
       if (task) {
         return this.waitForVirtualRefresh(
           event,
@@ -464,11 +698,625 @@ export class ExtensionRuntime {
         );
       }
     }
+
+    if (allowWait && (usageCritical || rawHardLimitExceeded || hardLimitExceeded)) {
+      return this.runForegroundCompactionLoop(
+        event,
+        ctx,
+        sessionId,
+        epochCompactionId,
+        model,
+        modelKey,
+        reserveTokens,
+        limits,
+        rawEstimate,
+        deltaD,
+        compatibleTaskBeforeCheck,
+        bestFallbackProjection,
+      );
+    }
+
+    const bestTokens = bestFallbackProjection
+      ? bestFallbackProjection.tokens
+      : effectiveRawTokens;
+
+    if (!allowWait && (rawHardLimitExceeded || hardLimitExceeded)) {
+      if (hardLimitExceeded) {
+        this.diagnostics.count("virtual_skipped_hard_limit");
+      }
+      if (bestTokens <= model.contextWindow) {
+        this.recordUnappliedContextEvaluation(
+          sessionId,
+          epochCompactionId,
+          ctx.sessionManager.getLeafId(),
+          event.messages,
+          rawEstimate,
+          limits,
+          true,
+          false,
+        );
+        this.diagnostics.count("virtual_skipped");
+        return {
+          messages: bestFallbackProjection ? bestFallbackProjection.messages : event.messages,
+        };
+      }
+      this.abortContextForCapacityFailure(
+        ctx,
+        "still_exceeds_hard_limit",
+        bestTokens,
+        limits?.hardLimit,
+      );
+      this.recordUnappliedContextEvaluation(
+        sessionId,
+        epochCompactionId,
+        ctx.sessionManager.getLeafId(),
+        event.messages,
+        rawEstimate,
+        limits,
+        true,
+        true,
+      );
+      this.diagnostics.count("virtual_skipped");
+      return { messages: event.messages };
+    }
+
+    this.recordUnappliedContextEvaluation(
+      sessionId,
+      epochCompactionId,
+      ctx.sessionManager.getLeafId(),
+      event.messages,
+      rawEstimate,
+      limits,
+      !allowWait,
+      false,
+    );
     if (hardLimitExceeded) {
       this.diagnostics.count("virtual_skipped_hard_limit");
     }
     this.diagnostics.count("virtual_skipped");
     return { messages: event.messages };
+  }
+
+  private async runForegroundCompactionLoop(
+    event: ContextEvent,
+    ctx: ExtensionContext,
+    sessionId: string,
+    epochCompactionId: string | null,
+    model: Model<Api>,
+    modelKey: string,
+    reserveTokens: number,
+    limits: ReturnType<typeof calculateContextCapacityLimits>,
+    rawEstimate: { totalTokens: number; countedSystemTokens: number },
+    deltaD: number,
+    initialTask: BackgroundTask | undefined,
+    initialBestFallback: { messages: ContextEvent["messages"]; tokens: number } | undefined,
+  ): Promise<Pick<ContextEvent, "messages">> {
+    const MAX_FOREGROUND_RETRIES = 3;
+    let foregroundRetries = 0;
+    const waitStartedAt = Date.now();
+    const deadline = waitStartedAt + this.currentConfig.taskTimeoutMs;
+    const signal = this.getForegroundSignal(ctx);
+
+    let progressTask: BackgroundTask | undefined = initialTask ?? this.findCompatibleTask(ctx);
+    const progress = this.startForegroundWaitProgress(
+      ctx,
+      () => progressTask,
+      waitStartedAt,
+      () => foregroundRetries,
+    );
+    let bestFallbackProjection = initialBestFallback;
+    let lastFailureReason: string | undefined;
+
+    try {
+      while (true) {
+        if (signal.aborted) {
+          this.diagnostics.count("foreground_wait_aborted");
+          if (
+            progressTask &&
+            progressTask.sessionId === sessionId &&
+            progressTask.runEpoch === this.runEpoch
+          ) {
+            this.discardTask(progressTask, "user_aborted");
+          }
+          break;
+        }
+
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          this.diagnostics.count("critical_wait_timed_out");
+          lastFailureReason = "critical_wait_timeout";
+          break;
+        }
+
+        let task =
+          progressTask && !progressTask.discarded && progressTask.runEpoch === this.runEpoch
+            ? progressTask
+            : this.findCompatibleTask(ctx);
+
+        if (!task) {
+          while (this.hasExternalBackgroundOperation()) {
+            const slotRemaining = deadline - Date.now();
+            if (slotRemaining <= 0) {
+              this.diagnostics.count("critical_wait_timed_out");
+              lastFailureReason = "external_slot_timeout";
+              break;
+            }
+            const active = sharedRuntimeState.activeBackgroundOperation;
+            if (!active) {
+              break;
+            }
+            const slotOutcome = await this.waitForPromiseWithSignal(
+              active,
+              slotRemaining,
+              signal,
+            );
+            if (slotOutcome === "aborted") {
+              this.diagnostics.count("foreground_wait_aborted");
+              break;
+            }
+            if (slotOutcome === "timeout") {
+              this.diagnostics.count("critical_wait_timed_out");
+              lastFailureReason = "external_slot_timeout";
+              break;
+            }
+          }
+          if (signal.aborted || lastFailureReason) {
+            break;
+          }
+
+          const currentBranch = ctx.sessionManager.getBranch();
+          const currentCandidates = findReadyCheckpointCandidates(
+            currentBranch,
+            sessionId,
+            epochCompactionId,
+            this.checkpointClaim?.checkpointId,
+          );
+          const newestCandidate = currentCandidates[0];
+
+          let prep = prepareCompactionFromBranch(
+            currentBranch,
+            createCheckpointPreparationSettings(reserveTokens),
+            newestCandidate?.data,
+          );
+          let keepTokensToUse = CHECKPOINT_KEEP_RECENT_TOKENS;
+          if (!prep && newestCandidate) {
+            prep = prepareCompactionFromBranch(
+              currentBranch,
+              createCheckpointPreparationSettings(reserveTokens, 1),
+              newestCandidate.data,
+            );
+            keepTokensToUse = 1;
+          }
+
+          if (!prep) {
+            lastFailureReason = "no_compaction_boundary";
+            break;
+          }
+
+          task = this.startBackgroundTaskIfEligible(ctx, true, {
+            force: true,
+            keepRecentTokens: keepTokensToUse,
+            parentCheckpoint: newestCandidate?.data,
+          });
+          if (task) {
+            this.diagnostics.count("critical_task_started");
+          } else {
+            lastFailureReason = "critical_task_start_failed";
+            break;
+          }
+        }
+
+        progressTask = task;
+        this.diagnostics.count("critical_wait_started");
+        const taskTimeout = Math.min(deadline - Date.now(), this.remainingTaskTime(task));
+        const waitOutcome = await this.waitForTask(task, taskTimeout, signal);
+
+        if (waitOutcome === "aborted") {
+          this.diagnostics.count("foreground_wait_aborted");
+          if (task.sessionId === sessionId && task.runEpoch === this.runEpoch) {
+            this.discardTask(task, "user_aborted");
+          }
+          break;
+        }
+
+        if (
+          waitOutcome === "timeout" ||
+          task.failureKind ||
+          task.controller.signal.aborted ||
+          task.discarded
+        ) {
+          if (waitOutcome === "timeout") {
+            this.diagnostics.count("critical_wait_timed_out");
+          }
+          progressTask = undefined;
+          foregroundRetries += 1;
+          if (foregroundRetries > MAX_FOREGROUND_RETRIES) {
+            lastFailureReason = "foreground_retries_exhausted";
+            break;
+          }
+          continue;
+        }
+
+        if (waitOutcome === "finished") {
+          this.diagnostics.count("critical_waited");
+          const currentBranch = ctx.sessionManager.getBranch();
+          const currentCandidates = findReadyCheckpointCandidates(
+            currentBranch,
+            sessionId,
+            epochCompactionId,
+            this.checkpointClaim?.checkpointId,
+          );
+          let appliedProjection: ContextEvent["messages"] | undefined;
+
+          for (const candidate of currentCandidates) {
+            const attempt = tryProjectCheckpointToVirtualContext({
+              branch: currentBranch,
+              eventMessages: event.messages,
+              checkpoint: candidate.data,
+              contextWindow: model.contextWindow,
+              reserveTokens,
+              softThresholdPercent: this.currentConfig.softThresholdPercent,
+              cache: this.virtualContextCache,
+            });
+            if (attempt.status === "projected") {
+              const tokens = attempt.projection.estimatedTokens + deltaD;
+              if (limits && tokens <= limits.hardLimit) {
+                appliedProjection = attempt.projection.messages;
+                const leafId = ctx.sessionManager.getLeafId();
+                if (leafId) {
+                  this.virtualApplication = {
+                    checkpointId: candidate.data.checkpointId,
+                    sessionId,
+                    epochCompactionId,
+                    firstAppliedLeafId: leafId,
+                    lastAppliedLeafId: leafId,
+                    modelKey,
+                    refreshRequested: attempt.projection.needsRefresh,
+                  };
+                }
+                break;
+              } else if (tokens <= model.contextWindow) {
+                if (!bestFallbackProjection || tokens < bestFallbackProjection.tokens) {
+                  bestFallbackProjection = { messages: attempt.projection.messages, tokens };
+                }
+              }
+            } else if (attempt.status === "hard-limit") {
+              const tokens = attempt.estimatedTokens + deltaD;
+              if (tokens <= model.contextWindow) {
+                if (!bestFallbackProjection || tokens < bestFallbackProjection.tokens) {
+                  bestFallbackProjection = { messages: attempt.projection.messages, tokens };
+                }
+              }
+            }
+          }
+
+          if (appliedProjection) {
+            return { messages: appliedProjection };
+          }
+
+          if (
+            this.lastUnpersistedCandidate &&
+            this.lastUnpersistedCandidate.sessionId === sessionId
+          ) {
+            const attempt = tryProjectCheckpointToVirtualContext({
+              branch: currentBranch,
+              eventMessages: event.messages,
+              checkpoint: this.lastUnpersistedCandidate.candidate,
+              contextWindow: model.contextWindow,
+              reserveTokens,
+              softThresholdPercent: this.currentConfig.softThresholdPercent,
+              cache: this.virtualContextCache,
+            });
+            if (attempt.status === "projected" || attempt.status === "hard-limit") {
+              const tokens =
+                (attempt.status === "projected"
+                  ? attempt.projection.estimatedTokens
+                  : attempt.estimatedTokens) + deltaD;
+              if (tokens <= model.contextWindow) {
+                if (!bestFallbackProjection || tokens < bestFallbackProjection.tokens) {
+                  bestFallbackProjection = { messages: attempt.projection.messages, tokens };
+                }
+              }
+            }
+          }
+
+          const newestCandidate = currentCandidates[0];
+          const canAdvance =
+            newestCandidate &&
+            this.canAdvanceCompaction(currentBranch, reserveTokens, newestCandidate.data);
+          if (canAdvance) {
+            progressTask = undefined;
+            continue;
+          } else {
+            break;
+          }
+        }
+      }
+    } finally {
+      progress.cleanup();
+    }
+
+    const bestTokens = bestFallbackProjection
+      ? bestFallbackProjection.tokens
+      : rawEstimate.totalTokens + deltaD;
+
+    if (bestTokens <= model.contextWindow) {
+      if (bestFallbackProjection) {
+        return { messages: bestFallbackProjection.messages };
+      }
+      this.diagnostics.count("virtual_skipped");
+      return { messages: event.messages };
+    }
+
+    this.abortContextForCapacityFailure(
+      ctx,
+      lastFailureReason ?? "context_window_exceeded",
+      bestTokens,
+      limits?.hardLimit,
+    );
+    this.diagnostics.count("virtual_skipped");
+    return { messages: event.messages };
+  }
+
+  private canAdvanceCompaction(
+    branch: readonly SessionEntry[],
+    reserveTokens: number,
+    parentCheckpoint: CheckpointData,
+  ): boolean {
+    const snapshotIndex = getEntryIndex(branch, parentCheckpoint.snapshotLeafId);
+    if (snapshotIndex >= 0 && hasContextSourceProgressAfter(branch, snapshotIndex)) {
+      const prep = prepareCompactionFromBranch(
+        branch,
+        createCheckpointPreparationSettings(reserveTokens),
+        parentCheckpoint,
+      );
+      if (prep && (prep.messagesToSummarize.length > 0 || prep.turnPrefixMessages.length > 0)) {
+        return true;
+      }
+    }
+    const prepMin = prepareCompactionFromBranch(
+      branch,
+      createCheckpointPreparationSettings(reserveTokens, 1),
+      parentCheckpoint,
+    );
+    if (
+      prepMin &&
+      prepMin.firstKeptEntryId !== parentCheckpoint.compaction.firstKeptEntryId &&
+      (prepMin.messagesToSummarize.length > 0 || prepMin.turnPrefixMessages.length > 0)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  private estimateRawCandidateTokens(
+    eventMessages: ContextEvent["messages"],
+    branch: readonly SessionEntry[],
+    ctx: ExtensionContext,
+  ): {
+    totalTokens: number;
+    charEstimatedTokens: number;
+    countedSystemTokens: number;
+  } {
+    const conversationTokens = estimateContextMessagesTokens(eventMessages);
+    const eventSystemMessages = eventMessages.filter((message) => message.role === "system");
+    let countedSystemTokens = estimateContextMessagesTokens(eventSystemMessages);
+    if (countedSystemTokens === 0) {
+      const branchSystemMessage = getCurrentSystemMessage(
+        buildSessionProjection([...branch]).messages,
+      );
+      if (branchSystemMessage) {
+        countedSystemTokens = estimateTokens(branchSystemMessage);
+      } else if (typeof ctx.getSystemPrompt === "function") {
+        const systemPrompt = ctx.getSystemPrompt();
+        if (typeof systemPrompt === "string" && systemPrompt.length > 0) {
+          countedSystemTokens = Math.ceil(systemPrompt.length / 4);
+        }
+      }
+    }
+    const charEstimatedTokens =
+      eventSystemMessages.length > 0
+        ? conversationTokens
+        : conversationTokens + countedSystemTokens;
+    const usage = ctx.getContextUsage();
+    const validUsageTokens =
+      !hasInvalidatingEntryAfterLastAssistant(branch) &&
+      usage?.tokens != null &&
+      Number.isFinite(usage.tokens)
+        ? usage.tokens
+        : 0;
+    return {
+      totalTokens: Math.max(charEstimatedTokens, validUsageTokens),
+      charEstimatedTokens,
+      countedSystemTokens,
+    };
+  }
+
+  private recordUnappliedContextEvaluation(
+    sessionId: string,
+    epochCompactionId: string | null,
+    leafId: string | null,
+    conversationMessages: ContextEvent["messages"],
+    rawEstimate: {
+      totalTokens: number;
+      countedSystemTokens: number;
+    },
+    limits: ReturnType<typeof calculateContextCapacityLimits>,
+    foregroundAttempted: boolean,
+    aborted: boolean,
+  ): void {
+    if (!limits) {
+      this.lastContextEvaluation = undefined;
+      return;
+    }
+    this.lastContextEvaluation = {
+      runEpoch: this.runEpoch,
+      sessionId,
+      epochCompactionId,
+      leafId,
+      conversationMessages,
+      conversationEstimatedTokens: rawEstimate.totalTokens,
+      countedSystemTokens: rawEstimate.countedSystemTokens,
+      hardLimit: limits.hardLimit,
+      refreshLimit: limits.refreshLimit,
+      foregroundAttempted,
+      aborted,
+    };
+  }
+
+  private hasExternalBackgroundOperation(): boolean {
+    const active = sharedRuntimeState.activeBackgroundOperation;
+    if (!active) {
+      return false;
+    }
+    if (this.inFlightTask && active === this.inFlightTask.promise) {
+      return false;
+    }
+    return true;
+  }
+
+  private waitForPromiseWithSignal(
+    promise: Promise<void>,
+    timeoutMs: number,
+    signal: AbortSignal,
+  ): Promise<WaitOutcome> {
+    if (signal.aborted) {
+      return Promise.resolve("aborted");
+    }
+    if (timeoutMs <= 0) {
+      return Promise.resolve("timeout");
+    }
+    return new Promise<WaitOutcome>((resolve) => {
+      let settled = false;
+      const finish = (outcome: WaitOutcome) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        resolve(outcome);
+      };
+      const onAbort = () => finish("aborted");
+      const timer = setTimeout(() => finish("timeout"), timeoutMs);
+      signal.addEventListener("abort", onAbort, { once: true });
+      void promise.finally(() => finish("finished"));
+    });
+  }
+
+  private abortContextForCapacityFailure(
+    ctx: ExtensionContext,
+    reason: string,
+    estimatedTokens?: number,
+    hardLimit?: number,
+  ): void {
+    this.diagnostics.count("context_aborted_capacity", {
+      reason,
+      details: {
+        ...(estimatedTokens === undefined ? {} : { estimatedTokens }),
+        ...(hardLimit === undefined ? {} : { hardLimit }),
+      },
+    });
+    const message =
+      reason === "no_compaction_boundary"
+        ? "上下文无合法切点且超过模型窗口，已停止当前请求。"
+        : reason === "critical_wait_timeout" || reason === "external_slot_timeout"
+          ? "前台压缩超时且超过模型窗口，已停止当前请求。"
+          : reason === "foreground_retries_exhausted"
+            ? "前台压缩重试耗尽且超过模型窗口，已停止当前请求。"
+            : "上下文超过模型窗口且无法预压缩，已停止当前请求。";
+    this.diagnostics.record("capacity", message);
+    this.notifyWarning(message);
+    if (typeof ctx.abort === "function") {
+      try {
+        ctx.abort();
+      } catch {
+        // 忽略宿主 abort 抛出的异常。
+      }
+    }
+  }
+
+  private verifyContextWithSystem(
+    event: ContextWithSystemEvent,
+    ctx: ExtensionContext,
+  ): Pick<ContextWithSystemEvent, "messages"> | undefined {
+    this.bindContext(ctx);
+    if (this.currentConfig.precomputeMode === "off") {
+      return undefined;
+    }
+    const model = asModel(ctx.model);
+    if (!model) {
+      return undefined;
+    }
+    const branch = ctx.sessionManager.getBranch();
+    const sessionId = ctx.sessionManager.getSessionId();
+    const epochCompactionId = getEpochCompactionId(branch);
+    if (this.isFormalizationExhausted(sessionId, epochCompactionId)) {
+      return undefined;
+    }
+    const reserveTokens = loadPiCompactionReserveTokens(
+      ctx.cwd,
+      isProjectTrustedContext(ctx),
+      model,
+    );
+    const limits = calculateContextCapacityLimits(
+      model.contextWindow,
+      reserveTokens,
+      this.currentConfig.softThresholdPercent,
+    );
+    if (!limits) {
+      return undefined;
+    }
+
+    const leafId = ctx.sessionManager.getLeafId();
+    const lastEval =
+      this.lastContextEvaluation &&
+      this.lastContextEvaluation.runEpoch === this.runEpoch &&
+      this.lastContextEvaluation.sessionId === sessionId &&
+      this.lastContextEvaluation.epochCompactionId === epochCompactionId &&
+      this.lastContextEvaluation.leafId === leafId
+        ? this.lastContextEvaluation
+        : undefined;
+
+    const systemMessages = event.messages.filter((message) => message.role === "system");
+    const nonSystemMessages = event.messages.filter((message) => message.role !== "system");
+    const systemTokens = estimateContextMessagesTokens(systemMessages);
+    const nonSystemTokens = estimateContextMessagesTokens(nonSystemMessages);
+    const extraSystemTokens = lastEval
+      ? Math.max(0, systemTokens - lastEval.countedSystemTokens)
+      : systemTokens;
+    const extraNonSystemTokens = lastEval
+      ? Math.max(0, nonSystemTokens - lastEval.conversationEstimatedTokens)
+      : 0;
+    const fullTokens = lastEval
+      ? lastEval.conversationEstimatedTokens + extraSystemTokens + extraNonSystemTokens
+      : systemTokens + nonSystemTokens;
+
+    const modelKey = `${model.provider}/${model.id}`;
+    const deltaKey = `${sessionId}:${modelKey}`;
+    const deltaD = extraSystemTokens + extraNonSystemTokens;
+    if (deltaD > 0) {
+      this.recordedTranscriptDeltas.set(deltaKey, deltaD);
+    }
+
+    if (fullTokens >= limits.refreshLimit && this.virtualApplication) {
+      this.virtualApplication.refreshRequested = true;
+    }
+
+    if (fullTokens > limits.hardLimit) {
+      this.diagnostics.count("system_transcript_exceeds_hard_limit", {
+        details: {
+          fullTokens,
+          hardLimit: limits.hardLimit,
+          deltaD,
+        },
+      });
+      if (!this.inFlightTask && !this.hasExternalBackgroundOperation()) {
+        this.startBackgroundTaskIfEligible(ctx, true);
+      }
+    }
+
+    return undefined;
   }
 
   private isCriticalWaitRequired(ctx: ExtensionContext): boolean {
@@ -487,46 +1335,124 @@ export class ExtensionRuntime {
       model.contextWindow,
       loadPiCompactionReserveTokens(
         ctx.cwd,
-        ctx.isProjectTrusted(),
+        isProjectTrustedContext(ctx),
         model,
       ),
     );
     return criticalWaitTokens !== undefined && usage.tokens >= criticalWaitTokens;
   }
 
-  private async waitForCriticalCheckpoint(
-    event: ContextEvent,
+  private getForegroundSignal(ctx: ExtensionContext): AbortSignal {
+    return ctx.signal ?? new AbortController().signal;
+  }
+
+  private startForegroundWaitProgress(
     ctx: ExtensionContext,
-    task: BackgroundTask,
-  ): Promise<Pick<ContextEvent, "messages">> {
-    const timeoutMs = this.remainingTaskTime(task);
-    if (timeoutMs <= 0) {
-      this.diagnostics.count("critical_wait_timed_out");
-      this.diagnostics.count("virtual_skipped");
-      return { messages: event.messages };
-    }
+    getTask: () => BackgroundTask | undefined,
+    startedAt: number,
+    getRetryCount?: () => number,
+  ): ForegroundWaitProgressHandle {
+    this.stopForegroundWaitProgress();
+    const runEpoch = this.runEpoch;
+    const isNonInteractive =
+      ctx.mode === "json" || ctx.mode === "print" || ctx.hasUI === false;
+    const isRpc = ctx.mode === "rpc";
+    const isTui = !isNonInteractive && !isRpc;
+    const ui = ctx.ui;
 
-    this.diagnostics.count("critical_wait_started");
-    const waitOutcome = await this.waitForTask(
-      task,
-      timeoutMs,
-      new AbortController().signal,
-    );
-    if (
-      waitOutcome !== "finished" ||
-      task.runEpoch !== this.runEpoch ||
-      task.sessionId !== this.currentSessionId
-    ) {
-      if (waitOutcome === "timeout") {
-        this.diagnostics.count("critical_wait_timed_out");
-        this.diagnostics.record("capacity", "临界上下文等待预压缩任务超时。");
-      }
-      this.diagnostics.count("virtual_skipped");
-      return { messages: event.messages };
-    }
+    const formatText = (): string => {
+      const task = getTask();
+      const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      const retryCount = getRetryCount ? getRetryCount() : 0;
+      const retrySuffix =
+        retryCount > 0
+          ? ` · 重试 ${retryCount}/3`
+          : task && (task.retryCount > 0 || task.stage === "retry_backoff")
+            ? ` · 重试 ${task.retryCount}/${MAX_BACKGROUND_RETRIES}`
+            : "";
+      return `pi-press 正在压缩 · 已等待 ${elapsedSeconds} 秒${retrySuffix}`;
+    };
 
-    this.diagnostics.count("critical_waited");
-    return await this.applyVirtualContext(event, ctx, false);
+    const handle: ForegroundWaitProgressHandle = {
+      runEpoch,
+      closed: false,
+      refresh: () => {
+        if (
+          handle.closed ||
+          this.activeForegroundWait !== handle ||
+          handle.runEpoch !== this.runEpoch
+        ) {
+          return;
+        }
+        const text = formatText();
+        try {
+          if (isTui) {
+            if (ui && typeof ui.setWorkingMessage === "function") {
+              ui.setWorkingMessage(text);
+            }
+            if (ui && typeof ui.setStatus === "function") {
+              ui.setStatus("pi-press", text);
+            }
+          } else if (isRpc) {
+            if (ui && typeof ui.setStatus === "function") {
+              ui.setStatus("pi-press", text);
+            }
+          }
+        } catch {
+          // 忽略 UI 更新异常。
+        }
+      },
+      cleanup: () => {
+        if (handle.closed) {
+          return;
+        }
+        handle.closed = true;
+        if (handle.timer) {
+          clearInterval(handle.timer);
+          handle.timer = undefined;
+        }
+        if (this.activeForegroundWait === handle) {
+          this.activeForegroundWait = undefined;
+        }
+        if (handle.runEpoch !== this.runEpoch) {
+          return;
+        }
+        try {
+          if (isTui) {
+            if (ui && typeof ui.setWorkingMessage === "function") {
+              ui.setWorkingMessage(undefined);
+            }
+            if (ui && typeof ui.setStatus === "function") {
+              ui.setStatus("pi-press", undefined);
+            }
+          } else if (isRpc) {
+            if (ui && typeof ui.setStatus === "function") {
+              ui.setStatus("pi-press", undefined);
+            }
+          }
+        } catch {
+          // 忽略 UI 清理异常。
+        }
+      },
+    };
+
+    this.activeForegroundWait = handle;
+    handle.refresh();
+    if (!isNonInteractive) {
+      handle.timer = setInterval(() => {
+        handle.refresh();
+      }, 1000);
+      handle.timer.unref?.();
+    }
+    return handle;
+  }
+
+  private stopForegroundWaitProgress(): void {
+    const active = this.activeForegroundWait;
+    if (!active) {
+      return;
+    }
+    active.cleanup();
   }
 
   private async waitForVirtualRefresh(
@@ -535,11 +1461,29 @@ export class ExtensionRuntime {
     task: BackgroundTask,
     timeoutMs: number,
   ): Promise<Pick<ContextEvent, "messages">> {
-    const waitOutcome = await this.waitForTask(
-      task,
-      timeoutMs,
-      new AbortController().signal,
+    const signal = this.getForegroundSignal(ctx);
+    const progress = this.startForegroundWaitProgress(
+      ctx,
+      () => task,
+      task.startedAt,
     );
+    let waitOutcome: WaitOutcome;
+    try {
+      waitOutcome = await this.waitForTask(task, timeoutMs, signal);
+    } finally {
+      progress.cleanup();
+    }
+    if (waitOutcome === "aborted") {
+      this.diagnostics.count("foreground_wait_aborted");
+      if (
+        task.sessionId === ctx.sessionManager.getSessionId() &&
+        task.runEpoch === this.runEpoch
+      ) {
+        this.discardTask(task, "user_aborted");
+      }
+      this.diagnostics.count("virtual_skipped");
+      return { messages: event.messages };
+    }
     if (
       waitOutcome === "timeout" ||
       task.runEpoch !== this.runEpoch ||
@@ -649,6 +1593,7 @@ export class ExtensionRuntime {
       }
     }
     this.invalidate("session_compact", false);
+    this.recordedTranscriptDeltas.clear();
     this.bindContext(ctx);
     if (this.currentConfig.precomputeMode !== "off") {
       this.notifyUser(
@@ -701,6 +1646,11 @@ export class ExtensionRuntime {
   private startBackgroundTaskIfEligible(
     ctx: ExtensionContext,
     bypassThreshold: boolean,
+    options?: {
+      force?: boolean;
+      keepRecentTokens?: number;
+      parentCheckpoint?: CheckpointData | undefined;
+    },
   ): BackgroundTask | undefined {
     const config = this.currentConfig;
     const usage = ctx.getContextUsage();
@@ -729,6 +1679,16 @@ export class ExtensionRuntime {
     if (this.isFormalizationExhausted(sessionId, epochCompactionId)) {
       return undefined;
     }
+    const reserveTokens = loadPiCompactionReserveTokens(
+      ctx.cwd,
+      isProjectTrustedContext(ctx),
+      model,
+    );
+    const limits = calculateContextCapacityLimits(
+      model.contextWindow,
+      reserveTokens,
+      config.softThresholdPercent,
+    );
     const candidates = findReadyCheckpointCandidates(
       branchEntries,
       sessionId,
@@ -745,14 +1705,25 @@ export class ExtensionRuntime {
     );
     const virtualRefreshNeeded = Boolean(
       virtualCandidate &&
-      (virtualRefreshRequested || this.shouldRefresh(virtualCandidate, branchEntries, model, config)),
+      (virtualRefreshRequested ||
+        this.shouldRefresh(
+          virtualCandidate,
+          branchEntries,
+          model,
+          config,
+          reserveTokens,
+          usage?.tokens,
+        )),
     );
     if (!bypassThreshold && !virtualRefreshNeeded) {
       if (!usageKnown) {
         this.diagnostics.count("threshold_skipped_unknown_usage");
         return undefined;
       }
-      if (usage!.percent! < config.softThresholdPercent) {
+      const softReached = limits
+        ? usage!.tokens! >= limits.refreshLimit || usage!.percent! >= config.softThresholdPercent
+        : usage!.percent! >= config.softThresholdPercent;
+      if (!softReached) {
         return undefined;
       }
     }
@@ -774,18 +1745,29 @@ export class ExtensionRuntime {
       virtualCandidate?.data.checkpointId === existingCandidate.data.checkpointId,
     );
     if (
+      !bypassThreshold &&
+      !options?.force &&
       existingCandidate &&
       !existingRefreshRequested &&
-      !this.shouldRefresh(existingCandidate, branchEntries, model, config)
+      !this.shouldRefresh(
+        existingCandidate,
+        branchEntries,
+        model,
+        config,
+        reserveTokens,
+        usage?.tokens,
+      )
     ) {
       return undefined;
     }
 
     const attempts = this.attemptsBySnapshotKey.get(snapshotKey) ?? 0;
-    if (attempts > MAX_BACKGROUND_RETRIES) {
+    if (!bypassThreshold && !options?.force && attempts > MAX_BACKGROUND_RETRIES) {
       return undefined;
     }
     this.attemptsBySnapshotKey.set(snapshotKey, attempts + 1);
+    const parentCheckpoint =
+      options?.parentCheckpoint ?? (existingCandidate === undefined ? undefined : existingCandidate.data);
     const task = this.startBackgroundTask({
       sessionId,
       snapshotLeafId,
@@ -797,9 +1779,10 @@ export class ExtensionRuntime {
       thinkingLevel: config.summaryThinkingLevel === "inherit"
         ? ctx.thinkingLevel ?? "medium"
         : config.summaryThinkingLevel,
-      reserveTokens: loadPiCompactionReserveTokens(ctx.cwd, ctx.isProjectTrusted(), model),
+      reserveTokens,
       config,
-      ...(existingCandidate === undefined ? {} : { parentCheckpoint: existingCandidate.data }),
+      ...(options?.keepRecentTokens === undefined ? {} : { keepRecentTokens: options.keepRecentTokens }),
+      ...(parentCheckpoint === undefined ? {} : { parentCheckpoint }),
     });
     if (
       task &&
@@ -1009,10 +1992,10 @@ export class ExtensionRuntime {
     const preparation = prepareCompactionFromBranch(
       branch,
       createFormalizationPreparationSettings(
-        loadPiCompactionReserveTokens(ctx.cwd, ctx.isProjectTrusted(), model),
+        loadPiCompactionReserveTokens(ctx.cwd, isProjectTrustedContext(ctx), model),
         loadPiCompactionKeepRecentTokens(
           ctx.cwd,
-          ctx.isProjectTrusted(),
+          isProjectTrustedContext(ctx),
           model,
         ),
       ),
@@ -1132,6 +2115,8 @@ export class ExtensionRuntime {
     this.cancelFormalizationSchedule();
     this.pendingFormalization = undefined;
     this.deferredFormalization = undefined;
+    this.lastContextEvaluation = undefined;
+    this.lastUnpersistedCandidate = undefined;
   }
 
   private captureDiagnosticContext(): DiagnosticEventMetadata {
@@ -1260,10 +2245,10 @@ export class ExtensionRuntime {
     this.notifyUser(`pi-press：${message}`, "warning");
   }
 
-  private reportTaskFailure(message: string): void {
+  private reportTaskFailure(message: string, metadata?: DiagnosticEventMetadata): void {
     const failure = describeError(message);
-    this.diagnostics.count("task_failed");
-    this.diagnostics.record("task", failure);
+    this.diagnostics.count("task_failed", metadata);
+    this.diagnostics.record("task", failure, metadata);
     this.notifyUser(`pi-press：后台预压缩失败：${failure}`, "error");
   }
 
@@ -1342,6 +2327,7 @@ export class ExtensionRuntime {
   }
 
   private invalidate(reason: string, clearContext: boolean): void {
+    this.stopForegroundWaitProgress();
     this.runEpoch += 1;
     if (this.inFlightTask) {
       this.discardTask(this.inFlightTask, reason);
@@ -1351,12 +2337,14 @@ export class ExtensionRuntime {
     this.attemptsBySnapshotKey.clear();
     this.formalizationAttemptsByEpoch.clear();
     this.virtualContextCache.clear();
+    this.lastUnpersistedCandidate = undefined;
     if (clearContext) {
       this.currentSessionManager = undefined;
       this.currentModelRegistry = undefined;
       this.currentSessionId = undefined;
       this.currentEpochCompactionId = undefined;
       this.currentNotify = undefined;
+      this.recordedTranscriptDeltas.clear();
     }
   }
 
@@ -1455,8 +2443,18 @@ export class ExtensionRuntime {
         this.diagnostics.count("task_cancelled", this.taskMetadata(task));
         return;
       }
-      this.diagnostics.count("task_failed", this.taskMetadata(task));
-      this.reportTaskFailure("后台预压缩执行失败");
+      const metadata = this.taskMetadata(task, {
+        ...(task.failureKind === undefined ? {} : { failureKind: task.failureKind }),
+      });
+      if (task.failureKind === "empty_summary" || task.failureKind === "invalid_summary") {
+        this.reportTaskFailure("模型返回空摘要或无效摘要", metadata);
+      } else if (task.failureKind === "transient_error") {
+        this.reportTaskFailure("临时错误重试耗尽", metadata);
+      } else if (task.failureKind === "deterministic_error") {
+        this.reportTaskFailure("模型返回确定性错误", metadata);
+      } else {
+        this.reportTaskFailure("后台预压缩执行失败", metadata);
+      }
     }
   }
 
@@ -1464,9 +2462,10 @@ export class ExtensionRuntime {
     if (!this.isCurrentTask(task)) {
       return;
     }
+    const keepRecentTokens = task.keepRecentTokens ?? CHECKPOINT_KEEP_RECENT_TOKENS;
     const nativePreparation = prepareCompactionFromBranch(
       task.branchEntries,
-      createCheckpointPreparationSettings(task.reserveTokens),
+      createCheckpointPreparationSettings(task.reserveTokens, keepRecentTokens),
       task.parentCheckpoint,
     );
     this.diagnostics.count("task_stage_finished", this.taskMetadata(task, {
@@ -1537,19 +2536,33 @@ export class ExtensionRuntime {
     }
 
     const retry = {
-      enabled: MAX_BACKGROUND_RETRIES > 0,
-      maxRetries: MAX_BACKGROUND_RETRIES,
+      get enabled(): boolean {
+        return MAX_BACKGROUND_RETRIES - task.retryCount > 0;
+      },
+      get maxRetries(): number {
+        return Math.max(0, MAX_BACKGROUND_RETRIES - task.retryCount);
+      },
       baseDelayMs: RETRY_BASE_DELAY_MS,
     };
     let historyFinished = preparation.messagesToSummarize.length === 0;
     const streamFn: StreamFn = async (model, context, options) => {
+      if (task.controller.signal.aborted || options?.signal?.aborted) {
+        const abortError = new Error("The operation was aborted");
+        abortError.name = "AbortError";
+        throw abortError;
+      }
+      if (this.remainingTaskTime(task) <= 0) {
+        const timeoutError = new Error("Pi-press background task timed out");
+        timeoutError.name = "TimeoutError";
+        throw timeoutError;
+      }
       task.stage = historyFinished ? "turn_prefix_summary" : "history_summary";
       task.stageStartedAt = Date.now();
       const stage = task.stage;
       const startedAt = task.stageStartedAt;
       const requestIndex = ++task.requestCount;
       this.diagnostics.count("summary_request_started", this.taskMetadata(task, { requestIndex }));
-      const settled = (stopReason: string): void => {
+      const settled = (stopReason: string, advanceStage = false): void => {
         this.diagnostics.count("summary_request_settled", this.taskMetadata(task, {
           stage,
           requestIndex,
@@ -1557,20 +2570,57 @@ export class ExtensionRuntime {
           stopReason,
           aborted: task.controller.signal.aborted,
         }));
-        if (stopReason === "stop") {
+        if (advanceStage) {
           historyFinished = true;
         }
       };
       try {
         const stream = await providerResult.request.streamFn(model, context, options);
-        // 观察同一个结果 Promise，保留 Pi 的流消费、摘要编排和重试行为。
-        void stream.result().then(
-          (message) => settled(message.stopReason),
-          () => settled("rejected"),
+        const rawResultPromise = stream.result();
+        const validatedResultPromise = rawResultPromise.then(
+          (message) => {
+            const hasToolCall = message.content.some((block) => block.type === "toolCall");
+            const text = contentText(message.content).trim();
+            if (message.stopReason === "stop" && !hasToolCall && text.length === 0) {
+              task.failureKind = "empty_summary";
+              settled("empty_summary", false);
+              return {
+                ...message,
+                stopReason: "error" as const,
+                errorMessage: "Empty summary response (server_error)",
+              };
+            }
+            if (message.stopReason === "length" || hasToolCall) {
+              task.failureKind = "invalid_summary";
+              settled(message.stopReason, false);
+              return message;
+            }
+            if (message.stopReason === "error") {
+              task.failureKind = isRetryableAssistantError(message)
+                ? "transient_error"
+                : "deterministic_error";
+              settled(message.stopReason, false);
+              return message;
+            }
+            if (message.stopReason === "stop") {
+              task.failureKind = undefined;
+              settled("stop", true);
+              return message;
+            }
+            settled(message.stopReason, false);
+            return message;
+          },
+          (error: unknown) => {
+            settled("rejected", false);
+            throw error;
+          },
         );
-        return stream;
+        return {
+          ...stream,
+          result: () => validatedResultPromise,
+        } as typeof stream;
       } catch (error: unknown) {
-        settled("rejected");
+        settled("rejected", false);
         throw error;
       }
     };
@@ -1590,6 +2640,7 @@ export class ExtensionRuntime {
           task.retryCount++;
           task.stage = "retry_backoff";
           task.stageStartedAt = Date.now();
+          this.activeForegroundWait?.refresh();
           this.diagnostics.count("summary_retry_scheduled", this.taskMetadata(task, {
             attempt, maxRetries, delayMs,
           }));
@@ -1765,14 +2816,18 @@ export class ExtensionRuntime {
       );
       return "skipped";
     }
+    candidateData.estimatedTokensAfterAtSnapshot = capacity.estimatedTokensAfter;
     if (!capacity.accepted) {
       const message = describeCapacityRejection(candidateData.checkpointId, capacity);
       this.diagnostics.count("checkpoint_skipped_capacity");
       this.diagnostics.record("capacity", message);
       this.notifyWarning(`后台预压缩容量不足，未持久化结果：${message}。`);
+      this.lastUnpersistedCandidate = {
+        sessionId: task.sessionId,
+        candidate: candidateData,
+      };
       return "skipped";
     }
-    candidateData.estimatedTokensAfterAtSnapshot = capacity.estimatedTokensAfter;
     const checkpointData = parseCheckpointData(candidateData, { piVersion: VERSION });
     if (!checkpointData) {
       this.diagnostics.count("checkpoint_invalid_result");
@@ -1781,6 +2836,7 @@ export class ExtensionRuntime {
 
     try {
       this.pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, checkpointData);
+      this.lastUnpersistedCandidate = undefined;
       this.diagnostics.count("checkpoint_appended", {
         checkpointId: checkpointData.checkpointId,
         reason: "checkpoint_ready",
@@ -1804,10 +2860,19 @@ export class ExtensionRuntime {
     branch: readonly SessionEntry[],
     model: Model<Api>,
     config: PiPressConfig,
+    reserveTokens: number,
+    currentUsageTokens?: number | null,
   ): boolean {
     const snapshotIndex = getEntryIndex(branch, candidate.data.snapshotLeafId);
     if (snapshotIndex < 0) {
       return true;
+    }
+    const currentSourceLeafId = getSnapshotSourceLeafId(branch);
+    if (!currentSourceLeafId || currentSourceLeafId === candidate.data.snapshotSourceLeafId) {
+      return false;
+    }
+    if (!hasContextSourceProgressAfter(branch, snapshotIndex)) {
+      return false;
     }
     const trailingTokens = this.virtualContextCache.estimateTokensAfter(branch, snapshotIndex) ??
       estimateMessagesTokens(
@@ -1815,8 +2880,51 @@ export class ExtensionRuntime {
           .slice(snapshotIndex + 1)
           .flatMap((entry) => sessionEntryToContextMessages(entry)),
       );
-    const refreshLimit = Math.floor(model.contextWindow * config.softThresholdPercent / 100);
-    return candidate.data.estimatedTokensAfterAtSnapshot + trailingTokens >= refreshLimit;
+    const limits = calculateContextCapacityLimits(
+      model.contextWindow,
+      reserveTokens,
+      config.softThresholdPercent,
+    );
+    const refreshLimit = limits
+      ? limits.refreshLimit
+      : Math.floor((model.contextWindow * config.softThresholdPercent) / 100);
+    if (candidate.data.estimatedTokensAfterAtSnapshot + trailingTokens >= refreshLimit) {
+      return true;
+    }
+    const application = this.virtualApplication;
+    const modelKey = `${model.provider}/${model.id}`;
+    if (
+      application &&
+      application.checkpointId === candidate.data.checkpointId &&
+      application.sessionId === candidate.data.sessionId &&
+      application.epochCompactionId === candidate.data.epochCompactionId &&
+      application.modelKey === modelKey
+    ) {
+      const anchoredTokens = estimateAppliedCheckpointBranchTokens(
+        branch,
+        candidate.data,
+        {
+          appliedSinceLeafId: application.firstAppliedLeafId,
+          appliedModelKey: application.modelKey,
+          currentModelKey: modelKey,
+        },
+        this.virtualContextCache,
+      );
+      if (anchoredTokens !== undefined) {
+        return anchoredTokens >= refreshLimit;
+      }
+      const firstAppliedIndex = getEntryIndex(branch, application.firstAppliedLeafId);
+      if (
+        firstAppliedIndex >= 0 &&
+        hasContextSourceProgressAfter(branch, Math.max(snapshotIndex, firstAppliedIndex)) &&
+        currentUsageTokens != null &&
+        Number.isFinite(currentUsageTokens) &&
+        currentUsageTokens >= refreshLimit
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private isSupportedCompaction(

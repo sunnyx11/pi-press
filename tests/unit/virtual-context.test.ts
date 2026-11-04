@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { estimateTokens, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   projectCheckpointToVirtualContext,
   tryProjectCheckpointToVirtualContext,
@@ -573,4 +573,98 @@ test("virtual context returns no projection when the hard limit is exceeded", ()
 
   assert.equal(result, undefined);
   assert.equal(oldId.length > 0, true);
+});
+
+test("virtual context re-estimates on first application and anchors to valid post-application usage on same-prefix requests", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-usage-anchor");
+  manager.appendMessage(makeUserMessage("old history"));
+  const keptId = manager.appendMessage(makeUserMessage("kept message"));
+  const snapshotId = manager.appendMessage(
+    makeAssistantMessage("pre-compaction response", makeUsage(90_000)),
+  );
+  const checkpoint = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "virtual-checkpoint-usage",
+    estimatedTokensAfterAtSnapshot: 200,
+    compaction: {
+      summary: "compressed history",
+      firstKeptEntryId: keptId,
+      tokensBefore: 90_000,
+    },
+  });
+  const checkpointEntryId = manager.appendCustomEntry("pi-press.precompaction", checkpoint);
+
+  // First application: no usage baseline yet, must not reuse pre-compaction 90_000 usage.
+  const firstAttempt = tryProjectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages: manager.buildSessionContext().messages,
+    checkpoint,
+    contextWindow: 100_000,
+    reserveTokens: 16_384,
+    softThresholdPercent: 60,
+  });
+  assert.equal(firstAttempt.status, "projected");
+  assert.equal(firstAttempt.projection.estimatedTokens, 200);
+  assert.equal(firstAttempt.projection.needsRefresh, false);
+
+  // Assistant responds under the applied virtual prefix with real provider usage (62,000 tokens),
+  // followed by an unsent user tail message ("中文工具输出".repeat(20) -> 120 chars -> 30 tokens).
+  manager.appendMessage(makeAssistantMessage("post-virtual response", makeUsage(62_000)));
+  const unsentTail = makeUserMessage("中文工具输出".repeat(20));
+  manager.appendMessage(unsentTail);
+
+  const anchoredAttempt = tryProjectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages: manager.buildSessionContext().messages,
+    checkpoint,
+    contextWindow: 100_000,
+    reserveTokens: 16_384,
+    softThresholdPercent: 60,
+    usageBaseline: {
+      appliedSinceLeafId: checkpointEntryId,
+      appliedModelKey: "test/model-id",
+      currentModelKey: "test/model-id",
+    },
+  });
+  assert.equal(anchoredAttempt.status, "projected");
+  assert.equal(
+    anchoredAttempt.projection.estimatedTokens,
+    62_000 + estimateTokens(unsentTail),
+  );
+  assert.equal(anchoredAttempt.projection.needsRefresh, true);
+
+  // Model switch invalidates the previous usage baseline and falls back to full projection estimate.
+  const switchedModelAttempt = tryProjectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages: manager.buildSessionContext().messages,
+    checkpoint,
+    contextWindow: 100_000,
+    reserveTokens: 16_384,
+    softThresholdPercent: 60,
+    usageBaseline: {
+      appliedSinceLeafId: checkpointEntryId,
+      appliedModelKey: "test/model-id",
+      currentModelKey: "test/other-model",
+    },
+  });
+  assert.equal(switchedModelAttempt.status, "projected");
+  assert.ok(switchedModelAttempt.projection.estimatedTokens < 1_000);
+
+  // Error response after valid assistant response invalidates usage reuse and falls back to estimate.
+  manager.appendMessage(makeAssistantErrorMessage("provider temporary failure"));
+  manager.appendMessage(makeUserMessage("retry request"));
+  const afterErrorAttempt = tryProjectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages: manager.buildSessionContext().messages,
+    checkpoint,
+    contextWindow: 100_000,
+    reserveTokens: 16_384,
+    softThresholdPercent: 60,
+    usageBaseline: {
+      appliedSinceLeafId: checkpointEntryId,
+      appliedModelKey: "test/model-id",
+      currentModelKey: "test/model-id",
+    },
+  });
+  assert.equal(afterErrorAttempt.status, "projected");
+  assert.ok(afterErrorAttempt.projection.estimatedTokens < 1_000);
 });

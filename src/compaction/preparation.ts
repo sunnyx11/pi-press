@@ -20,7 +20,7 @@ import type {
 import { isRecord } from "../checkpoint/schema.js";
 
 // 预压缩保留固定近期内容，同时覆盖 snapshot 前的完整消息。
-const CHECKPOINT_KEEP_RECENT_TOKENS = 10_000;
+export const CHECKPOINT_KEEP_RECENT_TOKENS = 10_000;
 
 function createFileOps(): FileOperations {
   return {
@@ -380,11 +380,14 @@ export function prepareCompactionFromBranch(
 }
 
 /** 使用宿主容量预留和固定近期保留量构造 checkpoint preparation 设置。 */
-export function createCheckpointPreparationSettings(reserveTokens: number): CompactionSettings {
+export function createCheckpointPreparationSettings(
+  reserveTokens: number,
+  keepRecentTokens: number = CHECKPOINT_KEEP_RECENT_TOKENS,
+): CompactionSettings {
   return {
     enabled: true,
     reserveTokens,
-    keepRecentTokens: CHECKPOINT_KEEP_RECENT_TOKENS,
+    keepRecentTokens,
   };
 }
 

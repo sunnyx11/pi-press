@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { VERSION, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
+  calculateContextCapacityLimits,
   calculateCriticalWaitTokens,
+  estimateCheckpointCapacity,
   estimateVirtualCheckpointCapacity,
 } from "../../src/checkpoint/capacity.js";
 import {
@@ -129,21 +131,62 @@ test("selection rejects edits to snapshot history and allows edits to later tail
   );
 });
 
-test("virtual checkpoint refresh starts exactly at the soft threshold", () => {
+test("virtual checkpoint refresh starts at the effective soft threshold and rejects thresholds above 85", () => {
   const { data } = makeBranch();
-  const capacity = estimateVirtualCheckpointCapacity(data, [], 1_000, 0, 10);
+  const capacity = estimateVirtualCheckpointCapacity(data, [], 10_000, 0, 1);
 
   assert.ok(capacity);
   assert.equal(capacity.estimatedTokens, capacity.refreshLimit);
   assert.equal(capacity.needsRefresh, true);
+  assert.equal(estimateVirtualCheckpointCapacity(data, [], 10_000, 0, 86), undefined);
+  assert.equal(estimateVirtualCheckpointCapacity(data, [], 4_000, 5_000, 50), undefined);
 });
 
-test("critical wait threshold follows the Pi reserve and context safety margin", () => {
+test("capacity limits take the smaller of 85 percent and Pi reserve minus safety margin", () => {
+  const largeWindow = calculateContextCapacityLimits(500_000, 16_384, 60);
+  assert.deepEqual(largeWindow, {
+    safetyMargin: 10_000,
+    hardLimit: 425_000,
+    refreshLimit: 300_000,
+  });
+
+  const smallWindow = calculateContextCapacityLimits(128_000, 16_384, 85);
+  assert.deepEqual(smallWindow, {
+    safetyMargin: 4_096,
+    hardLimit: 107_520,
+    refreshLimit: 107_520,
+  });
+
   assert.equal(calculateCriticalWaitTokens(200_000, 50_000), 145_904);
-  assert.equal(calculateCriticalWaitTokens(1_000_000, 100_000), 880_000);
-  assert.equal(calculateCriticalWaitTokens(4_000, 5_000), 0);
+  assert.equal(calculateCriticalWaitTokens(1_000_000, 100_000), 850_000);
+  assert.equal(calculateCriticalWaitTokens(4_000, 5_000), undefined);
   assert.equal(calculateCriticalWaitTokens(0, 1_000), undefined);
   assert.equal(calculateCriticalWaitTokens(100_000, -1), undefined);
+});
+
+test("estimateCheckpointCapacity uses the unified hard limit and accepts equality", () => {
+  const { branch, data } = makeBranch();
+  const estimate = estimateCheckpointCapacity(
+    branch,
+    data,
+    {
+      firstKeptEntryId: data.compaction.firstKeptEntryId,
+      messagesToSummarize: [],
+      turnPrefixMessages: [],
+      isSplitTurn: false,
+      tokensBefore: 100,
+      fileOps: {
+        read: new Set<string>(),
+        written: new Set<string>(),
+        edited: new Set<string>(),
+      },
+      settings: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 10_000 },
+    },
+    500_000,
+  );
+  assert.ok(estimate);
+  assert.equal(estimate.hardLimit, 425_000);
+  assert.equal(estimate.accepted, true);
 });
 
 test("selection validates every checkpoint parent against the current branch", () => {

@@ -889,3 +889,62 @@ test("checkpoint above the refresh threshold is persisted for immediate use", as
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("real context usage triggers background refresh when character estimate underestimates CJK tail", async () => {
+  const scenario = createScenario({
+    softThresholdPercent: 60,
+  });
+  scenario.faux.setResponses([
+    async () => fauxAssistantMessage("first checkpoint summary"),
+    async () => fauxAssistantMessage("refreshed checkpoint summary"),
+  ]);
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.appended.length === 1);
+
+    // Apply the first checkpoint in onContext.
+    const initialContext = await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, scenario.ctx);
+    assert.equal(initialContext.messages[0]?.role, "compactionSummary");
+
+    // Metadata-only custom entry without new source messages must not trigger refresh.
+    scenario.manager.appendCustomEntry("other.extension.meta", { note: "metadata only" });
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(scenario.appended.length, 1);
+    assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 1);
+
+    // Append a CJK assistant response with real provider usage above 60% (65,000 / 100,000)
+    // and enough recent CJK messages (> 10,000 estimated tokens) to form a valid compaction cut point,
+    // while total character-based estimate (~35,000 tokens) remains far below the 60,000 refresh limit.
+    scenario.manager.appendMessage(
+      makeAssistantMessage("这是一段中文模型回复内容。".repeat(200), makeUsage(65_000)),
+    );
+    scenario.manager.appendMessage(makeUserMessage("继续执行下一步中文工具调用。".repeat(3_500)));
+    const realUsageCtx = {
+      ...scenario.ctx,
+      getContextUsage: () => ({
+        tokens: 65_010,
+        contextWindow: scenario.ctx.model!.contextWindow,
+        percent: 65.01,
+      }),
+    } as ExtensionContext;
+
+    scenario.runtime.onTurnEnd(realUsageCtx);
+    await waitFor(() => scenario.appended.length === 2);
+
+    const checkpoints = scenario.appended.map((value) => parseCheckpointData(value));
+    assert.ok(checkpoints[0]);
+    assert.ok(checkpoints[1]);
+    assert.equal(checkpoints[1].parentCheckpointId, checkpoints[0].checkpointId);
+    assert.equal(checkpoints[1].compaction.summary, "refreshed checkpoint summary");
+    assert.equal(scenario.runtime.getDiagnostics().counters.task_started, 2);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});

@@ -7,6 +7,7 @@ import {
   type CompactionEntry,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { MAX_SOFT_THRESHOLD_PERCENT } from "../config.js";
 import type {
   CheckpointData,
   CompactionCapacityEstimate,
@@ -51,6 +52,12 @@ export type VirtualCheckpointCapacityEstimate = {
   needsRefresh: boolean;
 };
 
+export type ContextCapacityLimits = {
+  safetyMargin: number;
+  hardLimit: number;
+  refreshLimit: number;
+};
+
 /** 计算上下文容量检查共用的安全余量。 */
 export function calculateContextSafetyMargin(contextWindow: number): number | undefined {
   if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
@@ -59,21 +66,47 @@ export function calculateContextSafetyMargin(contextWindow: number): number | un
   return Math.max(4_096, Math.ceil(contextWindow * 0.02));
 }
 
+/** 计算上下文容量上限与后台刷新阈值。 */
+export function calculateContextCapacityLimits(
+  contextWindow: number,
+  reserveTokens: number,
+  softThresholdPercent = MAX_SOFT_THRESHOLD_PERCENT,
+): ContextCapacityLimits | undefined {
+  const safetyMargin = calculateContextSafetyMargin(contextWindow);
+  if (
+    safetyMargin === undefined ||
+    !Number.isFinite(reserveTokens) ||
+    reserveTokens < 0 ||
+    !Number.isFinite(softThresholdPercent) ||
+    softThresholdPercent < 0 ||
+    softThresholdPercent > MAX_SOFT_THRESHOLD_PERCENT
+  ) {
+    return undefined;
+  }
+  const hardLimit = Math.min(
+    Math.floor((contextWindow * MAX_SOFT_THRESHOLD_PERCENT) / 100),
+    contextWindow - reserveTokens - safetyMargin,
+  );
+  if (!Number.isFinite(hardLimit) || hardLimit <= 0) {
+    return undefined;
+  }
+  const refreshLimit = Math.min(
+    Math.floor((contextWindow * softThresholdPercent) / 100),
+    hardLimit,
+  );
+  return {
+    safetyMargin,
+    hardLimit,
+    refreshLimit,
+  };
+}
+
 /** 计算请求前等待预压缩任务的 token 临界值。 */
 export function calculateCriticalWaitTokens(
   contextWindow: number,
   piCompactionReserveTokens: number,
 ): number | undefined {
-  const safetyMargin = calculateContextSafetyMargin(contextWindow);
-  if (
-    safetyMargin === undefined ||
-    !Number.isFinite(piCompactionReserveTokens) ||
-    piCompactionReserveTokens < 0
-  ) {
-    return undefined;
-  }
-  const piCompactionThreshold = contextWindow - piCompactionReserveTokens;
-  return Math.max(0, piCompactionThreshold - safetyMargin);
+  return calculateContextCapacityLimits(contextWindow, piCompactionReserveTokens)?.hardLimit;
 }
 
 export function estimateVirtualCheckpointCapacity(
@@ -84,17 +117,15 @@ export function estimateVirtualCheckpointCapacity(
   softThresholdPercent: number,
   additionalTokens = 0,
 ): VirtualCheckpointCapacityEstimate | undefined {
-  if (
-    !Number.isFinite(contextWindow) ||
-    contextWindow <= 0 ||
-    !Number.isFinite(reserveTokens) ||
-    reserveTokens < 0 ||
-    !Number.isFinite(softThresholdPercent) ||
-    softThresholdPercent < 0 ||
-    softThresholdPercent > 100 ||
-    !Number.isFinite(additionalTokens) ||
-    additionalTokens < 0
-  ) {
+  if (!Number.isFinite(additionalTokens) || additionalTokens < 0) {
+    return undefined;
+  }
+  const limits = calculateContextCapacityLimits(
+    contextWindow,
+    reserveTokens,
+    softThresholdPercent,
+  );
+  if (!limits) {
     return undefined;
   }
   const summaryMessage = checkpointToCompactionSummaryMessage(data);
@@ -105,17 +136,11 @@ export function estimateVirtualCheckpointCapacity(
     data.estimatedTokensAfterAtSnapshot +
     sumMessageTokens(additionalMessages) +
     additionalTokens;
-  const safetyMargin = calculateContextSafetyMargin(contextWindow);
-  if (safetyMargin === undefined) {
-    return undefined;
-  }
-  const hardLimit = contextWindow - reserveTokens - safetyMargin;
-  const refreshLimit = Math.floor((contextWindow * softThresholdPercent) / 100);
   return {
     estimatedTokens,
-    hardLimit,
-    refreshLimit,
-    needsRefresh: estimatedTokens >= refreshLimit,
+    hardLimit: limits.hardLimit,
+    refreshLimit: limits.refreshLimit,
+    needsRefresh: estimatedTokens >= limits.refreshLimit,
   };
 }
 
@@ -163,11 +188,21 @@ export function estimateCheckpointCapacity(
   const keptMessagesEstimatedTokens = sumMessageTokens(keptMessages);
   const estimatedTokensAfter =
     fixedOverhead + summaryEstimatedTokens + keptMessagesEstimatedTokens;
+  const reserveTokens = preparation.settings.reserveTokens;
   const safetyMargin = calculateContextSafetyMargin(contextWindow);
-  if (safetyMargin === undefined) {
+  if (safetyMargin === undefined || !Number.isFinite(reserveTokens) || reserveTokens < 0) {
     return undefined;
   }
-  const hardLimit = contextWindow - preparation.settings.reserveTokens - safetyMargin;
+  const limits = calculateContextCapacityLimits(
+    contextWindow,
+    reserveTokens,
+  );
+  const hardLimit = limits
+    ? limits.hardLimit
+    : Math.min(
+      Math.floor((contextWindow * MAX_SOFT_THRESHOLD_PERCENT) / 100),
+      contextWindow - reserveTokens - safetyMargin,
+    );
 
   return {
     currentMessagesEstimatedTokens,
@@ -177,6 +212,6 @@ export function estimateCheckpointCapacity(
     estimatedTokensAfter,
     safetyMargin,
     hardLimit,
-    accepted: estimatedTokensAfter <= hardLimit,
+    accepted: hardLimit > 0 && estimatedTokensAfter <= hardLimit,
   };
 }

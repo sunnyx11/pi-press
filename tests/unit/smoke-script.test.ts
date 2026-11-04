@@ -13,7 +13,12 @@ import { delimiter, join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createCheckpointPreparationSettings, prepareCompactionFromBranch } from "../../src/compaction/preparation.js";
-import { createSmokeSession, resolvePiLaunch, resolveSystemPi } from "../../scripts/smoke-real-pi.js";
+import {
+  createGrowthSmokeSession,
+  createSmokeSession,
+  resolvePiLaunch,
+  resolveSystemPi,
+} from "../../scripts/smoke-real-pi.js";
 
 const executableName = process.platform === "win32" ? "pi.cmd" : "pi";
 
@@ -147,6 +152,27 @@ test("real Pi resolver honors an explicit executable", () => {
     });
 
     assert.equal(resolved, realpathSync(explicitPi));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("growth real Pi smoke fixture seeds Chinese tool history for usage-driven refresh", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-press-growth-fixture-"));
+  try {
+    const sessionFile = createGrowthSmokeSession(root, SessionManager);
+    const manager = SessionManager.open(sessionFile);
+    const branch = manager.getBranch();
+    const preparation = prepareCompactionFromBranch(
+      branch,
+      createCheckpointPreparationSettings(16_384),
+    );
+    assert.ok(preparation);
+    assert.ok(preparation.messagesToSummarize.length + preparation.turnPrefixMessages.length > 0);
+    const toolResults = branch.filter(
+      (entry) => entry.type === "message" && entry.message.role === "toolResult",
+    );
+    assert.ok(toolResults.length >= 2);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -229,8 +229,9 @@ import {
 | 事件 | 处理要求 |
 | --- | --- |
 | `session_start` | 通过 `ctx.sessionManager.getEntries()`、`getBranch()` 恢复 checkpoint、正式 compaction epoch、消费状态和当前分支。 |
-| `turn_end` | 读取 `ctx.getContextUsage()`，判断软阈值或已应用虚拟 checkpoint 的尾部容量，获取快照并调度后台任务。处理器必须在后台摘要完成前返回；Pi 可随后在同一 agent 的下一次 assistant 请求前执行原生阈值压缩。 |
-| `context` | 每次 provider 请求前重新校验 ready checkpoint，构造虚拟 `compactionSummary` 和当前未压缩尾部；允许 Pi 自动重试保留于 session、但从实时状态删除、后接另一条 assistant 响应且不承担压缩边界定位的失败 assistant 消息缺失，其他映射不明确时返回原消息。 |
+| `turn_end` | 读取 `ctx.getContextUsage()`，结合字符估算与同前缀有效真实 `usage` 判断软阈值（`0..85`）或已应用虚拟 checkpoint 的尾部容量，获取快照并调度后台任务。处理器必须在后台摘要完成前返回；Pi 可随后在同一 agent 的下一次 assistant 请求前执行原生阈值压缩。 |
+| `context` | 每次 provider 请求前重新校验 ready checkpoint，构造虚拟 `compactionSummary` 和当前未压缩尾部；对候选虚拟上下文和原始上下文统一执行 `hardLimit` 检查，超限时进入前台循环压缩（支持多轮推进切点、3 次重试、TUI/RPC 状态计时与 `ctx.signal` 取消本会话兼容任务）；无法压缩或重试耗尽时，估算 `<= contextWindow` 则发送（优先使用压缩投影），仅在 `> contextWindow` 时调用 `ctx.abort()` 请求协作取消。 |
+| `context_with_system` | 计算并记录系统与扩展增量 `D = max(0, F - C)` 供下次 `context` 阶段提前压缩；超限时触发非阻塞后台预压缩，不阻塞也不调用 `ctx.abort()`。 |
 | `agent_settled` | 等待兼容后台任务，选择最新 checkpoint，以同步保留量预检查当前分支；不可用时保存 deferred，可用时延迟调用 `ctx.compact()`。 |
 | `session_before_compact` | 校验 reason、signal、分支、epoch、checkpoint 和容量；可返回兼容 `CompactionResult`，否则返回 `undefined` 让 Pi 使用原生实现。 |
 | `session_compact` | 记录正式 entry 对 checkpoint 的消费，递增运行 epoch，取消旧 epoch 任务并清除 virtual、deferred 和 pending 状态。 |
@@ -455,7 +456,7 @@ originalTokensBefore = checkpoint.compaction.tokensBefore + estimatedMessagesAft
 fixedOverhead = max(0, originalTokensBefore - currentMessagesEstimatedTokens)
 estimatedTokensAfter = fixedOverhead + summaryEstimatedTokens + keptMessagesEstimatedTokens
 safetyMargin = max(4096, ceil(contextWindow * 0.02))
-hardLimit = contextWindow - reserveTokens - safetyMargin
+hardLimit = min(floor(contextWindow * 0.85), contextWindow - reserveTokens - safetyMargin)
 ```
 
 `estimatedTokensAfter` 超过 `hardLimit`、当前模型 context window 不可用或当前限制无法确定时，checkpoint 不可消费，返回 `undefined`。虚拟上下文达到 `softThresholdPercent` 时仍可在 hard limit 内应用，同时调度下一代增量 checkpoint。
@@ -479,7 +480,7 @@ checkpoint preparation 固定使用 `keepRecentTokens: 10000`，正式化 prepar
 
 `SettingsManager` 负责合并全局、受信任项目和 `compaction.modelOverrides` 设置，字段缺失时返回 Pi 默认值，当前默认 `keepRecentTokens` 为 `20000`。Pi-press 通过公开接口读取宿主设置。摘要输出上限遵循 Pi 1.5.0 的原生模型上限语义，`reserveTokens` 用于容量预留。
 
-后台摘要请求固定允许一次瞬时错误重试。同一正式 compaction epoch 可按 `softThresholdPercent` 连续刷新，每代使用 parent summary 和 parent snapshot 后的投影历史。旧配置字段 `targetPostCompactionPercent` 与 `summaryReserveTokens` 的值均忽略，且均排除在配置 fingerprint 之外。每个 Runtime 实例对两字段各记录一次诊断；`summaryReserveTokens` 另显示一次 CLI warning。
+后台摘要请求在任务级共享最多一次重试预算（覆盖瞬时 provider 错误、空摘要以及 split turn 的子请求），每次请求前检查取消信号与剩余总期限。同一正式 compaction epoch 可按 `softThresholdPercent`（允许范围 `0..85`）连续刷新，每代使用 parent summary 和 parent snapshot 后的投影历史。旧配置字段 `targetPostCompactionPercent` 与 `summaryReserveTokens` 的值均忽略，且均排除在配置 fingerprint 之外。每个 Runtime 实例对两字段各记录一次诊断；`summaryReserveTokens` 另显示一次 CLI warning。
 
 `summaryThinkingLevel` 允许 `inherit`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh`，无效值按配置层规则处理并记录诊断。该配置只影响新摘要请求，主会话级别保持原状，已有有效检查点继续复用。
 

@@ -147,3 +147,78 @@ test("split summaries share a total deadline and record late request settlement"
     rmSync(scenario.cwd, { recursive: true, force: true });
   }
 });
+
+test("transient error plus empty summary shares a single task retry budget without exceeding one retry", async () => {
+  const scenario = createScenario();
+  let calls = 0;
+  scenario.faux.setResponses([
+    () => {
+      calls += 1;
+      return fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 transient failure" });
+    },
+    () => {
+      calls += 1;
+      return fauxAssistantMessage("   ");
+    },
+    () => {
+      calls += 1;
+      return fauxAssistantMessage("should not be reached");
+    },
+  ]);
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.runtime.getDiagnostics().counters.task_failed === 1);
+    // 1 initial attempt + 1 shared retry = 2 calls max; empty summary on retry must not trigger a 3rd call.
+    assert.equal(calls, 2);
+    assert.equal(scenario.appended.length, 0);
+    assert.ok(
+      scenario.notifications.some(
+        (item) => item.type === "error" && item.message.includes("空摘要或无效摘要"),
+      ),
+    );
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("split turn shares a single retry budget across history and turn prefix requests", async () => {
+  const scenario = createScenario();
+  addSplitTurn(scenario);
+  let calls = 0;
+  scenario.faux.setResponses([
+    () => {
+      calls += 1;
+      return fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 history transient failure" });
+    },
+    () => {
+      calls += 1;
+      return fauxAssistantMessage("history summary after retry");
+    },
+    () => {
+      calls += 1;
+      return fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 prefix transient failure" });
+    },
+    () => {
+      calls += 1;
+      return fauxAssistantMessage("prefix summary that must not be requested");
+    },
+  ]);
+
+  try {
+    scenario.runtime.onTurnEnd(scenario.ctx);
+    await waitFor(() => scenario.runtime.getDiagnostics().counters.task_failed === 1);
+    // History consumed the single retry (2 calls); turn prefix gets 1 call and cannot retry again (total 3 calls).
+    assert.equal(calls, 3);
+    assert.equal(scenario.appended.length, 0);
+    assert.ok(
+      scenario.notifications.some(
+        (item) => item.type === "error" && item.message.includes("临时错误"),
+      ),
+    );
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
