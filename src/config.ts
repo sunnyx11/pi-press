@@ -17,7 +17,7 @@ import {
 
 export const DEFAULT_CONFIG: PiPressConfig = {
   precomputeMode: "threshold",
-  softThresholdPercent: 80,
+  softThresholdPercent: 60,
   summaryThinkingLevel: "low",
   taskTimeoutMs: 300_000,
   hookWaitTimeoutMs: 1_000,

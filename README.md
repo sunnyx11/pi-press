@@ -47,7 +47,7 @@ pi remove npm:@sunnyx11/pi-press
 ```json
 {
   "precomputeMode": "threshold",
-  "softThresholdPercent": 80,
+  "softThresholdPercent": 60,
   "summaryThinkingLevel": "low",
   "taskTimeoutMs": 300000
 }

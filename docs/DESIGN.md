@@ -6,7 +6,7 @@
 
 核心目标：
 
-- 上下文使用量达到约 80% 时，在后台提前生成一份预压缩结果。
+- 上下文使用量达到约 60% 时，在后台提前生成一份预压缩结果。
 - 后台任务执行期间，当前 agent 在临界等待区之前继续运行；进入临界等待区后，下一次 provider 请求等待兼容任务完成。
 - 预压缩结果持久化到当前 session 的 JSONL 文件。
 - checkpoint ready 后，在每次 provider 请求前通过 `context` 事件生成“预压缩摘要 + 当前未压缩尾部”的虚拟压缩上下文，避免同一 agent 运行中的连续工具调用使请求超过上下文窗口。
@@ -154,7 +154,7 @@ checkpoint 是扩展 custom entry，默认不进入 LLM 上下文。Pi-press 只
 - 监听 `turn_end`，只同步读取使用量、创建快照和调度任务。处理器不得等待摘要 Promise，必须立即返回。
 - detached task 必须由调度器保存 Promise，并设置统一错误处理，禁止产生未处理的 Promise rejection。
 - 只使用 `ctx.getContextUsage()` 判断首次预压缩阈值。返回 `undefined`、`tokens: null` 或 `percent: null` 时跳过本次首次检查，不自行估算系统提示词和工具定义占用。虚拟压缩已经应用后，同前缀请求将 checkpoint 首次应用后的最新有效 assistant `usage` 作为容量基线，累加尚未进入该响应的尾部消息估算与系统提示词增量；当字符估算或真实 `usage` 基线达到 `refreshLimit` 时触发下一代后台刷新，避免多字节或高密度文本在字符估算下漏刷。
-- 默认软阈值为活动模型上下文窗口的 80%，有效配置范围为 `0..85`。该值是最早启动点，不是复用 checkpoint 的充分条件。
+- 默认软阈值为活动模型上下文窗口的 60%，有效配置范围为 `0..85`。该值是最早启动点，不是复用 checkpoint 的充分条件。
 - 达到阈值但当前分支无法构造可用 preparation 时，记录诊断并静默跳过；后续 `turn_end` 可以再次尝试。
 - checkpoint 只有在 `pi.appendEntry()` 成功返回后才能显示预压缩成功；生成失败、超时或追加失败显示 CLI error，生成阶段容量不足显示 CLI warning。
 - Pi-press 通过 `precomputeMode: "off" | "threshold" | "threshold-and-manual"` 明确控制是否生成和消费检查点，默认值为 `"threshold"`。该开关独立于 Pi 的 auto-compaction 开关；Pi compaction 的保留量通过公开 `SettingsManager` 获取。
@@ -205,7 +205,7 @@ Pi-press 配置独立于 Pi 的运行时 settings。配置文件按全局到项�
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `precomputeMode` | `"threshold"` | `"off"` 停用；`"threshold"` 启用预压缩、虚拟压缩和 agent settled 后正式化；`"threshold-and-manual"` 还允许无自定义指令的使用者手动 compaction 复用 checkpoint |
-| `softThresholdPercent` | `80` | 首次预压缩与后续增量刷新的上下文百分比，允许范围为 `0..85` |
+| `softThresholdPercent` | `60` | 首次预压缩与后续增量刷新的上下文百分比，允许范围为 `0..85` |
 | `summaryThinkingLevel` | `"low"` | 后台摘要思考级别；允许 `"inherit"`、`"off"`、`"minimal"`、`"low"`、`"medium"`、`"high"`、`"xhigh"`。`"inherit"` 使用当前主会话级别，缺失时使用 `"medium"`；其他值只影响摘要请求 |
 | `taskTimeoutMs` | `300000` | 单次后台任务总超时 |
 | `hookWaitTimeoutMs` | `1000` | 正式压缩 hook 与临界值之前的 hard-limit 场景等待兼容任务的最长时间；临界 `context` 等待使用任务自身的剩余 `taskTimeoutMs` |
@@ -771,7 +771,7 @@ Pi 命令 `/pi-press-diagnostics [--session <id>] [--last <1-100>] [--json]` 查
 ## 验收标准
 
 1. 当前安装的 Pi 版本尝试执行预压缩；公开 API 不兼容、provider、超时或结果校验失败时通过 CLI 显示错误，并保留 Pi 原生 compaction 后备处理。
-2. 上下文使用量跨越默认 80% 软阈值后调度 detached task，`turn_end` 不等待摘要请求，当前 agent 不被中止。
+2. 上下文使用量跨越默认 60% 软阈值后调度 detached task，`turn_end` 不等待摘要请求，当前 agent 不被中止。
 3. `ctx.getContextUsage()` 返回不可用值时不启动任务，也不读取 session 文件自行估算。
 4. 生产代码只使用 Pi 扩展契约和包根入口；唯一自有协议适配集中在 preparation 版本适配模块。
 5. 版本适配模块与当前 Pi 公开事件提供的 preparation 在目标 fixture 上一致，包括 split turn、metadata 边界、前次摘要和文件操作。

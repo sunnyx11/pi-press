@@ -25,7 +25,7 @@ test("normalizeConfig returns design defaults and reports removed fields", () =>
     targetPostCompactionPercent: 50,
   });
   assert.deepEqual(result.config, DEFAULT_CONFIG);
-  assert.equal(DEFAULT_CONFIG.softThresholdPercent, 80);
+  assert.equal(DEFAULT_CONFIG.softThresholdPercent, 60);
   assert.equal(DEFAULT_CONFIG.taskTimeoutMs, 300_000);
   assert.equal(DEFAULT_CONFIG.diagnosticsPersistence, "sqlite");
   assert.equal(DEFAULT_CONFIG.diagnosticsRetentionDays, 30);
