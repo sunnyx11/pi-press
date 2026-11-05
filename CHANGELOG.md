@@ -7,6 +7,27 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-05
+
+### Added
+
+- 上下文超出安全容量时支持前台多轮预压缩，等待期间显示耗时并支持取消。
+
+### Changed
+
+- 默认预压缩软阈值从 80% 调整为 60%，显式配置继续优先生效。
+- `softThresholdPercent` 有效范围为 `0..85`；超出范围的配置使用默认值。
+- 无法继续压缩时，估算容量在模型窗口内的请求继续发送，超出窗口时取消。
+- `context_with_system` 记录系统及扩展消息增量并触发后台预压缩，保持发送过程非阻塞。
+
+### Fixed
+
+- 虚拟上下文容量检查计入当前系统提示词，避免应用超限摘要。
+- 安全容量上限无法计算时，仍拦截超过模型窗口的请求。
+- 前台预压缩对 provider 抛出的异常执行重试。
+- 等待其他会话后台任务时，正确处理失败结果，避免未处理的 Promise 拒绝。
+- 前台应用 checkpoint 后同步上下文评估，避免重复计算系统提示词占用。
+
 ## [0.6.0] - 2026-11-02
 
 ### Changed
@@ -165,7 +186,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/sunnyx11/pi-press/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/sunnyx11/pi-press/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/sunnyx11/pi-press/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/sunnyx11/pi-press/compare/v0.5.0...v0.5.1
