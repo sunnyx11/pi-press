@@ -1513,3 +1513,191 @@ test("foreground compaction retries up to 3 times on task failure before falling
     rmSync(scenario.cwd, { recursive: true, force: true });
   }
 });
+
+test("model window overflow aborts when the hard limit is unavailable", async () => {
+  const scenario = createScenario({ taskTimeoutMs: 100 });
+  writeFileSync(
+    join(scenario.cwd, ".pi", "settings.json"),
+    JSON.stringify({
+      compaction: {
+        keepRecentTokens: 10_000,
+        reserveTokens: 100_000,
+      },
+    }),
+  );
+  scenario.manager.appendContextEdit(scenario.firstEntryId, { content: "x".repeat(500_000) });
+  let aborted = 0;
+  const ctx = {
+    ...scenario.ctx,
+    abort: () => {
+      aborted += 1;
+    },
+    getContextUsage: () => undefined,
+  } as unknown as ExtensionContext;
+
+  try {
+    await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionProjection().messages.filter(
+        (message) => message.role !== "system",
+      ),
+    }, ctx);
+    assert.equal(aborted, 1);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("foreground compaction retries provider stream rejections", async () => {
+  const scenario = createScenario({ taskTimeoutMs: 500 });
+  const originalProvider = scenario.faux.provider;
+  let attempts = 0;
+  const streamSimple = ((...args: Parameters<typeof originalProvider.streamSimple>) => {
+    attempts += 1;
+    if (attempts <= 4) {
+      return Promise.reject(new Error(`transient provider failure ${attempts}`));
+    }
+    return originalProvider.streamSimple(...args);
+  }) as unknown as typeof originalProvider.streamSimple;
+  const provider = { ...originalProvider, streamSimple };
+  const ctx = {
+    ...scenario.ctx,
+    modelRegistry: {
+      ...scenario.ctx.modelRegistry,
+      getProvider: () => provider,
+    },
+    abort: () => undefined,
+    getContextUsage: () => ({
+      tokens: 85_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 85,
+    }),
+  } as unknown as ExtensionContext;
+
+  try {
+    const sourceMessages = scenario.manager.buildSessionContext().messages;
+    const result = await scenario.runtime.onContext({
+      type: "context",
+      messages: sourceMessages,
+    }, ctx);
+    assert.equal(attempts, 4);
+    assert.equal(result.messages, sourceMessages);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("external rejected background operations do not create unhandled rejections while foreground waits", async () => {
+  const first = createScenario({ taskTimeoutMs: 500 });
+  const second = createScenario({ taskTimeoutMs: 500 });
+  let releaseFirst: (() => void) | undefined;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const originalProvider = first.faux.provider;
+  const rejectingStreamSimple = ((..._args: Parameters<typeof originalProvider.streamSimple>) =>
+    firstGate.then(() => {
+      throw new Error("external provider failure");
+    })) as unknown as typeof originalProvider.streamSimple;
+  const rejectingProvider = { ...originalProvider, streamSimple: rejectingStreamSimple };
+  const firstCtx = {
+    ...first.ctx,
+    modelRegistry: {
+      ...first.ctx.modelRegistry,
+      getProvider: () => rejectingProvider,
+    },
+  } as unknown as ExtensionContext;
+  const secondCtx = {
+    ...second.ctx,
+    getContextUsage: () => ({
+      tokens: 90_000,
+      contextWindow: second.ctx.model!.contextWindow,
+      percent: 90,
+    }),
+  } as unknown as ExtensionContext;
+  const unhandled: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+
+  try {
+    first.runtime.onTurnEnd(firstCtx);
+    await waitFor(() => first.runtime.getDiagnostics().counters.summary_request_started === 1);
+    const contextPromise = second.runtime.onContext({
+      type: "context",
+      messages: second.manager.buildSessionContext().messages,
+    }, secondCtx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseFirst?.();
+    await contextPromise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    releaseFirst?.();
+    process.off("unhandledRejection", onUnhandledRejection);
+    first.runtime.onSessionShutdown();
+    second.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(first.cwd, { recursive: true, force: true });
+    rmSync(second.cwd, { recursive: true, force: true });
+  }
+});
+
+test("foreground projection records the context evaluation used by the next system transcript", async () => {
+  const systemPrompt = "S".repeat(200_000);
+  const scenario = createScenario({ taskTimeoutMs: 500 });
+  const initialCtx = {
+    ...scenario.ctx,
+    getSystemPrompt: () => systemPrompt,
+    getContextUsage: () => ({
+      tokens: 90_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 90,
+    }),
+  } as unknown as ExtensionContext;
+
+  try {
+    const initial = await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, initialCtx);
+    const systemMessage = {
+      role: "system" as const,
+      content: systemPrompt,
+      timestamp: Date.now(),
+    };
+    await scenario.runtime.onContextWithSystem({
+      type: "context_with_system",
+      messages: [systemMessage, ...initial.messages],
+    }, initialCtx);
+    const hardLimitSkipsBeforeNextContext =
+      scenario.runtime.getDiagnostics().counters.virtual_skipped_hard_limit ?? 0;
+
+    const next = await scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, {
+      ...initialCtx,
+      getContextUsage: () => ({
+        tokens: 10_000,
+        contextWindow: scenario.ctx.model!.contextWindow,
+        percent: 10,
+      }),
+    } as unknown as ExtensionContext);
+
+    assert.equal(
+      scenario.runtime.getDiagnostics().counters.virtual_skipped_hard_limit ?? 0,
+      hardLimitSkipsBeforeNextContext,
+    );
+    assert.ok(next.messages.length > 0);
+  } finally {
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});

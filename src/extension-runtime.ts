@@ -496,7 +496,28 @@ export class ExtensionRuntime {
     );
     const rawEstimate = this.estimateRawCandidateTokens(event.messages, branch, ctx);
     const effectiveRawTokens = rawEstimate.totalTokens + deltaD;
-    const rawHardLimitExceeded = limits !== undefined && effectiveRawTokens > limits.hardLimit;
+    const rawHardLimitExceeded = limits
+      ? effectiveRawTokens > limits.hardLimit
+      : effectiveRawTokens > model.contextWindow;
+    if (!limits && effectiveRawTokens > model.contextWindow) {
+      this.abortContextForCapacityFailure(
+        ctx,
+        "context_window_exceeded",
+        effectiveRawTokens,
+      );
+      this.recordUnappliedContextEvaluation(
+        sessionId,
+        epochCompactionId,
+        ctx.sessionManager.getLeafId(),
+        event.messages,
+        rawEstimate,
+        limits,
+        true,
+        true,
+      );
+      this.diagnostics.count("virtual_skipped");
+      return { messages: event.messages };
+    }
 
     let hardLimitExceeded = false;
     let bestFallbackProjection: { messages: ContextEvent["messages"]; tokens: number } | undefined;
@@ -519,6 +540,7 @@ export class ExtensionRuntime {
         reserveTokens,
         softThresholdPercent: this.currentConfig.softThresholdPercent,
         cache: this.virtualContextCache,
+        additionalSystemTokens: rawEstimate.systemTokenAdjustment,
         ...(sameApplicationPrefix
           ? {
             usageBaseline: {
@@ -663,6 +685,7 @@ export class ExtensionRuntime {
         reserveTokens,
         softThresholdPercent: this.currentConfig.softThresholdPercent,
         cache: this.virtualContextCache,
+        additionalSystemTokens: rawEstimate.systemTokenAdjustment,
       });
       if (attempt.status === "projected" || attempt.status === "hard-limit") {
         const candidateTokens = (attempt.status === "projected"
@@ -786,7 +809,11 @@ export class ExtensionRuntime {
     modelKey: string,
     reserveTokens: number,
     limits: ReturnType<typeof calculateContextCapacityLimits>,
-    rawEstimate: { totalTokens: number; countedSystemTokens: number },
+    rawEstimate: {
+      totalTokens: number;
+      countedSystemTokens: number;
+      systemTokenAdjustment: number;
+    },
     deltaD: number,
     initialTask: BackgroundTask | undefined,
     initialBestFallback: { messages: ContextEvent["messages"]; tokens: number } | undefined,
@@ -957,6 +984,7 @@ export class ExtensionRuntime {
               reserveTokens,
               softThresholdPercent: this.currentConfig.softThresholdPercent,
               cache: this.virtualContextCache,
+              additionalSystemTokens: rawEstimate.systemTokenAdjustment,
             });
             if (attempt.status === "projected") {
               const tokens = attempt.projection.estimatedTokens + deltaD;
@@ -972,6 +1000,19 @@ export class ExtensionRuntime {
                     lastAppliedLeafId: leafId,
                     modelKey,
                     refreshRequested: attempt.projection.needsRefresh,
+                  };
+                  this.lastContextEvaluation = {
+                    runEpoch: this.runEpoch,
+                    sessionId,
+                    epochCompactionId,
+                    leafId,
+                    conversationMessages: attempt.projection.messages,
+                    conversationEstimatedTokens: tokens,
+                    countedSystemTokens: rawEstimate.countedSystemTokens,
+                    hardLimit: attempt.projection.hardLimit,
+                    refreshLimit: attempt.projection.refreshLimit,
+                    foregroundAttempted: true,
+                    aborted: false,
                   };
                 }
                 break;
@@ -1006,6 +1047,7 @@ export class ExtensionRuntime {
               reserveTokens,
               softThresholdPercent: this.currentConfig.softThresholdPercent,
               cache: this.virtualContextCache,
+              additionalSystemTokens: rawEstimate.systemTokenAdjustment,
             });
             if (attempt.status === "projected" || attempt.status === "hard-limit") {
               const tokens =
@@ -1097,16 +1139,19 @@ export class ExtensionRuntime {
     totalTokens: number;
     charEstimatedTokens: number;
     countedSystemTokens: number;
+    systemTokenAdjustment: number;
   } {
     const conversationTokens = estimateContextMessagesTokens(eventMessages);
     const eventSystemMessages = eventMessages.filter((message) => message.role === "system");
     let countedSystemTokens = estimateContextMessagesTokens(eventSystemMessages);
+    let systemTokensIncludedInProjection = countedSystemTokens;
     if (countedSystemTokens === 0) {
       const branchSystemMessage = getCurrentSystemMessage(
         buildSessionProjection([...branch]).messages,
       );
       if (branchSystemMessage) {
         countedSystemTokens = estimateTokens(branchSystemMessage);
+        systemTokensIncludedInProjection = countedSystemTokens;
       } else if (typeof ctx.getSystemPrompt === "function") {
         const systemPrompt = ctx.getSystemPrompt();
         if (typeof systemPrompt === "string" && systemPrompt.length > 0) {
@@ -1129,6 +1174,10 @@ export class ExtensionRuntime {
       totalTokens: Math.max(charEstimatedTokens, validUsageTokens),
       charEstimatedTokens,
       countedSystemTokens,
+      systemTokenAdjustment: Math.max(
+        0,
+        countedSystemTokens - systemTokensIncludedInProjection,
+      ),
     };
   }
 
@@ -1200,7 +1249,10 @@ export class ExtensionRuntime {
       const onAbort = () => finish("aborted");
       const timer = setTimeout(() => finish("timeout"), timeoutMs);
       signal.addEventListener("abort", onAbort, { once: true });
-      void promise.finally(() => finish("finished"));
+      void promise.then(
+        () => finish("finished"),
+        () => finish("finished"),
+      );
     });
   }
 
@@ -2611,6 +2663,9 @@ export class ExtensionRuntime {
             return message;
           },
           (error: unknown) => {
+            if (!isAbortLike(error) && !isTimeoutError(error)) {
+              task.failureKind = "transient_error";
+            }
             settled("rejected", false);
             throw error;
           },
@@ -2620,6 +2675,9 @@ export class ExtensionRuntime {
           result: () => validatedResultPromise,
         } as typeof stream;
       } catch (error: unknown) {
+        if (!isAbortLike(error) && !isTimeoutError(error)) {
+          task.failureKind = "transient_error";
+        }
         settled("rejected", false);
         throw error;
       }

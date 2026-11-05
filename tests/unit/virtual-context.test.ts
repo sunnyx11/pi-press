@@ -52,6 +52,33 @@ test("virtual context projects conversation messages when Pi hides system messag
   );
 });
 
+test("virtual context rejects a projection that exceeds hard limit after external system prompt tokens", () => {
+  const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-external-system");
+  manager.appendMessage({ ...makeUserMessage("old history"), timestamp: 2_000 });
+  const keptId = manager.appendMessage({ ...makeUserMessage("kept message"), timestamp: 3_000 });
+  const snapshotId = manager.appendMessage({ ...makeUserMessage("snapshot message"), timestamp: 4_000 });
+  const eventMessages = manager.buildSessionProjection().messages.filter(
+    (message) => message.role !== "system",
+  );
+  const data = makeCheckpointData(manager.getSessionId(), snapshotId, keptId, {
+    checkpointId: "virtual-checkpoint-external-system",
+    estimatedTokensAfterAtSnapshot: 100,
+  });
+
+  const result = tryProjectCheckpointToVirtualContext({
+    branch: manager.getBranch(),
+    eventMessages,
+    checkpoint: data,
+    contextWindow: 100_000,
+    reserveTokens: 1,
+    softThresholdPercent: 50,
+    cache: new VirtualContextProjectionCache(),
+    additionalSystemTokens: 90_000,
+  });
+
+  assert.equal(result.status, "hard-limit");
+});
+
 test("virtual context counts system growth after the checkpoint snapshot", () => {
   const manager = SessionManager.inMemory("/tmp/pi-press-virtual-context-system-growth");
   manager.appendMessage({ role: "system", content: "base", timestamp: 1_000 });

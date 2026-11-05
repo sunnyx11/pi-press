@@ -31,6 +31,7 @@ export interface VirtualContextProjectionInput {
   softThresholdPercent: number;
   cache?: VirtualContextProjectionCache;
   usageBaseline?: VirtualContextUsageBaseline;
+  additionalSystemTokens?: number;
 }
 
 export interface VirtualContextProjection {
@@ -528,6 +529,7 @@ export function tryProjectCheckpointToVirtualContext(
     softThresholdPercent,
     cache,
     usageBaseline,
+    additionalSystemTokens = 0,
   } = input;
   if (
     !Number.isFinite(contextWindow) ||
@@ -536,7 +538,9 @@ export function tryProjectCheckpointToVirtualContext(
     reserveTokens < 0 ||
     !Number.isFinite(softThresholdPercent) ||
     softThresholdPercent < 0 ||
-    softThresholdPercent > MAX_SOFT_THRESHOLD_PERCENT
+    softThresholdPercent > MAX_SOFT_THRESHOLD_PERCENT ||
+    !Number.isFinite(additionalSystemTokens) ||
+    additionalSystemTokens < 0
   ) {
     return { status: "unavailable", reason: "invalid_projection_input" };
   }
@@ -674,7 +678,7 @@ export function tryProjectCheckpointToVirtualContext(
     contextWindow,
     reserveTokens,
     softThresholdPercent,
-    transformedTokenGrowth + systemTokenGrowth,
+    transformedTokenGrowth + systemTokenGrowth + additionalSystemTokens,
   );
   if (!capacity) {
     return { status: "unavailable", reason: "capacity_estimate_unavailable" };
