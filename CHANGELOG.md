@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-06
+
+### Changed
+
+- 运行时通知、配置告警、诊断、迁移和冒烟脚本的自有固定提示统一使用英文。
+
+### Fixed
+
+- 修复前台压缩进度重复显示，保留 Pi 原生动画与完成、取消后的状态恢复。
+- 修复前台重试次数显示超出上限的问题。
+
 ## [0.7.0] - 2026-11-05
 
 ### Added
@@ -186,7 +197,8 @@
 - 认证错误和 provider 凭据不会写入通知、诊断或 checkpoint provenance。
 - 持久化实际 provider endpoint 前移除 URL user information、query 和 fragment。
 
-[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/sunnyx11/pi-press/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/sunnyx11/pi-press/compare/440959e9b81cc8adbb043220026930f5732dd088...v0.7.1
 [0.7.0]: https://github.com/sunnyx11/pi-press/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/sunnyx11/pi-press/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/sunnyx11/pi-press/compare/v0.5.1...v0.5.2
