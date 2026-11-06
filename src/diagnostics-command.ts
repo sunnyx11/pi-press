@@ -37,7 +37,7 @@ export function parseDiagnosticsCommand(
     if (token === "--session") {
       const value = tokens[index + 1];
       if (!value || value.startsWith("--")) {
-        return { error: `--session 需要 session ID。用法：${DIAGNOSTICS_COMMAND_USAGE}` };
+        return { error: `--session requires a session ID. Usage: ${DIAGNOSTICS_COMMAND_USAGE}` };
       }
       sessionId = value;
       index += 1;
@@ -47,13 +47,13 @@ export function parseDiagnosticsCommand(
       const value = tokens[index + 1];
       const parsed = value === undefined ? Number.NaN : Number(value);
       if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
-        return { error: `--last 必须是 1 到 100 的整数。用法：${DIAGNOSTICS_COMMAND_USAGE}` };
+        return { error: `--last must be an integer from 1 to 100. Usage: ${DIAGNOSTICS_COMMAND_USAGE}` };
       }
       limit = parsed;
       index += 1;
       continue;
     }
-    return { error: `未知参数 ${token}。用法：${DIAGNOSTICS_COMMAND_USAGE}` };
+    return { error: `Unknown argument: ${token}. Usage: ${DIAGNOSTICS_COMMAND_USAGE}` };
   }
   return { options: { sessionId, limit, json } };
 }
@@ -72,11 +72,11 @@ export function formatDiagnosticsReport(
   }
 
   const lines = [
-    `Pi-press 诊断：session=${options.sessionId}，最近 ${events.length} 条`,
-    `数据库：${options.databasePath ?? "内存模式"}`,
+    `pi-press diagnostics: session =${options.sessionId}, last ${events.length} events`,
+    `Database: ${options.databasePath ?? "in-memory"}`,
   ];
   if (events.length === 0) {
-    lines.push("没有匹配的诊断事件。");
+    lines.push("No matching diagnostic events.");
     return lines.join("\n");
   }
   for (const event of events) {

@@ -132,7 +132,7 @@ test("real Pi resolver rejects an explicit repository-local executable", () => {
         pathValue: "",
         explicitPi: localPi,
       }),
-      /仓库 node_modules/,
+      /outside the repository's node_modules/,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

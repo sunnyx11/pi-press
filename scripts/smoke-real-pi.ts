@@ -105,10 +105,10 @@ export function resolveSystemPi(options: ResolveSystemPiOptions): string {
     const explicitPath = resolve(options.explicitPi);
     const explicit = resolveExecutable(explicitPath);
     if (!explicit) {
-      throw new Error(`PI_BIN 不可执行：${options.explicitPi}`);
+      throw new Error(`PI_BIN is not executable: ${options.explicitPi}`);
     }
     if (isWithin(localModules, explicitPath) || isWithin(localModules, explicit)) {
-      throw new Error(`PI_BIN 禁止指向仓库 node_modules：${options.explicitPi}`);
+      throw new Error(`PI_BIN must point outside the repository's node_modules: ${options.explicitPi}`);
     }
     return explicit;
   }
@@ -127,7 +127,7 @@ export function resolveSystemPi(options: ResolveSystemPiOptions): string {
     }
   }
 
-  throw new Error("当前环境中没有仓库外部的 Pi 可执行文件；请安装 Pi 或设置 PI_BIN");
+  throw new Error("No Pi executable was found outside the repository. Install Pi or set PI_BIN");
 }
 
 function readPiVersion(piExecutable: string): string {
@@ -140,11 +140,11 @@ function readPiVersion(piExecutable: string): string {
     throw result.error;
   }
   if (result.status !== 0) {
-    throw new Error(`Pi 版本读取失败：${result.stderr.trim() || `退出码 ${result.status}`}`);
+    throw new Error(`Failed to read the Pi version: ${result.stderr.trim() || `exit code ${result.status}`}`);
   }
   const version = result.stdout.trim();
   if (!version) {
-    throw new Error("Pi 未返回版本号");
+    throw new Error("Pi did not return a version number");
   }
   return version;
 }
@@ -163,7 +163,7 @@ function findPiPackageRoot(piExecutable: string): string {
       if (parsed.name === "@earendil-works/pi-coding-agent") {
         const packageRoot = realpathSync(candidate);
         if (isWithin(join(projectRoot, "node_modules"), packageRoot)) {
-          throw new Error("真实 Pi 禁止使用仓库 node_modules 中的 SDK");
+          throw new Error("The live Pi test must use an SDK outside the repository's node_modules");
         }
         return packageRoot;
       }
@@ -174,7 +174,7 @@ function findPiPackageRoot(piExecutable: string): string {
     }
     current = parent;
   }
-  throw new Error(`无法从 Pi 可执行文件定位 @earendil-works/pi-coding-agent：${piExecutable}`);
+  throw new Error(`Unable to locate @earendil-works/pi-coding-agent from the Pi executable: ${piExecutable}`);
 }
 
 /** Windows npm shim 使用同一外部安装包声明的 CLI 入口。 */
@@ -187,11 +187,11 @@ export function resolvePiLaunch(piExecutable: string): { command: string; args: 
     bin?: { pi?: unknown };
   };
   if (typeof metadata.bin?.pi !== "string") {
-    throw new Error(`外部 Pi 包没有声明 pi CLI：${packageRoot}`);
+    throw new Error(`The external Pi package does not declare a pi CLI: ${packageRoot}`);
   }
   const entrypoint = realpathSync(join(packageRoot, metadata.bin.pi));
   if (!isWithin(packageRoot, entrypoint)) {
-    throw new Error(`Pi CLI 位于安装包之外：${entrypoint}`);
+    throw new Error(`The Pi CLI is outside its package directory: ${entrypoint}`);
   }
   return { command: process.execPath, args: [entrypoint] };
 }
@@ -258,7 +258,7 @@ export function createSmokeSession(
   }
   const sessionFile = manager.getSessionFile();
   if (!sessionFile) {
-    throw new Error("Pi 未创建冒烟测试 session 文件");
+    throw new Error("Pi did not create a smoke test session file");
   }
   return sessionFile;
 }
@@ -354,7 +354,7 @@ export function createGrowthSmokeSession(
   }
   const sessionFile = manager.getSessionFile();
   if (!sessionFile) {
-    throw new Error("Pi 未创建增长冒烟测试 session 文件");
+    throw new Error("Pi did not create a growth smoke test session file");
   }
   return sessionFile;
 }
@@ -472,25 +472,25 @@ function verifyEntries(
   );
   if (!checkpointEntry || checkpointEntry.type !== "custom" ||
       !isCheckpointData(checkpointEntry.data)) {
-    throw new Error("真实 Pi session 中缺少有效的 pi-press checkpoint");
+    throw new Error("The live Pi session is missing a valid pi-press checkpoint");
   }
   if (!compactionEntry || compactionEntry.type !== "compaction") {
-    throw new Error("真实 Pi session 中缺少扩展正式 compaction entry");
+    throw new Error("The live Pi session is missing an extension-generated compaction entry");
   }
 
   const checkpointData = checkpointEntry.data;
   if (checkpointData.provenance?.thinkingLevel !== expectedThinkingLevel) {
-    throw new Error(`摘要 thinking level 不匹配：${checkpointData.provenance?.thinkingLevel}`);
+    throw new Error(`Summary thinking level mismatch: ${checkpointData.provenance?.thinkingLevel}`);
   }
   if (splitTurn && !checkpointData.compaction.summary?.includes("**Turn Context (split turn):**")) {
-    throw new Error("大输入冒烟测试没有生成原生 split turn 双摘要");
+    throw new Error("The large-input smoke test did not produce the two native split-turn summaries");
   }
   const snapshotIndex = entries.findIndex(
     (entry) => entry.id === checkpointData.snapshotLeafId,
   );
   const compactionIndex = entries.findIndex((entry) => entry.id === compactionEntry.id);
   if (snapshotIndex < 0 || compactionIndex <= snapshotIndex) {
-    throw new Error("正式 compaction 与 checkpoint 快照边界无效");
+    throw new Error("Invalid snapshot boundary between the compaction entry and checkpoint");
   }
 
   const tailTokens = entries
@@ -501,14 +501,14 @@ function verifyEntries(
   const expectedTokensBefore = checkpointTokensBefore + tailTokens;
   if (compactionEntry.tokensBefore !== expectedTokensBefore) {
     throw new Error(
-      `tokensBefore 不匹配：期望 ${expectedTokensBefore}，实际 ${compactionEntry.tokensBefore}`,
+      `tokensBefore mismatch: expected ${expectedTokensBefore}, got ${compactionEntry.tokensBefore}`,
     );
   }
   if (compactionEntry.fromHook !== true) {
-    throw new Error("正式 compaction entry 不是扩展 hook 结果");
+    throw new Error("The compaction entry was not produced by the extension hook");
   }
   if (getPiPressCheckpointId(compactionEntry) !== checkpointData.checkpointId) {
-    throw new Error("正式 compaction entry 与 checkpoint ID 不一致");
+    throw new Error("The compaction entry does not match the checkpoint ID");
   }
 
   return {
@@ -573,7 +573,7 @@ function runRpcSmoke(
     const timeout = setTimeout(() => {
       const trace = eventTrace.length > 0 ? `\nRPC events: ${eventTrace.join(", ")}` : "";
       finish({
-        error: new Error(`等待真实 Pi 正式 compaction 超时${stderr ? `：${stderr}` : ""}${trace}`),
+        error: new Error(`Timed out waiting for live Pi compaction${stderr ? `: ${stderr}` : ""}${trace}`),
       });
     }, 420_000);
 
@@ -599,23 +599,23 @@ function runRpcSmoke(
 
       if (record.type === "response" && record.id === "state") {
         if (record.success !== true || !record.data || typeof record.data !== "object") {
-          finish({ error: new Error("无法读取真实 Pi 当前状态") });
+          finish({ error: new Error("Unable to read the live Pi state") });
           return;
         }
         const stateModel = (record.data as { model?: unknown }).model;
         if (!stateModel || typeof stateModel !== "object") {
-          finish({ error: new Error("真实 Pi 当前配置没有可用模型") });
+          finish({ error: new Error("No model is available in the current live Pi configuration") });
           return;
         }
         const provider = (stateModel as { provider?: unknown }).provider;
         const modelId = (stateModel as { id?: unknown }).id;
         if (typeof provider !== "string" || typeof modelId !== "string") {
-          finish({ error: new Error("真实 Pi 当前模型信息不完整") });
+          finish({ error: new Error("The live Pi model information is incomplete") });
           return;
         }
         const thinkingLevel = (record.data as { thinkingLevel?: unknown }).thinkingLevel;
         if (thinkingLevel !== mainThinkingLevel) {
-          finish({ error: new Error(`主会话 thinking level 不匹配：${String(thinkingLevel)}`) });
+          finish({ error: new Error(`Main session thinking level mismatch: ${String(thinkingLevel)}`) });
           return;
         }
         model = `${provider}/${modelId}`;
@@ -632,7 +632,7 @@ function runRpcSmoke(
           ? (params as { message?: unknown }).message
           : undefined;
         const message = typeof record.message === "string" ? record.message : nestedMessage;
-        if (!projectedPromptSent && typeof message === "string" && message.includes("预压缩成功")) {
+        if (!projectedPromptSent && typeof message === "string" && message.includes("Summary precomputation completed")) {
           projectedPromptSent = true;
           send({
             id: "projected-prompt",
@@ -640,15 +640,15 @@ function runRpcSmoke(
             message: "Reply exactly PROJECTED_OK and nothing else.",
             streamingBehavior: "followUp",
           });
-        } else if (typeof message === "string" && message.includes("预压缩失败")) {
-          finish({ error: new Error(`真实 Pi 后台预压缩失败：${message}`) });
+        } else if (typeof message === "string" && message.includes("Background summary precomputation failed")) {
+          finish({ error: new Error(`Live Pi background summary precomputation failed: ${message}`) });
         }
         return;
       }
 
       if (record.type === "auto_retry_end" && record.success === false) {
-        const finalError = typeof record.finalError === "string" ? record.finalError : "未知 provider 错误";
-        finish({ error: new Error(`真实 Pi provider 请求重试耗尽：${finalError}`) });
+        const finalError = typeof record.finalError === "string" ? record.finalError : "Unknown provider error";
+        finish({ error: new Error(`Live Pi provider request retries exhausted: ${finalError}`) });
         return;
       }
 
@@ -660,12 +660,12 @@ function runRpcSmoke(
 
       if (record.type === "response" && record.id === "entries") {
         if (record.success !== true || !record.data || typeof record.data !== "object") {
-          finish({ error: new Error("真实 Pi 无法返回 session entries") });
+          finish({ error: new Error("Live Pi could not return session entries") });
           return;
         }
         const entries = (record.data as { entries?: unknown }).entries;
         if (!Array.isArray(entries)) {
-          finish({ error: new Error("真实 Pi 返回的 session entries 无效") });
+          finish({ error: new Error("Live Pi returned invalid session entries") });
           return;
         }
         try {
@@ -687,8 +687,8 @@ function runRpcSmoke(
       }
 
       if (record.type === "extension_error") {
-        const message = typeof record.message === "string" ? record.message : "未知扩展错误";
-        finish({ error: new Error(`真实 Pi 扩展错误：${message}`) });
+        const message = typeof record.message === "string" ? record.message : "Unknown extension error";
+        finish({ error: new Error(`Live Pi extension error: ${message}`) });
       }
     };
 
@@ -710,7 +710,7 @@ function runRpcSmoke(
             handleRecord(record as Record<string, unknown>);
           }
         } catch {
-          stderr += `非 JSON RPC 输出：${line.slice(0, 300)}\n`;
+          stderr += `Non-JSON RPC output: ${line.slice(0, 300)}\n`;
         }
       }
     };
@@ -723,7 +723,7 @@ function runRpcSmoke(
     child.on("exit", (code, signal) => {
       if (!outcome) {
         rejectPromise(new Error(
-          `真实 Pi 提前退出：code=${String(code)} signal=${String(signal)}${stderr ? `\n${stderr}` : ""}`,
+          `Live Pi exited early: code =${String(code)} signal =${String(signal)}${stderr ? `\n${stderr}` : ""}`,
         ));
         return;
       }
@@ -732,7 +732,7 @@ function runRpcSmoke(
       } else if (outcome.result) {
         resolvePromise(outcome.result);
       } else {
-        rejectPromise(new Error("真实 Pi 冒烟测试没有结果"));
+        rejectPromise(new Error("The live Pi smoke test produced no result"));
       }
     });
 
@@ -788,7 +788,7 @@ function runGrowthRpcSmoke(
     const timeout = setTimeout(() => {
       const trace = eventTrace.length > 0 ? `\nRPC events: ${eventTrace.join(", ")}` : "";
       finish({
-        error: new Error(`等待真实 Pi 连续中文增长测试超时${stderr ? `：${stderr}` : ""}${trace}`),
+        error: new Error(`Timed out waiting for the live Pi continuous Chinese context growth test${stderr ? `: ${stderr}` : ""}${trace}`),
       });
     }, 480_000);
 
@@ -814,18 +814,18 @@ function runGrowthRpcSmoke(
 
       if (record.type === "response" && record.id === "state") {
         if (record.success !== true || !record.data || typeof record.data !== "object") {
-          finish({ error: new Error("无法读取真实 Pi 当前状态") });
+          finish({ error: new Error("Unable to read the live Pi state") });
           return;
         }
         const stateModel = (record.data as { model?: unknown }).model;
         if (!stateModel || typeof stateModel !== "object") {
-          finish({ error: new Error("真实 Pi 当前配置没有可用模型") });
+          finish({ error: new Error("No model is available in the current live Pi configuration") });
           return;
         }
         const provider = (stateModel as { provider?: unknown }).provider;
         const modelId = (stateModel as { id?: unknown }).id;
         if (typeof provider !== "string" || typeof modelId !== "string") {
-          finish({ error: new Error("真实 Pi 当前模型信息不完整") });
+          finish({ error: new Error("The live Pi model information is incomplete") });
           return;
         }
         model = `${provider}/${modelId}`;
@@ -845,7 +845,7 @@ function runGrowthRpcSmoke(
             ? (record.params as { text?: unknown; statusText?: unknown }).statusText ??
               (record.params as { text?: unknown }).text
             : undefined);
-        if (typeof statusText === "string" && statusText.includes("pi-press 正在压缩")) {
+        if (typeof statusText === "string" && statusText.includes("pi-press: Compacting")) {
           if (waitStartedAt === undefined) {
             waitStartedAt = Date.now();
           }
@@ -862,7 +862,7 @@ function runGrowthRpcSmoke(
           ? (params as { message?: unknown }).message
           : undefined;
         const message = typeof record.message === "string" ? record.message : nestedMessage;
-        if (!turn2Sent && typeof message === "string" && message.includes("预压缩成功")) {
+        if (!turn2Sent && typeof message === "string" && message.includes("Summary precomputation completed")) {
           turn2Sent = true;
           send({
             id: "growth-turn-2",
@@ -870,15 +870,15 @@ function runGrowthRpcSmoke(
             message: `${buildChineseLogChunk("第二轮中文增量日志", 1_150)}\nReply exactly GROWTH_2_OK and nothing else.`,
             streamingBehavior: "followUp",
           });
-        } else if (typeof message === "string" && message.includes("预压缩失败")) {
-          finish({ error: new Error(`真实 Pi 增长测试预压缩失败：${message}`) });
+        } else if (typeof message === "string" && message.includes("Background summary precomputation failed")) {
+          finish({ error: new Error(`Live Pi growth test summary precomputation failed: ${message}`) });
         }
         return;
       }
 
       if (record.type === "auto_retry_end" && record.success === false) {
-        const finalError = typeof record.finalError === "string" ? record.finalError : "未知 provider 错误";
-        finish({ error: new Error(`真实 Pi provider 请求重试耗尽：${finalError}`) });
+        const finalError = typeof record.finalError === "string" ? record.finalError : "Unknown provider error";
+        finish({ error: new Error(`Live Pi provider request retries exhausted: ${finalError}`) });
         return;
       }
 
@@ -912,12 +912,12 @@ function runGrowthRpcSmoke(
 
       if (record.type === "response" && record.id === "entries") {
         if (record.success !== true || !record.data || typeof record.data !== "object") {
-          finish({ error: new Error("真实 Pi 无法返回 session entries") });
+          finish({ error: new Error("Live Pi could not return session entries") });
           return;
         }
         const entries = (record.data as { entries?: unknown }).entries;
         if (!Array.isArray(entries)) {
-          finish({ error: new Error("真实 Pi 返回的 session entries 无效") });
+          finish({ error: new Error("Live Pi returned invalid session entries") });
           return;
         }
         try {
@@ -938,14 +938,14 @@ function runGrowthRpcSmoke(
               isCheckpointData(entry.data),
           );
           if (checkpoints.length < 2) {
-            throw new Error(`连续中文增长测试未触发多代刷新：实际代数 ${checkpoints.length}`);
+            throw new Error(`The continuous Chinese context growth test did not trigger multiple checkpoint generations: got ${checkpoints.length}`);
           }
           const latestCheckpoint = checkpoints[checkpoints.length - 1]!.data;
           if (!latestCheckpoint.parentCheckpointId) {
-            throw new Error("连续中文增长测试的最新 checkpoint 缺少 parentCheckpointId");
+            throw new Error("The latest checkpoint in the continuous Chinese context growth test is missing parentCheckpointId");
           }
           if (foregroundWaitStatuses.length === 0) {
-            throw new Error("连续中文增长测试未观察到超限前台等待状态更新");
+            throw new Error("The continuous Chinese context growth test observed no foreground wait status updates after the limit was exceeded");
           }
           const liveAssistants = typedEntries.filter(
             (entry): entry is SessionEntry & { type: "message" } =>
@@ -1009,8 +1009,8 @@ function runGrowthRpcSmoke(
       }
 
       if (record.type === "extension_error") {
-        const message = typeof record.message === "string" ? record.message : "未知扩展错误";
-        finish({ error: new Error(`真实 Pi 扩展错误：${message}`) });
+        const message = typeof record.message === "string" ? record.message : "Unknown extension error";
+        finish({ error: new Error(`Live Pi extension error: ${message}`) });
       }
     };
 
@@ -1032,7 +1032,7 @@ function runGrowthRpcSmoke(
             handleRecord(record as Record<string, unknown>);
           }
         } catch {
-          stderr += `非 JSON RPC 输出：${line.slice(0, 300)}\n`;
+          stderr += `Non-JSON RPC output: ${line.slice(0, 300)}\n`;
         }
       }
     };
@@ -1045,7 +1045,7 @@ function runGrowthRpcSmoke(
     child.on("exit", (code, signal) => {
       if (!outcome) {
         rejectPromise(new Error(
-          `真实 Pi 提前退出：code=${String(code)} signal=${String(signal)}${stderr ? `\n${stderr}` : ""}`,
+          `Live Pi exited early: code =${String(code)} signal =${String(signal)}${stderr ? `\n${stderr}` : ""}`,
         ));
         return;
       }
@@ -1054,7 +1054,7 @@ function runGrowthRpcSmoke(
       } else if (outcome.result) {
         resolvePromise(outcome.result);
       } else {
-        rejectPromise(new Error("真实 Pi 增长冒烟测试没有结果"));
+        rejectPromise(new Error("The live Pi growth smoke test produced no result"));
       }
     });
 
@@ -1066,7 +1066,7 @@ async function main(): Promise<void> {
   const scenario = process.env.PI_SMOKE_SCENARIO ?? "basic";
   const summaryThinkingLevel = process.env.PI_SMOKE_SUMMARY_THINKING ?? "low";
   if (!["basic", "split", "growth"].includes(scenario) || !["low", "inherit"].includes(summaryThinkingLevel)) {
-    throw new Error("PI_SMOKE_SCENARIO 允许 basic、split 或 growth；PI_SMOKE_SUMMARY_THINKING 允许 low 或 inherit");
+    throw new Error("PI_SMOKE_SCENARIO must be basic, split, or growth. PI_SMOKE_SUMMARY_THINKING must be low or inherit");
   }
   const splitTurn = scenario === "split";
   const piExecutable = resolveSystemPi({
@@ -1081,7 +1081,7 @@ async function main(): Promise<void> {
 
   process.stdout.write(`Pi executable: ${piExecutable}\n`);
   process.stdout.write(`Pi version: ${piVersion}\n`);
-  process.stdout.write("真实 Pi 冒烟测试将调用当前配置的 provider。\n");
+  process.stdout.write("The live Pi smoke test will call the currently configured provider.\n");
 
   try {
     const explicitModel = process.env.PI_SMOKE_MODEL;
@@ -1140,7 +1140,7 @@ async function main(): Promise<void> {
     if (succeeded || process.env.PI_SMOKE_KEEP_TEMP !== "1") {
       rmSync(cwd, { recursive: true, force: true });
     } else {
-      process.stderr.write(`已保留失败现场：${cwd}\n`);
+      process.stderr.write(`Failed test artifacts preserved at: ${cwd}\n`);
     }
   }
 }

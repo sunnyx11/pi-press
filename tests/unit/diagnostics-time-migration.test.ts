@@ -125,7 +125,7 @@ test("historical migration preserves existing backup files and rejects unsupport
     await assert.rejects(migrateDiagnosticTimes(fixture.databasePath, fixture.databasePath));
     fixture.database.exec("PRAGMA user_version = 2");
     const unusedBackup = join(fixture.root, "unsupported.sqlite3");
-    await assert.rejects(migrateDiagnosticTimes(fixture.databasePath, unusedBackup), /版本/);
+    await assert.rejects(migrateDiagnosticTimes(fixture.databasePath, unusedBackup), /Timestamp conversion is not supported/);
     assert.equal(existsSync(unusedBackup), false);
     assert.deepEqual(fixture.database.prepare("SELECT * FROM diagnostic_events ORDER BY id").all(), before);
   } finally {

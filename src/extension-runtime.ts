@@ -243,12 +243,12 @@ function getCheckpointIdFromDetails(details: unknown): string | undefined {
 
 function describeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  const normalized = message.trim() || "未知错误";
+  const normalized = message.trim() || "Unknown error";
   return normalized.length <= 200 ? normalized : `${normalized.slice(0, 197)}...`;
 }
 
 function describeCapacityRejection(checkpointId: string, capacity: CompactionCapacityEstimate): string {
-  return `checkpoint ${checkpointId}：预计压缩后 ${capacity.estimatedTokensAfter} tokens，hard limit ${capacity.hardLimit} tokens`;
+  return `Checkpoint ${checkpointId}: estimated post-compaction size is ${capacity.estimatedTokensAfter} tokens; hard limit is ${capacity.hardLimit} tokens`;
 }
 
 function sanitizeProvenanceBaseUrl(baseUrl: string): string | undefined {
@@ -415,7 +415,7 @@ export class ExtensionRuntime {
           this.diagnostics.count("virtual_failed");
           this.diagnostics.record(
             "checkpoint",
-            `完整上下文复核失败：${describeError(error)}`,
+            `Full context validation failed: ${describeError(error)}`,
           );
           return undefined;
         })
@@ -424,7 +424,7 @@ export class ExtensionRuntime {
       this.diagnostics.count("virtual_failed");
       this.diagnostics.record(
         "checkpoint",
-        `完整上下文复核失败：${describeError(error)}`,
+        `Full context validation failed: ${describeError(error)}`,
       );
       return undefined;
     }
@@ -437,7 +437,7 @@ export class ExtensionRuntime {
     this.diagnostics.count("virtual_failed");
     this.diagnostics.record(
       "checkpoint",
-      `虚拟上下文处理失败：${describeError(error)}`,
+      `Virtual context processing failed: ${describeError(error)}`,
     );
     return { messages: event.messages };
   }
@@ -961,6 +961,7 @@ export class ExtensionRuntime {
             lastFailureReason = "foreground_retries_exhausted";
             break;
           }
+          progress.refresh();
           continue;
         }
 
@@ -1271,12 +1272,12 @@ export class ExtensionRuntime {
     });
     const message =
       reason === "no_compaction_boundary"
-        ? "上下文无合法切点且超过模型窗口，已停止当前请求。"
+        ? "No valid compaction boundary is available, and the context exceeds the model's context window. Request stopped."
         : reason === "critical_wait_timeout" || reason === "external_slot_timeout"
-          ? "前台压缩超时且超过模型窗口，已停止当前请求。"
+          ? "Foreground compaction timed out, and the context exceeds the model's context window. Request stopped."
           : reason === "foreground_retries_exhausted"
-            ? "前台压缩重试耗尽且超过模型窗口，已停止当前请求。"
-            : "上下文超过模型窗口且无法预压缩，已停止当前请求。";
+            ? "Foreground compaction retries were exhausted, and the context exceeds the model's context window. Request stopped."
+            : "The context exceeds the model's context window, and summary precomputation is unavailable. Request stopped.";
     this.diagnostics.record("capacity", message);
     this.notifyWarning(message);
     if (typeof ctx.abort === "function") {
@@ -1418,11 +1419,11 @@ export class ExtensionRuntime {
       const retryCount = getRetryCount ? getRetryCount() : 0;
       const retrySuffix =
         retryCount > 0
-          ? ` · 重试 ${retryCount}/3`
+          ? ` · retry ${retryCount}/3`
           : task && (task.retryCount > 0 || task.stage === "retry_backoff")
-            ? ` · 重试 ${task.retryCount}/${MAX_BACKGROUND_RETRIES}`
+            ? ` · retry ${task.retryCount}/${MAX_BACKGROUND_RETRIES}`
             : "";
-      return `pi-press 正在压缩 · 已等待 ${elapsedSeconds} 秒${retrySuffix}`;
+      return `pi-press: Compacting · ${elapsedSeconds}s elapsed${retrySuffix}`;
     };
 
     const handle: ForegroundWaitProgressHandle = {
@@ -1441,9 +1442,6 @@ export class ExtensionRuntime {
           if (isTui) {
             if (ui && typeof ui.setWorkingMessage === "function") {
               ui.setWorkingMessage(text);
-            }
-            if (ui && typeof ui.setStatus === "function") {
-              ui.setStatus("pi-press", text);
             }
           } else if (isRpc) {
             if (ui && typeof ui.setStatus === "function") {
@@ -1473,9 +1471,6 @@ export class ExtensionRuntime {
           if (isTui) {
             if (ui && typeof ui.setWorkingMessage === "function") {
               ui.setWorkingMessage(undefined);
-            }
-            if (ui && typeof ui.setStatus === "function") {
-              ui.setStatus("pi-press", undefined);
             }
           } else if (isRpc) {
             if (ui && typeof ui.setStatus === "function") {
@@ -1545,7 +1540,7 @@ export class ExtensionRuntime {
         this.diagnostics.count("virtual_refresh_wait_timed_out");
         this.diagnostics.record(
           "capacity",
-          "虚拟上下文超过 hard limit，等待后台刷新超时。",
+          "The virtual context exceeds the hard limit. Timed out waiting for a background refresh.",
         );
       }
       this.diagnostics.count("virtual_skipped");
@@ -1650,8 +1645,8 @@ export class ExtensionRuntime {
     if (this.currentConfig.precomputeMode !== "off") {
       this.notifyUser(
         checkpointId
-          ? "pi-press：压缩成功，已复用预压缩结果。"
-          : "pi-press：压缩成功，使用 Pi 原生流程。",
+          ? "pi-press: Compaction completed using a precomputed summary."
+          : "pi-press: Compaction completed using Pi's native process.",
         "info",
       );
     }
@@ -1900,10 +1895,10 @@ export class ExtensionRuntime {
         if (waitOutcome === "timeout") {
           if (overflowRecovery) {
             this.diagnostics.count("overflow_wait_timed_out");
-            this.diagnostics.record("capacity", "overflow 等待增量 checkpoint 超时，交由 Pi 原生压缩处理。");
+            this.diagnostics.record("capacity", "Overflow recovery timed out waiting for an incremental checkpoint. Falling back to Pi's native compaction.");
           } else {
             this.diagnostics.count("hook_wait_timed_out");
-            this.notifyWarning("正式压缩等待预压缩结果超时，已取消后台任务并回退 Pi 原生压缩。");
+            this.notifyWarning("Timed out waiting for the precomputed summary. Background task cancelled. Falling back to Pi's native compaction.");
             this.discardTask(task, "hook_timeout");
           }
         } else if (!overflowRecovery) {
@@ -1949,7 +1944,7 @@ export class ExtensionRuntime {
     try {
       return ctx.isIdle();
     } catch (error: unknown) {
-      this.diagnostics.record("lifecycle", `无法读取 agent 空闲状态：${describeError(error)}`);
+      this.diagnostics.record("lifecycle", `Unable to read the agent's idle state: ${describeError(error)}`);
       return false;
     }
   }
@@ -2060,7 +2055,7 @@ export class ExtensionRuntime {
         checkedLeafId,
       };
       this.diagnostics.count("formalization_deferred");
-      this.diagnostics.record("lifecycle", "当前分支尚未达到 Pi 正式压缩边界，正式化已延期。");
+      this.diagnostics.record("lifecycle", "The current branch has not reached Pi's compaction boundary. Finalization deferred.");
       return;
     }
     this.deferredFormalization = undefined;
@@ -2125,7 +2120,7 @@ export class ExtensionRuntime {
         checkedLeafId: pending.scheduledLeafId,
       };
       this.diagnostics.count("formalization_deferred");
-      this.diagnostics.record("lifecycle", "Pi 未找到可压缩内容，正式化已延期。");
+      this.diagnostics.record("lifecycle", "Pi found no content to compact. Finalization deferred.");
       return;
     }
 
@@ -2133,7 +2128,7 @@ export class ExtensionRuntime {
     const failureCount = (this.formalizationAttemptsByEpoch.get(epochKey) ?? 0) + 1;
     this.formalizationAttemptsByEpoch.set(epochKey, failureCount);
     this.diagnostics.count("formalization_failed");
-    this.diagnostics.record("lifecycle", `正式化失败：${describeError(error)}`);
+    this.diagnostics.record("lifecycle", `Virtual compaction finalization failed: ${describeError(error)}`);
     if (failureCount >= MAX_FORMALIZATION_ATTEMPTS) {
       if (this.inFlightTask) {
         this.discardTask(this.inFlightTask, "formalization_exhausted");
@@ -2143,12 +2138,12 @@ export class ExtensionRuntime {
       this.diagnostics.count("formalization_exhausted");
       this.diagnostics.record(
         "lifecycle",
-        "正式化失败次数达到上限，当前压缩周期已停止虚拟压缩。",
+        "The finalization failure limit was reached. Virtual compaction disabled for the current compaction cycle.",
       );
-      this.notifyWarning("虚拟压缩正式化连续失败，后续请求交由 Pi 原生处理。");
+      this.notifyWarning("Virtual compaction finalization failed repeatedly. Pi will handle subsequent requests.");
       return;
     }
-    this.notifyWarning("虚拟压缩正式化失败，后续 settled 状态最多再试一次。");
+    this.notifyWarning("Failed to finalize virtual compaction. At most one retry will be attempted once the session settles.");
   }
 
   private cancelFormalizationSchedule(): void {
@@ -2289,25 +2284,25 @@ export class ExtensionRuntime {
     try {
       this.currentNotify(message, type);
     } catch (error: unknown) {
-      this.diagnostics.record("lifecycle", `无法显示 CLI 通知：${describeError(error)}`);
+      this.diagnostics.record("lifecycle", `Unable to display the CLI notification: ${describeError(error)}`);
     }
   }
 
   private notifyWarning(message: string): void {
-    this.notifyUser(`pi-press：${message}`, "warning");
+    this.notifyUser(`pi-press: ${message}`, "warning");
   }
 
   private reportTaskFailure(message: string, metadata?: DiagnosticEventMetadata): void {
     const failure = describeError(message);
     this.diagnostics.count("task_failed", metadata);
     this.diagnostics.record("task", failure, metadata);
-    this.notifyUser(`pi-press：后台预压缩失败：${failure}`, "error");
+    this.notifyUser(`pi-press: Background summary precomputation failed: ${failure}`, "error");
   }
 
   private notifyCheckpointReady(task: BackgroundTask): void {
     const elapsedSeconds = ((Date.now() - task.startedAt) / 1000).toFixed(1);
     this.notifyUser(
-      `pi-press：预压缩成功，耗时 ${elapsedSeconds} 秒。`,
+      `pi-press: Summary precomputation completed in ${elapsedSeconds}s.`,
       "info",
     );
   }
@@ -2488,7 +2483,7 @@ export class ExtensionRuntime {
     } catch (error: unknown) {
       if (isTimeoutError(error)) {
         this.diagnostics.count("task_timed_out", this.taskMetadata(task));
-        this.reportTaskFailure(`后台预压缩超时（${task.stage}，请求 ${task.requestCount} 次，重试 ${task.retryCount} 次）`);
+        this.reportTaskFailure(`Background summary precomputation timed out (stage: ${task.stage}, requests: ${task.requestCount}, retries: ${task.retryCount})`);
         return;
       }
       if (task.discarded || task.controller.signal.aborted || isAbortLike(error)) {
@@ -2499,13 +2494,13 @@ export class ExtensionRuntime {
         ...(task.failureKind === undefined ? {} : { failureKind: task.failureKind }),
       });
       if (task.failureKind === "empty_summary" || task.failureKind === "invalid_summary") {
-        this.reportTaskFailure("模型返回空摘要或无效摘要", metadata);
+        this.reportTaskFailure("The model returned an empty or invalid summary", metadata);
       } else if (task.failureKind === "transient_error") {
-        this.reportTaskFailure("临时错误重试耗尽", metadata);
+        this.reportTaskFailure("Retries exhausted for transient errors", metadata);
       } else if (task.failureKind === "deterministic_error") {
-        this.reportTaskFailure("模型返回确定性错误", metadata);
+        this.reportTaskFailure("The model returned a non-retryable error", metadata);
       } else {
-        this.reportTaskFailure("后台预压缩执行失败", metadata);
+        this.reportTaskFailure("Background summary precomputation failed", metadata);
       }
     }
   }
@@ -2531,7 +2526,7 @@ export class ExtensionRuntime {
       } : {}),
     }));
     if (!nativePreparation) {
-      const message = "当前分支无法构造可用 preparation";
+      const message = "Unable to prepare the current branch for compaction";
       this.diagnostics.count("task_skipped_no_preparation");
       this.diagnostics.record("task", message);
       return;
@@ -2546,7 +2541,7 @@ export class ExtensionRuntime {
         this.diagnostics.count("task_skipped_original_tokens_unavailable");
         this.diagnostics.record(
           "checkpoint",
-          `checkpoint ${task.parentCheckpoint.checkpointId}：无法计算原始上下文 token 数`,
+          `Checkpoint ${task.parentCheckpoint.checkpointId}: unable to estimate the original context token count`,
         );
         return;
       }
@@ -2560,7 +2555,7 @@ export class ExtensionRuntime {
     const registry = this.currentModelRegistry;
     if (!registry) {
       this.diagnostics.count("task_skipped_missing_registry");
-      this.reportTaskFailure("缺少当前模型的 provider 注册表");
+      this.reportTaskFailure("The provider registry for the current model is unavailable");
       return;
     }
     task.stage = "auth";
@@ -2580,8 +2575,8 @@ export class ExtensionRuntime {
     if (!providerResult.ok) {
       this.diagnostics.count(`provider_${providerResult.failure.kind}_failure`);
       const failure = providerResult.failure.kind === "auth"
-        ? "活动模型认证不可用"
-        : "活动模型 provider 不可用";
+        ? "Authentication for the active model is unavailable"
+        : "The provider for the active model is unavailable";
       this.diagnostics.record("provider", failure);
       this.reportTaskFailure(failure);
       return;
@@ -2729,7 +2724,7 @@ export class ExtensionRuntime {
     if (appendOutcome !== "appended") {
       this.diagnostics.recordUsage("discarded", result.usage);
       if (appendOutcome === "failed" && this.isCurrentTask(task)) {
-        this.reportTaskFailure("压缩结果未通过 checkpoint 校验或追加失败");
+        this.reportTaskFailure("The compaction result failed checkpoint validation or could not be appended");
       }
       return;
     }
@@ -2867,10 +2862,10 @@ export class ExtensionRuntime {
       this.diagnostics.count("checkpoint_skipped_capacity_unavailable");
       this.diagnostics.record(
         "capacity",
-        `checkpoint ${candidateData.checkpointId}：无法计算预计压缩后容量`,
+        `Checkpoint ${candidateData.checkpointId}: unable to estimate the post-compaction context size`,
       );
       this.notifyWarning(
-        `后台预压缩容量无法计算，未持久化 checkpoint ${candidateData.checkpointId}。`,
+        `Unable to estimate the precomputed context size. Checkpoint ${candidateData.checkpointId} was not saved.`,
       );
       return "skipped";
     }
@@ -2879,7 +2874,7 @@ export class ExtensionRuntime {
       const message = describeCapacityRejection(candidateData.checkpointId, capacity);
       this.diagnostics.count("checkpoint_skipped_capacity");
       this.diagnostics.record("capacity", message);
-      this.notifyWarning(`后台预压缩容量不足，未持久化结果：${message}。`);
+      this.notifyWarning(`The precomputed context exceeds the capacity limit. Result not saved: ${message}.`);
       this.lastUnpersistedCandidate = {
         sessionId: task.sessionId,
         candidate: candidateData,
@@ -3049,7 +3044,7 @@ export class ExtensionRuntime {
         this.diagnostics.count("checkpoint_rejected_original_tokens_unavailable");
         this.diagnostics.record(
           "checkpoint",
-          `checkpoint ${candidate.data.checkpointId}：无法计算原始上下文 token 数`,
+          `Checkpoint ${candidate.data.checkpointId}: unable to estimate the original context token count`,
         );
         continue;
       }
@@ -3064,10 +3059,10 @@ export class ExtensionRuntime {
         this.diagnostics.count("checkpoint_rejected_capacity_unavailable");
         this.diagnostics.record(
           "capacity",
-          `checkpoint ${candidate.data.checkpointId}：无法计算预计压缩后容量`,
+          `Checkpoint ${candidate.data.checkpointId}: unable to estimate the post-compaction context size`,
         );
         this.notifyWarning(
-          `checkpoint ${candidate.data.checkpointId} 容量无法计算，已回退 Pi 原生压缩。`,
+          `Unable to estimate the context size for checkpoint ${candidate.data.checkpointId}. Falling back to Pi's native compaction.`,
         );
         continue;
       }
@@ -3075,7 +3070,7 @@ export class ExtensionRuntime {
         const message = describeCapacityRejection(candidate.data.checkpointId, capacity);
         this.diagnostics.count("checkpoint_rejected_capacity");
         this.diagnostics.record("capacity", message);
-        this.notifyWarning(`checkpoint 容量不足，已回退 Pi 原生压缩：${message}。`);
+        this.notifyWarning(`The checkpoint exceeds the capacity limit. Falling back to Pi's native compaction: ${message}.`);
         continue;
       }
       const result = buildCheckpointCompactionResult(candidate, preparation);

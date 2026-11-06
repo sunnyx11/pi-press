@@ -118,7 +118,7 @@ function normalizeConfigLayer(raw: unknown): ConfigLayerResult {
   if (!isRecord(raw)) {
     return {
       config: {},
-      diagnostics: ["配置必须是 JSON 对象"],
+      diagnostics: ["Configuration must be a JSON object"],
     };
   }
 
@@ -126,7 +126,7 @@ function normalizeConfigLayer(raw: unknown): ConfigLayerResult {
   const diagnostics: string[] = [];
   for (const field of ["targetPostCompactionPercent", "summaryReserveTokens"]) {
     if (field in raw) {
-      diagnostics.push(`配置字段 ${field} 已移除，当前值已忽略`);
+      diagnostics.push(`Configuration field ${field} has been removed. Its value was ignored`);
     }
   }
   for (const key of CONFIG_KEYS) {
@@ -138,7 +138,7 @@ function normalizeConfigLayer(raw: unknown): ConfigLayerResult {
       config[key] = value as never;
     } else {
       config[key] = DEFAULT_CONFIG[key] as never;
-      diagnostics.push(`配置字段 ${key} 无效，已使用默认值`);
+      diagnostics.push(`Invalid value for configuration field ${key}. Using the default value`);
     }
   }
   return { config, diagnostics };
@@ -163,7 +163,7 @@ function readConfigLayer(configPath: string): ConfigLayerResult {
     }
     return {
       config: {},
-      diagnostics: ["无法读取或解析配置文件"],
+      diagnostics: ["Unable to read or parse the configuration file"],
     };
   }
   return normalizeConfigLayer(raw);

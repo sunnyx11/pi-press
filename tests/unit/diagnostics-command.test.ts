@@ -72,9 +72,9 @@ test("diagnostics command rejects unknown, missing, and out-of-range arguments",
   assert.ok("error" in unknown);
   assert.ok("error" in missingSession);
   assert.ok("error" in outOfRange);
-  assert.match(unknown.error, /未知参数/);
+  assert.match(unknown.error, /Unknown argument/);
   assert.match(missingSession.error, /--session/);
-  assert.match(outOfRange.error, /1 到 100/);
+  assert.match(outOfRange.error, /1 to 100/);
 });
 
 test("diagnostics command formats human-readable and JSON reports", async () => {
@@ -96,7 +96,7 @@ test("diagnostics command formats human-readable and JSON reports", async () => 
     sessionId: "session-1",
     json: false,
   });
-  assert.match(text, /session-1/);
+  assert.equal(text.split("\n")[0], "pi-press diagnostics: session =session-1, last 1 events");
   assert.match(text, /virtual_applied/);
   assert.match(text, /checkpoint-1/);
 

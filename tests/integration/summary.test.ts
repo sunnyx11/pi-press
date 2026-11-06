@@ -174,7 +174,7 @@ test("transient error plus empty summary shares a single task retry budget witho
     assert.equal(scenario.appended.length, 0);
     assert.ok(
       scenario.notifications.some(
-        (item) => item.type === "error" && item.message.includes("空摘要或无效摘要"),
+        (item) => item.type === "error" && item.message.includes("The model returned an empty or invalid summary"),
       ),
     );
   } finally {
@@ -214,7 +214,7 @@ test("split turn shares a single retry budget across history and turn prefix req
     assert.equal(scenario.appended.length, 0);
     assert.ok(
       scenario.notifications.some(
-        (item) => item.type === "error" && item.message.includes("临时错误"),
+        (item) => item.type === "error" && item.message.includes("Retries exhausted for transient errors"),
       ),
     );
   } finally {

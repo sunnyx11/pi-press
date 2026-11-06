@@ -230,7 +230,7 @@ import {
 | --- | --- |
 | `session_start` | 通过 `ctx.sessionManager.getEntries()`、`getBranch()` 恢复 checkpoint、正式 compaction epoch、消费状态和当前分支。 |
 | `turn_end` | 读取 `ctx.getContextUsage()`，结合字符估算与同前缀有效真实 `usage` 判断软阈值（`0..85`）或已应用虚拟 checkpoint 的尾部容量，获取快照并调度后台任务。处理器必须在后台摘要完成前返回；Pi 可随后在同一 agent 的下一次 assistant 请求前执行原生阈值压缩。 |
-| `context` | 每次 provider 请求前重新校验 ready checkpoint，构造虚拟 `compactionSummary` 和当前未压缩尾部；对候选虚拟上下文和原始上下文统一执行 `hardLimit` 检查，超限时进入前台循环压缩（支持多轮推进切点、3 次重试、TUI/RPC 状态计时与 `ctx.signal` 取消本会话兼容任务）；无法压缩或重试耗尽时，估算 `<= contextWindow` 则发送（优先使用压缩投影），仅在 `> contextWindow` 时调用 `ctx.abort()` 请求协作取消。 |
+| `context` | 每次 provider 请求前重新校验 ready checkpoint，构造虚拟 `compactionSummary` 和当前未压缩尾部；对候选虚拟上下文和原始上下文统一执行 `hardLimit` 检查，超限时进入前台循环压缩（支持多轮推进切点、3 次重试、TUI/RPC 计时状态与 `ctx.signal` 取消本会话兼容任务）；TUI 使用 Pi 原生 `Working` 工作消息，RPC 使用 `setStatus("pi-press", text)`；无法压缩或重试耗尽时，估算 `<= contextWindow` 则发送（优先使用压缩投影），仅在 `> contextWindow` 时调用 `ctx.abort()` 请求协作取消。 |
 | `context_with_system` | 计算并记录系统与扩展增量 `D = max(0, F - C)` 供下次 `context` 阶段提前压缩；超限时触发非阻塞后台预压缩，不阻塞也不调用 `ctx.abort()`。 |
 | `agent_settled` | 等待兼容后台任务，选择最新 checkpoint，以同步保留量预检查当前分支；不可用时保存 deferred，可用时延迟调用 `ctx.compact()`。 |
 | `session_before_compact` | 校验 reason、signal、分支、epoch、checkpoint 和容量；可返回兼容 `CompactionResult`，否则返回 `undefined` 让 Pi 使用原生实现。 |
@@ -241,6 +241,8 @@ import {
 | `session_shutdown` | 递增运行 epoch，先清除任务身份再发送 abort，清除 virtual、deferred、pending 和 session 资源；不等待后台认证或 provider Promise。 |
 | `model_select` | 不注册专用处理器；后续任务从新的 `ExtensionContext` 读取模型 provenance，不废弃已有 ready checkpoint，也不改变 snapshot key。 |
 | `thinking_level_select` | 不注册专用处理器；`summaryThinkingLevel: "inherit"` 的后续任务读取新的主会话级别，其余配置使用指定摘要级别。已有 checkpoint 继续按分支与容量规则消费。 |
+
+前台等待进度遵循 Pi 原生 UI 生命周期：TUI 通过 `ctx.ui.setWorkingMessage(text)` 写入 `pi-press: Compacting · Ns elapsed`，保留 Pi 的 spinner 和工作区布局；等待结束、取消、超时或异常时通过 `setWorkingMessage(undefined)` 恢复宿主工作消息。RPC 通过 `ctx.ui.setStatus("pi-press", text)` 发布相同进度，并在清理时传入 `undefined`。`json`、`print` 和无 UI 模式不启动进度定时器。
 
 `turn_end` 不调用 `ctx.compact()`，因为当前 agent loop 仍可能继续采样。Pi 在 `turn_end` 后可于下一次 assistant 请求前执行原生阈值压缩；`agent_end` 之后仍可能发生自动重试、最终压缩检查或排队消息续跑。只有 `agent_settled` 后，且虚拟 checkpoint 已实际用于请求、上下文仍有效并且 `ctx.isIdle()` 为真时，才允许等待兼容后台任务并安排正式化。正式化通过 Pi `SettingsManager` 获取活动模型的 `compaction.keepRecentTokens`，以该值对当前分支构造无 parent preparation；不可用时保存 deferred 并按叶节点等待后续检查，可用时设置 pending 并调用 `ctx.compact()`。正式 `compaction` entry 由 Pi 写入。overflow 或 `willRetry: true` 只复用比失败请求更新的 checkpoint；等待失败时返回 `undefined`，保留 Pi 原生压缩和自动重试。带 `customInstructions` 的请求使用 Pi 原生 compaction。
 
@@ -528,7 +530,7 @@ Pi settings 和诊断存储字段不属于 checkpoint 生成配置，也不参�
 - `promptSnippet` 和 `promptGuidelines` 必须准确说明工具名称和使用条件；
 - 除非另有设计和集成测试，不覆盖 Pi 内置 `read`、`bash`、`edit`、`write`、`grep`、`find` 或 `ls` 工具。
 
-命令、快捷键和 UI 只在形成明确的使用场景后添加。`/pi-press-diagnostics` 只读取结构化诊断，支持当前或指定 session、最近 `1..100` 条事件和 JSON 输出，不修改 session 或 Runtime 状态。命令处理器可以使用 session 控制 API；事件处理器不得调用可能造成死锁的 session replacement 操作。终端 UI 必须按 `ctx.mode` 和 `ctx.hasUI` 分支，不能假设扩展总是在交互式 TUI 中运行。
+命令、快捷键和 UI 只在形成明确的使用场景后添加。`/pi-press-diagnostics` 只读取结构化诊断，支持当前或指定 session、最近 `1..100` 条事件和 JSON 输出，不修改 session 或 Runtime 状态。命令处理器可以使用 session 控制 API；事件处理器不得调用可能造成死锁的 session replacement 操作。前台压缩进度遵循 `ctx.mode` 和 `ctx.hasUI` 分支：TUI 使用 Pi 原生 `Working` 工作消息，RPC 使用 `setStatus("pi-press", text)`；`json`、`print` 和无 UI 模式不启动进度定时器。
 
 ## 日志与诊断
 

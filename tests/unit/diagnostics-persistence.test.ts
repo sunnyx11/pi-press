@@ -254,7 +254,7 @@ test("Diagnostics disable a failed store and keep recording in memory", () => {
 
   const snapshot = diagnostics.snapshot();
   assert.equal(snapshot.counters.task_started, 2);
-  assert.equal(snapshot.records.filter((record) => record.message.includes("诊断持久化")).length, 1);
+  assert.equal(snapshot.records.filter((record) => record.message.includes("Diagnostic persistence")).length, 1);
   assert.equal(
     snapshot.events.filter((event) => event.name === "persistence_disabled").length,
     1,

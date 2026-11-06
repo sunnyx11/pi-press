@@ -90,7 +90,7 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
       notifications.some(
         (item) =>
           item.type === "info" &&
-          /^pi-press：预压缩成功，耗时 \d+\.\d 秒。$/.test(item.message),
+          /^pi-press: Summary precomputation completed in \d+\.\d+s\.$/.test(item.message),
       ),
     );
 
@@ -116,7 +116,7 @@ test("threshold turn schedules compact once and hook reuses the checkpoint", asy
       reason: "threshold",
       willRetry: false,
     } satisfies SessionCompactEvent, ctx);
-    assert.ok(notifications.some((item) => item.type === "info" && item.message.includes("压缩成功，已复用")));
+    assert.ok(notifications.some((item) => item.type === "info" && item.message.includes("Compaction completed using a precomputed summary")));
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -793,13 +793,13 @@ test("checkpoint append failure reports an error without a success notification"
     assert.ok(
       notifications.some(
         (notification) =>
-          notification.type === "error" && notification.message.includes("追加失败"),
+          notification.type === "error" && notification.message.includes("The compaction result failed checkpoint validation or could not be appended"),
       ),
     );
     assert.equal(
       notifications.some(
         (notification) =>
-          notification.type === "info" && notification.message.includes("预压缩成功"),
+          notification.type === "info" && notification.message.includes("Summary precomputation completed"),
       ),
       false,
     );
@@ -860,7 +860,7 @@ test("invalid checkpoint data is rejected by the full schema before persistence"
     assert.ok(
       notifications.some(
         (notification) =>
-          notification.type === "error" && notification.message.includes("checkpoint 校验"),
+          notification.type === "error" && notification.message.includes("The compaction result failed checkpoint validation or could not be appended"),
       ),
     );
   } finally {

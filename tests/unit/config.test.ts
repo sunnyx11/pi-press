@@ -30,7 +30,7 @@ test("normalizeConfig returns design defaults and reports removed fields", () =>
   assert.equal(DEFAULT_CONFIG.diagnosticsPersistence, "sqlite");
   assert.equal(DEFAULT_CONFIG.diagnosticsRetentionDays, 30);
   assert.equal(DEFAULT_CONFIG.diagnosticsMaxDatabaseMiB, 64);
-  assert.deepEqual(result.diagnostics, ["配置字段 targetPostCompactionPercent 已移除，当前值已忽略"]);
+  assert.deepEqual(result.diagnostics, ["Configuration field targetPostCompactionPercent has been removed. Its value was ignored"]);
 });
 
 test("normalizeConfig ignores removed summary reserve values and keeps checkpoint identity", () => {
@@ -39,7 +39,7 @@ test("normalizeConfig ignores removed summary reserve values and keeps checkpoin
     const result = normalizeConfig({ summaryReserveTokens: value });
     assert.equal("summaryReserveTokens" in result.config, false);
     assert.equal(configFingerprint(result.config), fingerprint);
-    assert.deepEqual(result.diagnostics, ["配置字段 summaryReserveTokens 已移除，当前值已忽略"]);
+    assert.deepEqual(result.diagnostics, ["Configuration field summaryReserveTokens has been removed. Its value was ignored"]);
   }
 });
 
@@ -52,7 +52,7 @@ test("normalizeConfig defaults summary thinking to low and validates explicit le
   }
   const invalid = normalizeConfig({ summaryThinkingLevel: "maximum" });
   assert.equal(invalid.config.summaryThinkingLevel, "low");
-  assert.deepEqual(invalid.diagnostics, ["配置字段 summaryThinkingLevel 无效，已使用默认值"]);
+  assert.deepEqual(invalid.diagnostics, ["Invalid value for configuration field summaryThinkingLevel. Using the default value"]);
 });
 
 test("summary thinking participates in checkpoint identity", () => {

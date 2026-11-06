@@ -23,7 +23,7 @@ export default function registerPiPress(pi: ExtensionAPI): void {
   );
 
   pi.registerCommand("pi-press-diagnostics", {
-    description: "查询 Pi-press 当前或指定 session 的结构化诊断事件",
+    description: "Query structured diagnostic events for the current or specified session",
     handler: async (args, ctx) => {
       const parsed = parseDiagnosticsCommand(args, ctx.sessionManager.getSessionId());
       if ("error" in parsed) {

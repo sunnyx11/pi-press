@@ -49,7 +49,7 @@ test("background task timeout reports an error notification", async () => {
     assert.equal(diagnostics.counters.task_cancelled ?? 0, 0);
     assert.ok(
       scenario.notifications.some(
-        (notification) => notification.type === "error" && notification.message.includes("超时"),
+        (notification) => notification.type === "error" && notification.message.includes("Background summary precomputation timed out"),
       ),
     );
   } finally {
@@ -576,7 +576,7 @@ test("context above the hard limit falls back after the refresh wait times out",
     assert.equal(scenario.runtime.getDiagnostics().counters.virtual_refresh_wait_timed_out, 1);
     assert.ok(
       scenario.runtime.getDiagnostics().records.some(
-        (record) => record.message.includes("等待后台刷新超时"),
+        (record) => record.message.includes("The virtual context exceeds the hard limit"),
       ),
     );
 
@@ -617,8 +617,8 @@ test("hook timeout aborts the task before it can append a checkpoint", async () 
       scenario.notifications.some(
         (notification) =>
           notification.type === "warning" &&
-          notification.message.includes("等待预压缩结果超时") &&
-          notification.message.includes("Pi 原生压缩"),
+          notification.message.includes("Timed out waiting for the precomputed summary") &&
+          notification.message.includes("Pi's native compaction"),
       ),
     );
   } finally {
@@ -1090,7 +1090,7 @@ test("critical context waits for external background slot to free before startin
   }
 });
 
-test("foreground wait updates TUI working message and status timer and cleans up on completion", async () => {
+test("foreground wait updates the TUI working message without a footer status and cleans up on completion", async () => {
   let resolveStarted!: () => void;
   let resolveResponse!: () => void;
   const started = new Promise<void>((resolve) => {
@@ -1138,21 +1138,80 @@ test("foreground wait updates TUI working message and status timer and cleans up
       new Promise<void>((resolve) => setTimeout(resolve, 100)),
     ]);
     assert.ok(
-      workingMessages.some((msg) => typeof msg === "string" && msg.includes("pi-press 正在压缩 · 已等待")),
+      workingMessages.some((msg) => typeof msg === "string" && msg.includes("pi-press: Compacting · 0s elapsed")),
     );
-    assert.ok(
-      statuses.some(
-        (entry) =>
-          entry.key === "pi-press" &&
-          typeof entry.text === "string" &&
-          entry.text.includes("pi-press 正在压缩 · 已等待"),
-      ),
-    );
+    assert.equal(statuses.length, 0);
 
     resolveResponse();
     await contextPromise;
 
     assert.equal(workingMessages.at(-1), undefined);
+    assert.equal(statuses.length, 0);
+  } finally {
+    resolveResponse();
+    scenario.runtime.onSessionShutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    rmSync(scenario.cwd, { recursive: true, force: true });
+  }
+});
+
+test("foreground wait updates RPC status with elapsed and retry text and cleans up", async () => {
+  let resolveStarted!: () => void;
+  let resolveResponse!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const responseGate = new Promise<void>((resolve) => {
+    resolveResponse = resolve;
+  });
+  const response: ResponseFactory = async () => {
+    resolveStarted();
+    await responseGate;
+    return fauxAssistantMessage("foreground RPC summary");
+  };
+  const scenario = createScenario({ taskTimeoutMs: 2_000 }, response);
+  const workingMessages: Array<string | undefined> = [];
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const rpcCtx = {
+    ...scenario.ctx,
+    mode: "rpc" as const,
+    hasUI: true,
+    ui: {
+      ...scenario.ctx.ui,
+      setWorkingMessage: (message?: string) => {
+        workingMessages.push(message);
+      },
+      setStatus: (key: string, text: string | undefined) => {
+        statuses.push({ key, text });
+      },
+    },
+    getContextUsage: () => ({
+      tokens: 80_000,
+      contextWindow: scenario.ctx.model!.contextWindow,
+      percent: 80,
+    }),
+  } as unknown as ExtensionContext;
+
+  try {
+    const contextPromise = Promise.resolve(scenario.runtime.onContext({
+      type: "context",
+      messages: scenario.manager.buildSessionContext().messages,
+    }, rpcCtx));
+
+    await started;
+    assert.ok(
+      statuses.some(
+        (entry) =>
+          entry.key === "pi-press" &&
+          entry.text === "pi-press: Compacting · 0s elapsed",
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    assert.ok(statuses.some((entry) => entry.text === "pi-press: Compacting · 1s elapsed"));
+    assert.equal(workingMessages.length, 0);
+
+    resolveResponse();
+    await contextPromise;
     assert.equal(statuses.at(-1)?.text, undefined);
   } finally {
     resolveResponse();
@@ -1460,6 +1519,7 @@ test("foreground compaction loops for a second round when in-flight checkpoint a
 test("foreground compaction retries up to 3 times on task failure before falling back by contextWindow rule", async () => {
   let attempts = 0;
   const scenario = createScenario({ taskTimeoutMs: 500 });
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
   scenario.faux.setResponses([
     async () => {
       attempts += 1;
@@ -1486,6 +1546,14 @@ test("foreground compaction retries up to 3 times on task failure before falling
   let aborted = 0;
   const criticalWithinWindowCtx = {
     ...scenario.ctx,
+    mode: "rpc" as const,
+    hasUI: true,
+    ui: {
+      ...scenario.ctx.ui,
+      setStatus: (key: string, text: string | undefined) => {
+        statuses.push({ key, text });
+      },
+    },
     abort: () => {
       aborted += 1;
     },
@@ -1505,6 +1573,19 @@ test("foreground compaction retries up to 3 times on task failure before falling
 
     // 1 initial attempt + 3 retries = 4 total attempts, then falls back to sending because 85,000 <= W (100,000).
     assert.equal(attempts, 4);
+    assert.ok(
+      statuses.some(
+        (entry) => entry.text === "pi-press: Compacting · 0s elapsed · retry 1/3",
+      ),
+    );
+    assert.deepEqual(
+      statuses.flatMap((entry) => {
+        const retry = entry.text?.match(/retry (\d+)\/3/);
+        return retry ? [Number(retry[1])] : [];
+      }),
+      [1, 2, 3],
+    );
+    assert.equal(statuses.at(-1)?.text, undefined);
     assert.equal(aborted, 0);
     assert.equal(result.messages, sourceMessages);
   } finally {

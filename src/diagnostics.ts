@@ -83,7 +83,7 @@ export function formatDiagnosticTimestamp(atMs: number): string {
 
 function describePersistenceError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  const normalized = message.trim() || "未知错误";
+  const normalized = message.trim() || "Unknown error";
   return normalized.length <= 200 ? normalized : `${normalized.slice(0, 197)}...`;
 }
 
@@ -273,7 +273,7 @@ export class Diagnostics {
     }
     this.persistenceFailure = failure;
     const at = formatDiagnosticTimestamp(Date.now());
-    const message = `诊断持久化已停用：${failure}`;
+    const message = `Diagnostic persistence disabled: ${failure}`;
     this.pushRecord({ kind: "lifecycle", message, at });
     this.pushMemoryEvent(this.createEvent(
       "record",

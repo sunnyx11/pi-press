@@ -55,7 +55,7 @@ function readPragmaNumber(database: DatabaseSync, pragma: string): number {
   const row = database.prepare(`PRAGMA ${pragma}`).get() as Record<string, unknown> | undefined;
   const value = row?.[pragma];
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`无法读取 SQLite PRAGMA ${pragma}`);
+    throw new Error(`Unable to read SQLite PRAGMA ${pragma}`);
   }
   return value;
 }
@@ -66,7 +66,7 @@ function parseJsonObject(value: string | null): JsonObject | undefined {
   }
   const parsed = JSON.parse(value) as unknown;
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("诊断数据库包含无效 JSON 对象");
+    throw new Error("The diagnostics database contains an invalid JSON object");
   }
   return parsed as JsonObject;
 }
@@ -189,7 +189,7 @@ export class SqliteDiagnosticStore implements DiagnosticStore {
   append(event: DiagnosticEvent): void {
     const atMs = Date.parse(event.at);
     if (!Number.isFinite(atMs)) {
-      throw new Error("诊断事件时间无效");
+      throw new Error("Invalid diagnostic event timestamp");
     }
     this.insertStatement.run(
       atMs,
@@ -249,7 +249,7 @@ export class SqliteDiagnosticStore implements DiagnosticStore {
     this.database.exec("PRAGMA busy_timeout = 25");
     const version = readPragmaNumber(this.database, "user_version");
     if (version > SCHEMA_VERSION) {
-      throw new Error(`诊断数据库版本 ${version} 高于当前支持版本 ${SCHEMA_VERSION}`);
+      throw new Error(`Diagnostics database version ${version} exceeds the supported version ${SCHEMA_VERSION}`);
     }
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS diagnostic_events (

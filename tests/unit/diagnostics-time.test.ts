@@ -77,7 +77,7 @@ test("SQLite normalizes input timezones without changing absolute timestamps or 
     store.append(event);
     store.append({ ...event, at: "2026-09-30T12:36:22.616-04:00" });
     store.append({ ...event, at: "2026-10-01T00:36:22.616+08:00" });
-    assert.throws(() => store.append({ ...event, at: "invalid" }), /诊断事件时间无效/);
+    assert.throws(() => store.append({ ...event, at: "invalid" }), /Invalid diagnostic event timestamp/);
     store.close();
     store = new SqliteDiagnosticStore(options);
     const events = store.query({ sessionId: "session-1", limit: 10 });

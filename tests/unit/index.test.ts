@@ -27,7 +27,7 @@ test("extension registers and runs the pi-press diagnostics command", async () =
 
   const command = commands.get("pi-press-diagnostics");
   assert.ok(command);
-  assert.match(command.description ?? "", /诊断/);
+  assert.match(command.description ?? "", /diagnostic events/);
   assert.equal(typeof command.handler, "function");
 
   const ctx = {

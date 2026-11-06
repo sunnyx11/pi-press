@@ -354,7 +354,7 @@ test("timed out authentication remains occupied across runtime instances until i
 
       assert.equal(runtime.getDiagnostics().counters.task_failed, 1);
       assert.equal(notifications.length, 1);
-      assert.match(notifications[0]?.message ?? "", /超时/);
+      assert.match(notifications[0]?.message ?? "", /timed out/);
 
       nextRuntime.onTurnEnd(ctx);
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -506,7 +506,7 @@ test("authentication failure is shown as a CLI error notification", async () => 
   await waitFor(() => notifications.length > 0);
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0]?.type, "error");
-  assert.match(notifications[0]?.message ?? "", /后台预压缩失败/);
+  assert.match(notifications[0]?.message ?? "", /Background summary precomputation failed/);
   assert.doesNotMatch(
     JSON.stringify({ notifications, records: runtime.getDiagnostics().records }),
     /sk-review-secret/,

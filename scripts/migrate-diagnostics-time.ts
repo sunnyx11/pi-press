@@ -34,17 +34,17 @@ export async function migrateDiagnosticTimes(
   const location = resolve(databasePath);
   const backupLocation = resolve(backupPath);
   if (location === backupLocation) {
-    throw new Error("诊断数据库与备份文件必须使用不同位置");
+    throw new Error("The diagnostics database and backup file must use different locations");
   }
   if (!statSync(location).isFile()) {
-    throw new Error("诊断数据库必须是已有文件");
+    throw new Error("The diagnostics database must be an existing file");
   }
   const database = new DatabaseSync(location, { timeout: 1_000 });
   let transactionOpen = false;
   try {
     const version = database.prepare("PRAGMA user_version").get()?.user_version;
     if (version !== 1) {
-      throw new Error(`诊断数据库版本 ${String(version)} 不支持时间转换`);
+      throw new Error(`Timestamp conversion is not supported for diagnostics database version ${String(version)}`);
     }
     database.exec("BEGIN IMMEDIATE");
     transactionOpen = true;
@@ -60,18 +60,18 @@ export async function migrateDiagnosticTimes(
     const saved = new DatabaseSync(backupLocation, { readOnly: true });
     try {
       if (!isDeepStrictEqual(readRows(saved), before)) {
-        throw new Error("诊断数据库备份内容校验失败");
+        throw new Error("Diagnostics database backup verification failed");
       }
     } finally {
       saved.close();
     }
     const expected = before.map((row) => {
       if (!Number.isSafeInteger(row.at_ms)) {
-        throw new Error(`诊断记录 ${row.id} 的 at_ms 必须是安全整数`);
+        throw new Error(`Diagnostic record ${row.id}: at_ms must be a safe integer`);
       }
       const at = formatDiagnosticTimestamp(row.at_ms);
       if (Date.parse(at) !== row.at_ms) {
-        throw new Error(`诊断记录 ${row.id} 的时间转换校验失败`);
+        throw new Error(`Timestamp conversion verification failed for diagnostic record ${row.id}`);
       }
       return { ...row, at };
     });
@@ -85,7 +85,7 @@ export async function migrateDiagnosticTimes(
       }
     }
     if (!isDeepStrictEqual(readRows(database), expected)) {
-      throw new Error("诊断数据库转换后记录或字段校验失败");
+      throw new Error("Record or field verification failed after diagnostics database conversion");
     }
     database.exec("COMMIT");
     transactionOpen = false;
@@ -111,7 +111,7 @@ async function main(): Promise<void> {
   const [databaseFlag, databasePath, backupFlag, backupPath] = args;
   if (args.length !== 4 || databaseFlag !== "--database" || backupFlag !== "--backup" ||
       !databasePath || databasePath.startsWith("--") || !backupPath || backupPath.startsWith("--")) {
-    throw new Error("用法：npm run diagnostics:migrate-time -- --database <已有数据库> --backup <新备份文件>");
+    throw new Error("Usage: npm run diagnostics:migrate-time -- --database <existing-database> --backup <new-backup-file>");
   }
   const result = await migrateDiagnosticTimes(databasePath, backupPath);
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
